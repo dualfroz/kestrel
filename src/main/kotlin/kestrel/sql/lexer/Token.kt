@@ -1,0 +1,71 @@
+package kestrel.sql.lexer
+
+enum class TokenType {
+    Identifier, IntLiteral, RealLiteral, TextLiteral,
+    Create, Table, Insert, Into, Values, Select, From, Where,
+    Order, By, Asc, Desc, Limit, Delete, Update, Set, Drop,
+    And, Or, Not, Null, True, False, Primary, Key, As,
+    Index, On, Inner, Left, Outer, Join, Group, Having,
+    Begin, Commit, Rollback, Transaction, Explain,
+    Integer, Text, Boolean, Real,
+    Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
+    Plus, Minus, Star, Slash, Dot,
+    LeftParen, RightParen, Comma, Semicolon,
+    EndOfInput
+}
+
+data class Token(
+    val type: TokenType,
+    val lexeme: String,
+    val line: Int,
+    val column: Int,
+    val intValue: Long? = null,
+    val realValue: Double? = null,
+    val textValue: String? = null
+)
+
+internal val keywords: Map<String, TokenType> = mapOf(
+    "CREATE" to TokenType.Create,
+    "TABLE" to TokenType.Table,
+    "INSERT" to TokenType.Insert,
+    "INTO" to TokenType.Into,
+    "VALUES" to TokenType.Values,
+    "SELECT" to TokenType.Select,
+    "FROM" to TokenType.From,
+    "WHERE" to TokenType.Where,
+    "ORDER" to TokenType.Order,
+    "BY" to TokenType.By,
+    "ASC" to TokenType.Asc,
+    "DESC" to TokenType.Desc,
+    "LIMIT" to TokenType.Limit,
+    "DELETE" to TokenType.Delete,
+    "UPDATE" to TokenType.Update,
+    "SET" to TokenType.Set,
+    "DROP" to TokenType.Drop,
+    "AND" to TokenType.And,
+    "OR" to TokenType.Or,
+    "NOT" to TokenType.Not,
+    "NULL" to TokenType.Null,
+    "TRUE" to TokenType.True,
+    "FALSE" to TokenType.False,
+    "PRIMARY" to TokenType.Primary,
+    "KEY" to TokenType.Key,
+    "AS" to TokenType.As,
+    "INDEX" to TokenType.Index,
+    "ON" to TokenType.On,
+    "INNER" to TokenType.Inner,
+    "LEFT" to TokenType.Left,
+    "OUTER" to TokenType.Outer,
+    "JOIN" to TokenType.Join,
+    "GROUP" to TokenType.Group,
+    "HAVING" to TokenType.Having,
+    "BEGIN" to TokenType.Begin,
+    "COMMIT" to TokenType.Commit,
+    "ROLLBACK" to TokenType.Rollback,
+    "TRANSACTION" to TokenType.Transaction,
+    "EXPLAIN" to TokenType.Explain,
+    "INTEGER" to TokenType.Integer,
+    "TEXT" to TokenType.Text,
+    "BOOLEAN" to TokenType.Boolean,
+    "REAL" to TokenType.Real
+)
