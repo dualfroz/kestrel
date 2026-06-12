@@ -31,6 +31,8 @@ object TableRenderer {
         is Value.RealValue -> value.value.toString()
         is Value.TextValue -> value.value
         is Value.BooleanValue -> value.value.toString()
+        is Value.DecimalValue -> value.value.toPlainString()
+        is Value.DateValue -> value.value.toString()
         is Value.NullValue -> "NULL"
     }
 

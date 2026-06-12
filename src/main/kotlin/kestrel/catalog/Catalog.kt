@@ -577,23 +577,135 @@ class Catalog {
 
         val dependents = if (stillEnforced) emptyList() else tables.values.filter { other -> other.schema.foreignKeys.any(::dependsOnTarget) }
         if (!cascade && dependents.isNotEmpty()) {
+            val names = dependents.map { it.schema.name }.distinct()
+            throw KestrelException(
+                "cannot drop constraint ${unique.name} because table(s) ${names.joinToString(", ")} have a " +
+                    "FOREIGN KEY referencing it; use CASCADE"
+            )
+        }
+        for (other in dependents) {
+            val key = other.schema.name.lowercase()
+            val newSchema = TableSchema(
+                other.schema.name, other.schema.columns, other.schema.foreignKeys.filterNot(::dependsOnTarget),
+                other.schema.checks, other.schema.uniqueConstraints, other.schema.compositePrimaryKey, other.schema.temporary
+            )
+            val replacement = Table(newSchema)
+            replacement.rows.addAll(other.rows)
+            tables[key] = replacement
+        }
+        // Re-fetched: a self-referencing FOREIGN KEY on tableName itself may have just been rewritten
+        // above (dependents is not restricted to OTHER tables - a self-reference is a real dependent
+        // here, unlike dropDependentForeignKeys' table-drop case where it disappears for free).
+        val current = table(tableName)
+        val newSchema = TableSchema(
+            current.schema.name, current.schema.columns, current.schema.foreignKeys, current.schema.checks,
+            current.schema.uniqueConstraints - unique, current.schema.compositePrimaryKey, current.schema.temporary
+        )
+        replaceTable(tableName, newSchema, current.rows)
+    }
+
+    private fun renameInList(names: List<String>, oldName: String, newName: String): List<String> =
+        names.map { if (it.equals(oldName, ignoreCase = true)) newName else it }
+
+    private fun replaceTable(tableName: String, newSchema: TableSchema, rows: List<Row>) {
+        val key = tableName.lowercase()
+        val replacement = Table(newSchema)
+        replacement.rows.addAll(rows)
+        tables[key] = replacement
+    }
+
+    fun table(tableName: String): Table {
+        val key = tableName.lowercase()
+        tables[key]?.let { return it }
+        if (views.containsKey(key)) {
+            throw KestrelException("cannot modify view: $tableName")
+        }
+        throw KestrelException("no such table: $tableName")
+    }
 
     fun tableOrNull(tableName: String): Table? = tables[tableName.lowercase()]
 
     val tableNames: List<String> get() = tables.values.map { it.schema.name }
+
+    fun createView(name: String, query: QueryStatement, orReplace: Boolean) {
+        val key = name.lowercase()
+        if (tables.containsKey(key)) {
+            throw KestrelException("a table named '$name' already exists")
+        }
+        if (!orReplace && views.containsKey(key)) {
+            throw KestrelException("view '$name' already exists")
+        }
+        views[key] = ViewDefinition(name, query)
+    }
+
+    fun dropView(name: String, cascade: Boolean = false) {
+        val key = name.lowercase()
+        if (!views.containsKey(key)) {
+            if (tables.containsKey(key)) {
+                throw KestrelException("'$name' is a table, use DROP TABLE")
+            }
+            throw KestrelException("no such view: $name")
+        }
+        dropDependentViews(name, cascade)
+        views.remove(key)
+    }
+
+    /**
+     * Computes the full transitive closure of views depending on [name] (directly or
+     * through other views) before touching anything, so a "diamond" - two different
+     * dependents that both end up pulling in the same further-removed view - can't
+     * make a later removal fail with "no such view" because an earlier one already
+     * deleted it.
+     */
+    private fun dropDependentViews(name: String, cascade: Boolean) {
+        val closure = transitiveViewDependents(name.lowercase())
+        if (closure.isEmpty()) return
+        if (!cascade) {
+            val names = closure.mapNotNull { views[it]?.name }
+            throw KestrelException(
+                "cannot drop '$name' because view(s) ${names.joinToString(", ")} depend on it; use CASCADE"
+            )
+        }
+        for (key in closure) views.remove(key)
+    }
+
+    private fun transitiveViewDependents(rootKey: String): Set<String> {
+        val found = linkedSetOf<String>()
+        var frontier = setOf(rootKey)
+        while (true) {
+            val next = views.values
+                .filter { it.name.lowercase() != rootKey && it.name.lowercase() !in found }
+                .filter { view -> frontier.any { DependencyAnalysis.referencesRelation(view.query, it) } }
+                .map { it.name.lowercase() }
+                .toSet()
+            if (next.isEmpty()) return found
+            found.addAll(next)
+            frontier = next
+        }
+    }
+
+    fun viewOrNull(name: String): ViewDefinition? = views[name.lowercase()]
+
+    val viewNames: List<String> get() = views.values.map { it.name }
 
     fun createIndex(definition: IndexDefinition) {
         val key = definition.name.lowercase()
         if (indexes.containsKey(key)) {
             throw KestrelException("index '${definition.name}' already exists")
         }
+        require(definition.columnNames.isNotEmpty()) { "index must cover at least one column" }
         val table = table(definition.tableName)
-        if (table.schema.columnIndex(definition.columnName) == null) {
-            throw KestrelException("no such column: ${definition.columnName} in table ${definition.tableName}")
+        for (columnName in definition.columnNames) {
+            if (table.schema.columnIndex(columnName) == null) {
+                throw KestrelException("no such column: $columnName in table ${definition.tableName}")
+            }
         }
-        val index = SortedIndex(definition)
-        indexes[key] = index
+        // Populated before registering in [indexes] so that a UNIQUE index created over a table
+        // with pre-existing duplicate values fails cleanly, without leaving a half-built index
+        // behind for later statements to trip over.
+        val index = SortedIndex(definition, collationsFor(table.schema, definition.columnNames))
         reindexOne(table, index)
+        indexes[key] = index
     }
 
     fun dropIndex(indexName: String) {
@@ -602,9 +714,9 @@ class Catalog {
         }
     }
 
-    fun indexOn(tableName: String, columnName: String): SortedIndex? = indexes.values.firstOrNull {
-        it.definition.tableName.equals(tableName, ignoreCase = true) &&
-            it.definition.columnName.equals(columnName, ignoreCase = true)
+    /** Every index defined on [tableName], single-column or composite, in creation order. */
+    fun indexesOn(tableName: String): List<SortedIndex> = indexes.values.filter {
+        it.definition.tableName.equals(tableName, ignoreCase = true)
     }
 
     val indexNames: List<String> get() = indexes.values.map { it.definition.name }
@@ -618,21 +730,100 @@ class Catalog {
             .forEach { reindexOne(table, it) }
     }
 
+    /**
+     * Fires in [name]'s creation order for a given table/timing/event, matching the order
+     * multiple triggers on the same event fire in Postgres/SQLite.
+     */
+    fun createTrigger(definition: TriggerDefinition) {
+        val key = definition.name.lowercase()
+        if (triggers.containsKey(key)) {
+            throw KestrelException("trigger '${definition.name}' already exists")
+        }
+        table(definition.tableName)
+        triggers[key] = definition
+    }
+
+    fun dropTrigger(name: String) {
+        if (triggers.remove(name.lowercase()) == null) {
+            throw KestrelException("no such trigger: $name")
+        }
+    }
+
+    fun triggersOn(tableName: String, timing: TriggerTiming, event: TriggerEvent): List<TriggerDefinition> =
+        triggers.values.filter {
+            it.tableName.equals(tableName, ignoreCase = true) && it.timing == timing && it.event == event
+        }
+
+    fun hasTriggers(tableName: String): Boolean = triggers.values.any { it.tableName.equals(tableName, ignoreCase = true) }
+
+    val triggerNames: List<String> get() = triggers.values.map { it.name }
+
+    fun triggerDefinitions(): List<TriggerDefinition> = triggers.values.toList()
+
+    /**
+     * `name` must not already be a sequence (redundant CREATE); unlike tables/views, sequence
+     * names live in their own namespace here (Postgres puts them in the same relation namespace as
+     * tables, but this engine has no need for that overlap check to matter for anything it
+     * implements).
+     */
+    fun createSequence(definition: SequenceDefinition) {
+        val key = definition.name.lowercase()
+        if (sequences.containsKey(key)) {
+            throw KestrelException("sequence '${definition.name}' already exists")
+        }
+        sequences[key] = Sequence(definition)
+    }
+
+    fun dropSequence(name: String) {
+        if (sequences.remove(name.lowercase()) == null) {
+            throw KestrelException("no such sequence: $name")
+        }
+    }
+
+    /**
+     * Always installs a brand new [Sequence] instance (via [Sequence.altered]) rather than mutating
+     * the existing one in place - see [Sequence]'s own doc for why that is what makes ALTER SEQUENCE
+     * (unlike NEXTVAL) transactional.
+     */
+    fun alterSequence(name: String, newDefinition: SequenceDefinition, restartAt: Long?) {
+        val key = name.lowercase()
+        val existing = sequences[key] ?: throw KestrelException("no such sequence: $name")
+        sequences[key] = existing.altered(newDefinition, restartAt)
+    }
+
+    fun sequence(name: String): Sequence = sequenceOrNull(name) ?: throw KestrelException("no such sequence: $name")
+
+    fun sequenceOrNull(name: String): Sequence? = sequences[name.lowercase()]
+
+    val sequenceNames: List<String> get() = sequences.values.map { it.definition.name }
+
+    fun sequenceDefinitions(): List<SequenceDefinition> = sequences.values.map { it.definition }
+
     fun snapshot(): CatalogSnapshot = CatalogSnapshot(
         tables = tables.mapValues { (_, table) -> table.schema to table.rows.toList() },
-        indexDefinitions = indexes.values.map { it.definition }
+        indexDefinitions = indexes.values.map { it.definition },
+        views = views.toMap(),
+        triggers = triggers.toMap(),
+        sequences = sequences.toMap()
     )
 
     fun restore(snapshot: CatalogSnapshot) {
         tables.clear()
         indexes.clear()
+        views.clear()
+        triggers.clear()
+        sequences.clear()
+        views.putAll(snapshot.views)
+        triggers.putAll(snapshot.triggers)
+        sequences.putAll(snapshot.sequences)
         for ((key, image) in snapshot.tables) {
             val table = Table(image.first)
             table.rows.addAll(image.second)
             tables[key] = table
         }
         for (definition in snapshot.indexDefinitions) {
-            val index = SortedIndex(definition)
+            val schema = tables.getValue(definition.tableName.lowercase()).schema
+            val index = SortedIndex(definition, collationsFor(schema, definition.columnNames))
             indexes[definition.name.lowercase()] = index
             reindexOne(tables.getValue(definition.tableName.lowercase()), index)
         }
@@ -640,7 +831,13 @@ class Catalog {
 
     private fun reindexOne(table: Table, index: SortedIndex) {
         index.clear()
-        val columnIndex = table.schema.columnIndex(index.definition.columnName)!!
-        table.rows.forEachIndexed { rowIndex, row -> index.add(row.values[columnIndex], rowIndex) }
+        val columnIndices = index.definition.columnNames.map { table.schema.columnIndex(it)!! }
+        table.rows.forEachIndexed { rowIndex, row ->
+            index.add(columnIndices.map { row.values[it] }, rowIndex)
+        }
     }
+
+    /** One [Collation] per entry of [columnNames], in order - [Collation.Binary] for any name [schema] cannot resolve. */
+    private fun collationsFor(schema: TableSchema, columnNames: List<String>): List<Collation> =
+        columnNames.map { schema.column(it)?.collation ?: Collation.Binary }
 }
