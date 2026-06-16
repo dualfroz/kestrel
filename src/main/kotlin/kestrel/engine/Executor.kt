@@ -631,6 +631,179 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return DropTableResult(statement.tableName)
     }
 
+    /**
+     * TRUNCATE never fires a row-level trigger (Postgres/SQLite both only ever fire TRUNCATE-shaped
+     * statement-level triggers this engine has no equivalent of) and never runs a FOREIGN KEY's
+     * `onDelete` action row by row - see [kestrel.catalog.Catalog.truncateTables]'s own doc for why
+     * its RESTRICT/CASCADE handling is structurally different from [ForeignKeyEnforcer.cascadeDelete].
+     */
+    private fun executeTruncate(statement: TruncateTableStatement): StatementResult {
+        val truncated = catalog.truncateTables(statement.tableNames, statement.mode == DropMode.Cascade, statement.restartIdentity)
+        return TruncateTableResult(truncated)
+    }
+
+    private fun executeAlterTable(statement: AlterTableStatement): StatementResult {
+        when (val action = statement.action) {
+            is AddColumn -> executeAddColumn(statement.tableName, action.column)
+            is DropColumn -> catalog.dropColumn(statement.tableName, action.columnName, cascade = action.mode == DropMode.Cascade)
+            is RenameColumn -> catalog.renameColumn(statement.tableName, action.oldName, action.newName)
+            is RenameTable -> catalog.renameTable(statement.tableName, action.newName)
+            is AddConstraint -> executeAddConstraint(statement.tableName, action.constraint)
+            is DropConstraint -> catalog.dropConstraint(statement.tableName, action.name, cascade = action.mode == DropMode.Cascade)
+            is ChangeColumnType -> executeChangeColumnType(statement.tableName, action)
+        }
+        val resultName = (statement.action as? RenameTable)?.newName ?: statement.tableName
+        return AlterTableResult(resultName)
+    }
+
+    private fun executeAddConstraint(tableName: String, added: AddedConstraint) {
+        when (added) {
+            is AddedCheck -> executeAddCheckConstraint(tableName, added.check)
+            is AddedUnique -> executeAddUniqueConstraint(tableName, added.unique)
+            is AddedForeignKey -> executeAddForeignKeyConstraint(tableName, added.foreignKey)
+        }
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name CHECK (...)` - validated exactly like a CREATE TABLE-time
+     * CHECK ([validateCheckDefinitions]: known columns only, no subquery), PLUS - since this table
+     * may already hold rows a brand new CREATE TABLE never has to worry about - every existing row
+     * is evaluated against it up front, the same per-row logic [enforceChecks] already runs on every
+     * future INSERT/UPDATE.
+     */
+    private fun executeAddCheckConstraint(tableName: String, check: CheckConstraint) {
+        val schema = catalog.table(tableName).schema
+        check.name?.let { requireUniqueConstraintName(schema, it) }
+        checkColumns(check.expression, schema)
+        requireNoSubquery(check.expression)
+        for (row in catalog.table(tableName).rows) {
+            val result = Evaluator(schema, row, subqueryRunner).evaluate(check.expression)
+            if (result is Value.BooleanValue && !result.value) {
+                val label = check.name?.let { " $it" } ?: ""
+                throw KestrelException("CHECK constraint$label failed: an existing row in $tableName violates it")
+            }
+        }
+        catalog.addCheckConstraint(tableName, check)
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name UNIQUE (...)` - every existing row is checked for a
+     * duplicate combination of [unique]'s columns before the constraint is installed, the same
+     * [collationFoldedUniquenessKey]-folded, NULL-exempt logic [enforceUniqueConstraints] already
+     * runs on every future INSERT/UPDATE, just run once up front here against rows that already exist.
+     */
+    private fun executeAddUniqueConstraint(tableName: String, unique: UniqueConstraint) {
+        val schema = catalog.table(tableName).schema
+        unique.name?.let { requireUniqueConstraintName(schema, it) }
+        for (columnName in unique.columns) {
+            if (schema.columnIndex(columnName) == null) {
+                throw KestrelException("UNIQUE constraint refers to unknown column: $columnName")
+            }
+        }
+        val columnIndices = unique.columns.map { schema.columnIndex(it)!! }
+        val seen = HashSet<List<Value>>()
+        for (row in catalog.table(tableName).rows) {
+            val rawKey = columnIndices.map { row.values[it] }
+            if (rawKey.any { it is Value.NullValue }) continue
+            if (!seen.add(collationFoldedUniquenessKey(schema, columnIndices, rawKey))) {
+                val label = unique.name?.let { " $it" } ?: ""
+                throw KestrelException(
+                    "UNIQUE constraint$label failed: an existing row combination in " +
+                        "$tableName(${unique.columns.joinToString(", ")}) is already duplicated"
+                )
+            }
+        }
+        catalog.addUniqueConstraint(tableName, unique)
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...` - validated the same way
+     * [validateForeignKeyDefinitions] validates one at CREATE TABLE time (unknown column, referenced
+     * table/column existence, enforced uniqueness of the referenced column group), PLUS every
+     * existing row of [tableName] is checked against it via [ForeignKeyEnforcer.validateRow] before
+     * the constraint is installed - run against a throwaway [TableSchema] carrying [foreignKey]
+     * alongside every FOREIGN KEY [tableName] already has, so a self-referencing FOREIGN KEY
+     * (`referencedTable == tableName`) can find its own sibling rows the same way
+     * [validateForeignKeyDefinitions] does for a genuinely new table, except those "siblings" here
+     * are the table's own already-committed rows rather than an uncommitted INSERT batch.
+     */
+    private fun executeAddForeignKeyConstraint(tableName: String, foreignKey: ForeignKeyConstraint) {
+        val schema = catalog.table(tableName).schema
+        foreignKey.name?.let { requireUniqueConstraintName(schema, it) }
+        if (foreignKey.columns.size != foreignKey.referencedColumns.size) {
+            throw KestrelException(
+                "FOREIGN KEY (${foreignKey.columns.joinToString(", ")}) column count does not match " +
+                    "REFERENCES ${foreignKey.referencedTable}(${foreignKey.referencedColumns.joinToString(", ")})"
+            )
+        }
+        for (columnName in foreignKey.columns) {
+            if (schema.columnIndex(columnName) == null) {
+                throw KestrelException("FOREIGN KEY refers to unknown column: $columnName")
+            }
+        }
+        val selfReference = foreignKey.referencedTable.equals(tableName, ignoreCase = true)
+        val referencedSchema = if (selfReference) {
+            schema
+        } else {
+            catalog.tableOrNull(foreignKey.referencedTable)?.schema
+                ?: throw KestrelException("FOREIGN KEY references unknown table: ${foreignKey.referencedTable}")
+        }
+        for (columnName in foreignKey.referencedColumns) {
+            if (referencedSchema.column(columnName) == null) {
+                throw KestrelException("FOREIGN KEY references unknown column: ${foreignKey.referencedTable}.$columnName")
+            }
+        }
+        if (!referencedSchema.hasEnforcedUniqueness(foreignKey.referencedColumns)) {
+            throw KestrelException(
+                "FOREIGN KEY must reference a PRIMARY KEY or UNIQUE column(s), but " +
+                    "${foreignKey.referencedTable}(${foreignKey.referencedColumns.joinToString(", ")}) is not one"
+            )
+        }
+        val tempSchema = TableSchema(
+            schema.name, schema.columns, schema.foreignKeys + foreignKey, schema.checks,
+            schema.uniqueConstraints, schema.compositePrimaryKey, schema.temporary
+        )
+        for (row in catalog.table(tableName).rows) {
+            ForeignKeyEnforcer.validateRow(catalog, tempSchema, row.values)
+        }
+        catalog.addForeignKey(tableName, foreignKey)
+    }
+
+    /**
+     * `ALTER TABLE t ALTER COLUMN col TYPE newtype [USING expression]` - deliberately RESTRICT-only
+     * (no CASCADE option, unlike [kestrel.catalog.Catalog.dropColumn]): a column that is part of
+     * the PRIMARY KEY, any FOREIGN KEY (this table's own, or another table's referencing it), a
+     * UNIQUE constraint, or a secondary index is rejected outright rather than threading a type
+     * change through every one of those structures too - drop the dependency first, exactly like
+     * `ALTER TABLE ADD COLUMN` already refuses to declare one of those inline
+     * ([kestrel.sql.parser.Parser.parseAlterAddColumnDefinition]). A GENERATED column is rejected
+     * for a related but distinct reason: its value is always freshly recomputed from its own
+     * expression, never carried over from an OLD value the way [ChangeColumnType.using] (or its
+     * implicit "recompute this column as its own old value" default) assumes - changing its type
+     * means dropping and re-adding it with a new expression instead.
+     */
+    private fun executeChangeColumnType(tableName: String, action: ChangeColumnType) {
+        val schema = catalog.table(tableName).schema
+        val columnIndex = schema.columnIndex(action.columnName)
+            ?: throw KestrelException("no such column: ${action.columnName} in table $tableName")
+        val column = schema.columns[columnIndex]
+        if (column.generated != null) {
+            throw KestrelException(
+                "cannot change the type of GENERATED column ${action.columnName} in $tableName; drop and re-add it instead"
+            )
+        }
+        if (schema.primaryKeyColumns.any { it.equals(action.columnName, ignoreCase = true) }) {
+            throw KestrelException(
+                "cannot change the type of column ${action.columnName} because it is part of the PRIMARY KEY of $tableName"
+            )
+        }
+        if (schema.foreignKeys.any { fk -> fk.columns.any { it.equals(action.columnName, ignoreCase = true) } }) {
+            throw KestrelException(
+                "cannot change the type of column ${action.columnName} because it is used by one of ${tableName}'s own " +
+                    "FOREIGN KEY constraints; drop the constraint first"
+            )
+        }
+        val referencingTables = catalog.tableNames.filter { other ->
     private fun executeCreateIndex(statement: CreateIndexStatement): StatementResult {
         catalog.createIndex(IndexDefinition(statement.indexName, statement.tableName, statement.columnName))
         return CreateIndexResult(statement.indexName)
