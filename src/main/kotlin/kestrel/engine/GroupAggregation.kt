@@ -1,54 +1,188 @@
 package kestrel.engine
 
 import kestrel.KestrelException
+import kestrel.sql.ast.BetweenExpression
 import kestrel.sql.ast.BinaryExpression
+import kestrel.sql.ast.CallExpression
+import kestrel.sql.ast.CaseBranch
+import kestrel.sql.ast.CaseExpression
+import kestrel.sql.ast.CastExpression
 import kestrel.sql.ast.Expression
 import kestrel.sql.ast.ExpressionProjection
 import kestrel.sql.ast.FunctionExpression
+import kestrel.sql.ast.InExpression
+import kestrel.sql.ast.IsNullExpression
+import kestrel.sql.ast.LikeExpression
 import kestrel.sql.ast.LiteralExpression
+import kestrel.sql.ast.OrderKey
 import kestrel.sql.ast.SelectItem
 import kestrel.sql.ast.SelectStatement
 import kestrel.sql.ast.UnaryExpression
+import kestrel.storage.Collation
 import kestrel.storage.Value
-import kestrel.storage.ValueOrdering
-import kestrel.storage.typeName
 
 class GroupAggregation(
     private val resolveIndex: (kestrel.sql.ast.ColumnExpression) -> Int,
     private val evaluateRow: (Expression, List<Value>) -> Value,
-    private val label: (SelectItem, Int) -> String
+    private val label: (SelectItem, Int) -> String,
+    private val subqueries: SubqueryRunner? = null,
+    /** A bare grouping column's declared `COLLATE` (see [kestrel.catalog.Column.collation]) - defaults to reporting none, matching every [ColumnResolver] built before this existed. */
+    private val declaredCollationOf: (kestrel.sql.ast.ColumnExpression) -> Collation? = { null }
 ) {
-    fun aggregate(statement: SelectStatement, orderExpression: Expression?, combined: List<List<Value>>): SelectResult {
-        val groups = LinkedHashMap<List<Value>, MutableList<List<Value>>>()
-        for (row in combined) {
-            val key = statement.groupBy.map { evaluateRow(it, row) }
-            groups.getOrPut(key) { mutableListOf() }.add(row)
-        }
-        var groupRows: List<List<List<Value>>> =
-            if (statement.groupBy.isEmpty() && groups.isEmpty()) listOf(emptyList()) else groups.values.toList()
+    /**
+     * One row of the eventual result, before projection: the underlying source rows that fell into
+     * it, and the grouping-set expressions that were "active" (present, not rolled up away) for it.
+     * For an ordinary `GROUP BY` (no [kestrel.sql.ast.GroupingSpec]) there is exactly one grouping set
+     * per query - [activeExpressions] is always the full `GROUP BY` list, so every column reads
+     * normally and `GROUPING(...)` (see [substituteGroupingAwareCalls]) always answers 0, matching
+     * plain SQL. [rows] is empty only for the grand-total group of a set with zero expressions over a
+     * zero-row input - the same "ungrouped aggregate over nothing" case a bare `SELECT COUNT(*)` with
+     * no rows at all already has to handle.
+     */
+    private data class LogicalGroup(val rows: List<List<Value>>, val activeExpressions: List<Expression>)
+
+    fun aggregate(statement: SelectStatement, orderKeys: List<OrderKey>, combined: List<List<Value>>): SelectResult {
+        val allGroupingColumns = statement.groupBy
+        val sets = GroupingSetExpansion.setsFor(statement.groupingSpec, statement.groupBy)
+        var logicalGroups = sets.flatMap { groupsForSet(it, combined) }
         statement.having?.let { having ->
-            groupRows = groupRows.filter { isTrue(evaluateInGroup(having, it)) }
+            logicalGroups = logicalGroups.filter { isTrue(evaluateInGroup(having, it, allGroupingColumns)) }
         }
-        orderExpression?.let { expression ->
-            val comparator = Comparator<List<List<Value>>> { first, second ->
-                ValueOrdering.compare(evaluateInGroup(expression, first), evaluateInGroup(expression, second))
+        if (orderKeys.isNotEmpty()) {
+            val comparator = Comparator<LogicalGroup> { first, second ->
+                var result = 0
+                for (key in orderKeys) {
+                    val comparison = compareOrderKeyValues(
+                        evaluateInGroup(key.expression, first, allGroupingColumns),
+                        evaluateInGroup(key.expression, second, allGroupingColumns),
+                        key,
+                        declaredCollationOf
+                    )
+                    if (comparison != 0) {
+                        result = comparison
+                        break
+                    }
+                }
+                result
             }
-            groupRows = groupRows.sortedWith(if (statement.orderBy!!.descending) comparator.reversed() else comparator)
+            logicalGroups = logicalGroups.sortedWith(comparator)
         }
-        statement.limit?.let {
-            if (it < 0) throw KestrelException("LIMIT must not be negative")
-            groupRows = groupRows.take(it)
+        statement.offset?.let { if (it < 0) throw KestrelException("OFFSET must not be negative") }
+        statement.limit?.let { if (it < 0) throw KestrelException("LIMIT must not be negative") }
+        // DISTINCT can still collapse two separate groups into the same output row (e.g.
+        // `SELECT DISTINCT dept FROM t GROUP BY dept, sub_dept`) - LIMIT/OFFSET are deferred past
+        // dedup below so they count distinct output rows, not pre-dedup groups.
+        if (!statement.distinct && (statement.offset != null || statement.limit != null)) {
+            logicalGroups = logicalGroups.drop(statement.offset ?: 0)
+            statement.limit?.let { logicalGroups = logicalGroups.take(it) }
         }
         val projection = statement.projection as ExpressionProjection
         val labels = projection.items.mapIndexed { index, item -> label(item, index) }
-        val projected = groupRows.map { group -> projection.items.map { evaluateInGroup(it.expression, group) } }
+        var projected = logicalGroups.map { group -> projection.items.map { evaluateInGroup(it.expression, group, allGroupingColumns) } }
+        if (statement.distinct) {
+            val itemExpressions = projection.items.map { it.expression }
+            projected = projected.distinctBy { row -> collationFoldedKey(row, itemExpressions, declaredCollationOf) }
+            if (statement.offset != null || statement.limit != null) {
+                projected = projected.drop(statement.offset ?: 0)
+                statement.limit?.let { projected = projected.take(it) }
+            }
+        }
         return SelectResult(labels, projected)
     }
 
-    private fun evaluateInGroup(expression: Expression, group: List<List<Value>>): Value {
-        val substituted = substituteAggregates(expression, group)
-        val resolver = ColumnResolver { columnExpression -> group.first()[resolveIndex(columnExpression)] }
-        return Evaluator(resolver).evaluate(substituted)
+    /**
+     * Groups [combined] by [setExpressions] alone (not the query's full grouping-column union) -
+     * exactly the single-set logic this class always had, just parameterized per set instead of
+     * always using `statement.groupBy`. A set with zero expressions over zero source rows still
+     * produces the one grand-total group (`combined.isEmpty()` means the inner loop never ran, so
+     * `buckets` is genuinely empty rather than holding a single `emptyList()`-keyed bucket) - every
+     * *other* set, or this same set over a non-empty input, groups normally.
+     */
+    private fun groupsForSet(setExpressions: List<Expression>, combined: List<List<Value>>): List<LogicalGroup> {
+        val buckets = LinkedHashMap<List<Value>, MutableList<List<Value>>>()
+        for (row in combined) {
+            val key = setExpressions.map { evaluateRow(it, row) }
+            val bucketKey = collationFoldedKey(key, setExpressions, declaredCollationOf)
+            buckets.getOrPut(bucketKey) { mutableListOf() }.add(row)
+        }
+        return if (setExpressions.isEmpty() && buckets.isEmpty()) {
+            listOf(LogicalGroup(emptyList(), setExpressions))
+        } else {
+            buckets.values.map { LogicalGroup(it, setExpressions) }
+        }
+    }
+
+    private fun evaluateInGroup(expression: Expression, group: LogicalGroup, allGroupingColumns: List<Expression>): Value {
+        val nulled = substituteInactiveGroupingColumns(expression, group.activeExpressions, allGroupingColumns)
+        val substituted = substituteAggregates(nulled, group.rows)
+        // Only reached for a bare reference to one of `group.activeExpressions` (anything else was
+        // just replaced with NULL above), and a group with any active expression at all is never
+        // empty - it was built from at least one matching source row - so `.first()` cannot throw.
+        val resolver = object : ColumnResolver {
+            override fun resolve(columnExpression: kestrel.sql.ast.ColumnExpression): Value =
+                group.rows.first()[resolveIndex(columnExpression)]
+
+            override fun declaredCollation(columnExpression: kestrel.sql.ast.ColumnExpression): Collation? =
+                declaredCollationOf(columnExpression)
+        }
+        return Evaluator(resolver, subqueries).evaluate(substituted)
+    }
+
+    /**
+     * Replaces every grouping-column expression not in [activeExpressions] with a NULL literal (SQL's
+     * rule for a ROLLUP/CUBE/GROUPING SETS super-aggregate row: a collapsed column reads as NULL
+     * wherever it is used outside an aggregate's own argument) and every `GROUPING(...)` call with its
+     * literal bitmask. Stops at a [FunctionExpression] without recursing into its argument - an
+     * aggregate always sees real per-row values regardless of which columns this particular row
+     * collapsed, which is exactly what makes `SUM(amount)` correct on the grand-total row too.
+     */
+    private fun substituteInactiveGroupingColumns(
+        expression: Expression,
+        activeExpressions: List<Expression>,
+        allGroupingColumns: List<Expression>
+    ): Expression {
+        if (expression in allGroupingColumns && expression !in activeExpressions) {
+            return LiteralExpression(Value.NullValue)
+        }
+        fun recurse(child: Expression) = substituteInactiveGroupingColumns(child, activeExpressions, allGroupingColumns)
+        return when (expression) {
+            is BinaryExpression -> BinaryExpression(expression.operator, recurse(expression.left), recurse(expression.right))
+            is UnaryExpression -> UnaryExpression(expression.operator, recurse(expression.operand))
+            is CallExpression ->
+                if (expression.name.equals("GROUPING", ignoreCase = true)) {
+                    LiteralExpression(computeGrouping(expression, activeExpressions))
+                } else {
+                    CallExpression(expression.name, expression.arguments.map(::recurse))
+                }
+            is IsNullExpression -> IsNullExpression(recurse(expression.operand), expression.negated)
+            is InExpression -> InExpression(recurse(expression.operand), expression.values.map(::recurse), expression.negated)
+            is BetweenExpression -> BetweenExpression(
+                recurse(expression.operand), recurse(expression.low), recurse(expression.high), expression.negated
+            )
+            is LikeExpression -> LikeExpression(recurse(expression.operand), recurse(expression.pattern), expression.negated)
+            is CaseExpression -> CaseExpression(
+                expression.operand?.let(::recurse),
+                expression.branches.map { CaseBranch(recurse(it.condition), recurse(it.result)) },
+                expression.elseExpression?.let(::recurse)
+            )
+            is CastExpression -> CastExpression(recurse(expression.operand), expression.targetType, expression.precision, expression.scale)
+            else -> expression
+        }
+    }
+
+    /**
+     * `GROUPING(e1, ..., en)` per the SQL standard: an integer whose bits, most significant first, are
+     * 1 for each `ei` collapsed away in this row's grouping set and 0 for each one still present -
+     * `computeAggregate`'s own arguments never reach this ([FunctionExpression] is not
+     * [CallExpression]), so there is no ambiguity with a real aggregate named similarly.
+     */
+    private fun computeGrouping(call: CallExpression, activeExpressions: List<Expression>): Value {
+        if (call.arguments.isEmpty()) throw KestrelException("GROUPING requires at least one argument")
+        var bits = 0L
+        for (argument in call.arguments) {
+            bits = (bits shl 1) or if (argument in activeExpressions) 0L else 1L
+        }
+        return Value.IntegerValue(bits)
     }
 
     private fun substituteAggregates(expression: Expression, group: List<List<Value>>): Expression = when (expression) {
@@ -59,46 +193,52 @@ class GroupAggregation(
             substituteAggregates(expression.right, group)
         )
         is UnaryExpression -> UnaryExpression(expression.operator, substituteAggregates(expression.operand, group))
+        is CallExpression -> CallExpression(expression.name, expression.arguments.map { substituteAggregates(it, group) })
+        is IsNullExpression -> IsNullExpression(substituteAggregates(expression.operand, group), expression.negated)
+        is InExpression -> InExpression(
+            substituteAggregates(expression.operand, group),
+            expression.values.map { substituteAggregates(it, group) },
+            expression.negated
+        )
+        is BetweenExpression -> BetweenExpression(
+            substituteAggregates(expression.operand, group),
+            substituteAggregates(expression.low, group),
+            substituteAggregates(expression.high, group),
+            expression.negated
+        )
+        is LikeExpression -> LikeExpression(
+            substituteAggregates(expression.operand, group),
+            substituteAggregates(expression.pattern, group),
+            expression.negated
+        )
+        is CaseExpression -> CaseExpression(
+            expression.operand?.let { substituteAggregates(it, group) },
+            expression.branches.map {
+                CaseBranch(substituteAggregates(it.condition, group), substituteAggregates(it.result, group))
+            },
+            expression.elseExpression?.let { substituteAggregates(it, group) }
+        )
+        is CastExpression -> CastExpression(
+            substituteAggregates(expression.operand, group),
+            expression.targetType,
+            expression.precision,
+            expression.scale
+        )
         else -> expression
     }
 
+    /**
+     * `FILTER (WHERE ...)` narrows the rows this one aggregate call sees to those matching its own
+     * predicate, evaluated per source row exactly like a `WHERE` clause would be - independent of
+     * every other aggregate in the same SELECT list, which each see [group] unfiltered (or filtered by
+     * their own, different, FILTER clause) rather than this one's rows removed for everybody.
+     */
     private fun computeAggregate(function: FunctionExpression, group: List<List<Value>>): Value {
-        val name = function.name.uppercase()
-        if (name == "COUNT") {
-            if (function.star) return Value.IntegerValue(group.size.toLong())
-            val argument = function.argument ?: return Value.IntegerValue(group.size.toLong())
-            val count = group.count { evaluateRow(argument, it) !is Value.NullValue }
-            return Value.IntegerValue(count.toLong())
-        }
-        val argument = function.argument
-            ?: throw KestrelException("aggregate function ${function.name} requires an argument")
-        val values = group.map { evaluateRow(argument, it) }.filter { it !is Value.NullValue }
-        return when (name) {
-            "SUM" -> sum(values)
-            "AVG" -> average(values)
-            "MIN" -> values.minWithOrNull(ValueOrdering) ?: Value.NullValue
-            "MAX" -> values.maxWithOrNull(ValueOrdering) ?: Value.NullValue
-            else -> throw KestrelException("unknown function: ${function.name}")
-        }
-    }
-
-    private fun sum(values: List<Value>): Value {
-        if (values.isEmpty()) return Value.NullValue
-        if (values.all { it is Value.IntegerValue }) {
-            return Value.IntegerValue(values.sumOf { (it as Value.IntegerValue).value })
-        }
-        return Value.RealValue(values.sumOf { numeric(it) })
-    }
-
-    private fun average(values: List<Value>): Value {
-        if (values.isEmpty()) return Value.NullValue
-        return Value.RealValue(values.sumOf { numeric(it) } / values.size)
-    }
-
-    private fun numeric(value: Value): Double = when (value) {
-        is Value.IntegerValue -> value.value.toDouble()
-        is Value.RealValue -> value.value
-        else -> throw KestrelException("aggregate requires numeric operands but got ${value.typeName}")
+        val filtered = function.filter?.let { predicate -> group.filter { isTrue(evaluateRow(predicate, it)) } } ?: group
+        return AggregateFunctions.compute(
+            function.name, function.argument, function.star, filtered, evaluateRow,
+            function.separator, function.orderBy, function.distinct, declaredCollationOf
+        )
     }
 
     private fun isTrue(value: Value): Boolean = value is Value.BooleanValue && value.value
