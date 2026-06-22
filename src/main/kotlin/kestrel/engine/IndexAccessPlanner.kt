@@ -1,6 +1,7 @@
 package kestrel.engine
 
 import kestrel.catalog.Catalog
+import kestrel.catalog.SortedIndex
 import kestrel.catalog.TableSchema
 import kestrel.sql.ast.BinaryExpression
 import kestrel.sql.ast.BinaryOperator
@@ -14,6 +15,9 @@ sealed class PrimaryAccess {
     class IndexScan(val indexName: String, val description: String, val rowIndices: List<Int>) : PrimaryAccess()
 }
 
+/** An [IndexScan] candidate together with how many of the index's columns it actually pinned down, used to pick the most selective option among several usable indexes. */
+private class ScoredScan(val boundColumns: Int, val scan: PrimaryAccess.IndexScan)
+
 class IndexAccessPlanner(private val catalog: Catalog) {
     fun plan(tableName: String, alias: String, schema: TableSchema, predicate: Expression?): PrimaryAccess {
         if (predicate == null) return PrimaryAccess.FullScan
@@ -22,32 +26,75 @@ class IndexAccessPlanner(private val catalog: Catalog) {
             val simple = asColumnPredicate(conjunct, alias, schema) ?: continue
             byColumn.getOrPut(simple.first) { mutableListOf() }.add(simple.second to simple.third)
         }
-        for ((columnName, predicates) in byColumn) {
-            val index = catalog.indexOn(tableName, columnName) ?: continue
-            val equal = predicates.firstOrNull { it.first == BinaryOperator.Equal }
-            if (equal != null) {
-                val candidates = index.equalTo(equal.second).sorted()
-                return PrimaryAccess.IndexScan(index.definition.name, "$columnName = ${literalText(equal.second)}", candidates)
-            }
-            var lower: Value? = null
-            var lowerInclusive = false
-            var upper: Value? = null
-            var upperInclusive = false
-            val parts = mutableListOf<String>()
-            for ((operator, literal) in predicates) {
-                when (operator) {
-                    BinaryOperator.Greater -> { lower = literal; lowerInclusive = false; parts.add("$columnName > ${literalText(literal)}") }
-                    BinaryOperator.GreaterEqual -> { lower = literal; lowerInclusive = true; parts.add("$columnName >= ${literalText(literal)}") }
-                    BinaryOperator.Less -> { upper = literal; upperInclusive = false; parts.add("$columnName < ${literalText(literal)}") }
-                    BinaryOperator.LessEqual -> { upper = literal; upperInclusive = true; parts.add("$columnName <= ${literalText(literal)}") }
-                    else -> Unit
-                }
-            }
-            if (lower == null && upper == null) continue
-            val candidates = index.rangeOf(lower, lowerInclusive, upper, upperInclusive).sorted()
-            return PrimaryAccess.IndexScan(index.definition.name, parts.joinToString(" AND "), candidates)
+        return catalog.indexesOn(tableName)
+            .mapNotNull { index -> planIndex(index, byColumn) }
+            .maxByOrNull { it.boundColumns }
+            ?.scan
+            ?: PrimaryAccess.FullScan
+    }
+
+    /**
+     * Tries to serve [byColumn] from a single [index], preferring (in order): an exact match
+     * that binds every column of the index by equality; a range scan (<, <=, >, >=) on the
+     * column right after the longest leading equality run (works even with an empty run, i.e.
+     * a plain range on the index's very first column); or a pure equality prefix scan that
+     * binds a leading run of columns with the rest left entirely free. A composite index whose
+     * leading columns aren't bound at all (e.g. only its second column appears in the WHERE
+     * clause) is skipped - it cannot narrow the scan, since the index is sorted by its first
+     * column first.
+     */
+    private fun planIndex(index: SortedIndex, byColumn: Map<String, List<Pair<BinaryOperator, Value>>>): ScoredScan? {
+        val definition = index.definition
+        val columns = definition.columnNames
+        val equalityValues = mutableListOf<Value>()
+        val descriptionParts = mutableListOf<String>()
+        for (columnName in columns) {
+            val equal = byColumn[columnName]?.firstOrNull { it.first == BinaryOperator.Equal } ?: break
+            equalityValues.add(equal.second)
+            descriptionParts.add("$columnName = ${literalText(equal.second)}")
         }
-        return PrimaryAccess.FullScan
+        if (equalityValues.size == columns.size) {
+            val candidates = index.equalTo(equalityValues).sorted()
+            return ScoredScan(columns.size, PrimaryAccess.IndexScan(definition.name, descriptionParts.joinToString(" AND "), candidates))
+        }
+        val nextColumn = columns[equalityValues.size]
+        val rangePredicates = byColumn[nextColumn]?.filter { it.first != BinaryOperator.Equal }.orEmpty()
+        if (rangePredicates.isNotEmpty()) {
+            val scan = rangeScan(index, nextColumn, rangePredicates, prefix = equalityValues.toList(), descriptionParts)
+            if (scan != null) return scan
+        }
+        if (equalityValues.isEmpty()) return null
+        // A pure equality prefix: every bound column matched by "=", nothing further constrained.
+        val candidates = index.rangeOf(equalityValues, true, equalityValues, true).sorted()
+        return ScoredScan(equalityValues.size, PrimaryAccess.IndexScan(definition.name, descriptionParts.joinToString(" AND "), candidates))
+    }
+
+    private fun rangeScan(
+        index: SortedIndex,
+        columnName: String,
+        predicates: List<Pair<BinaryOperator, Value>>,
+        prefix: List<Value>,
+        descriptionPrefix: List<String>
+    ): ScoredScan? {
+        var lowerValue: Value? = null
+        var lowerInclusive = false
+        var upperValue: Value? = null
+        var upperInclusive = false
+        val parts = descriptionPrefix.toMutableList()
+        for ((operator, literal) in predicates) {
+            when (operator) {
+                BinaryOperator.Greater -> { lowerValue = literal; lowerInclusive = false; parts.add("$columnName > ${literalText(literal)}") }
+                BinaryOperator.GreaterEqual -> { lowerValue = literal; lowerInclusive = true; parts.add("$columnName >= ${literalText(literal)}") }
+                BinaryOperator.Less -> { upperValue = literal; upperInclusive = false; parts.add("$columnName < ${literalText(literal)}") }
+                BinaryOperator.LessEqual -> { upperValue = literal; upperInclusive = true; parts.add("$columnName <= ${literalText(literal)}") }
+                else -> Unit
+            }
+        }
+        if (lowerValue == null && upperValue == null) return null
+        val lower = lowerValue?.let { prefix + it }
+        val upper = upperValue?.let { prefix + it }
+        val candidates = index.rangeOf(lower, lowerInclusive, upper, upperInclusive).sorted()
+        return ScoredScan(prefix.size + 1, PrimaryAccess.IndexScan(index.definition.name, parts.joinToString(" AND "), candidates))
     }
 
     private fun asColumnPredicate(
@@ -95,6 +142,8 @@ class IndexAccessPlanner(private val catalog: Catalog) {
         is Value.RealValue -> value.value.toString()
         is Value.TextValue -> "'${value.value}'"
         is Value.BooleanValue -> value.value.toString()
+        is Value.DecimalValue -> value.value.toPlainString()
+        is Value.DateValue -> value.value.toString()
         is Value.NullValue -> "NULL"
     }
 
