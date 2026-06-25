@@ -1630,11 +1630,37 @@ class SelectRunner(private val catalog: Catalog) {
         is ParameterExpression -> "\$${expression.index}"
     }
 
+    private fun describeFunctionArguments(expression: FunctionExpression): String {
+        if (expression.star) return "*"
+        val distinctPrefix = if (expression.distinct) "DISTINCT " else ""
+        val value = expression.argument?.let { describeExpression(it) } ?: ""
+        val separator = expression.separator ?: return "$distinctPrefix$value"
+        val orderBy = if (expression.orderBy.isNotEmpty()) {
+            " ORDER BY " + expression.orderBy.joinToString(", ") { key -> describeExpression(key.expression) + orderKeySuffix(key) }
+        } else ""
+        return "$distinctPrefix$value, ${describeExpression(separator)}$orderBy"
+    }
+
+    private fun orderKeySuffix(key: OrderKey): String {
+        val direction = if (key.descending) " DESC" else ""
+        val nulls = when (key.nullsFirst) {
+            true -> " NULLS FIRST"
+            false -> " NULLS LAST"
+            null -> ""
+        }
+        return direction + nulls
+    }
+
+    private fun describeFilterClause(expression: FunctionExpression): String =
+        expression.filter?.let { " FILTER (WHERE ${describeExpression(it)})" } ?: ""
+
     private fun literalText(value: Value): String = when (value) {
         is Value.IntegerValue -> value.value.toString()
         is Value.RealValue -> value.value.toString()
         is Value.TextValue -> "'${value.value}'"
         is Value.BooleanValue -> value.value.toString()
+        is Value.DecimalValue -> value.value.toPlainString()
+        is Value.DateValue -> value.value.toString()
         is Value.NullValue -> "NULL"
     }
 
@@ -1646,5 +1672,12 @@ class SelectRunner(private val catalog: Catalog) {
         val offset: Int
     )
 
-    private class HashKeys(val buildExpression: Expression, val probeExpression: Expression)
+    private class HashKeys(val buildExpression: Expression, val probeExpression: Expression, val collation: Collation)
+
+    private companion object {
+        const val MAX_RECURSION_ITERATIONS = 10_000
+
+        /** Kinds whose result actually depends on which rows fall inside the frame. */
+        val FRAME_CAPABLE_KINDS = setOf(WindowFunctionKind.Aggregate, WindowFunctionKind.FirstValue, WindowFunctionKind.LastValue)
+    }
 }
