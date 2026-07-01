@@ -445,13 +445,230 @@ object SqlWriter {
         is BinaryExpression ->
             "(${expression(expression.left)} ${expression.operator.symbol} ${expression(expression.right)})"
         is UnaryExpression -> "(${expression.operator.symbol} ${expression(expression.operand)})"
+        is CallExpression -> "${expression.name}(${expression.arguments.joinToString(", ") { expression(it) }})"
+        is IsNullExpression ->
+            "(${expression(expression.operand)} IS ${if (expression.negated) "NOT " else ""}NULL)"
+        is InExpression ->
+            "(${expression(expression.operand)} ${if (expression.negated) "NOT " else ""}IN (${expression.values.joinToString(", ") { expression(it) }}))"
+        is BetweenExpression ->
+            "(${expression(expression.operand)} ${if (expression.negated) "NOT " else ""}BETWEEN ${expression(expression.low)} AND ${expression(expression.high)})"
+        is LikeExpression ->
+            "(${expression(expression.operand)} ${if (expression.negated) "NOT " else ""}LIKE ${expression(expression.pattern)})"
+        is CaseExpression -> buildString {
+            append("CASE ")
+            expression.operand?.let { append(expression(it)); append(' ') }
+            expression.branches.forEach { append("WHEN ${expression(it.condition)} THEN ${expression(it.result)} ") }
+            expression.elseExpression?.let { append("ELSE ${expression(it)} ") }
+            append("END")
+        }
+        is ScalarSubqueryExpression -> "(${selectText(expression.select)})"
+        is ExistsExpression -> "EXISTS (${selectText(expression.select)})"
+        is InSubqueryExpression ->
+            "(${expression(expression.operand)} ${if (expression.negated) "NOT " else ""}IN (${selectText(expression.select)}))"
+        is CastExpression ->
+            "CAST(${expression(expression.operand)} AS ${expression.targetType.displayWith(expression.precision, expression.scale)})"
+        is CollateExpression -> "(${expression(expression.operand)} COLLATE ${expression.collation.sqlName})"
+        is WindowExpression -> "${expression.name}(${windowArgumentsText(expression)}) OVER (${overClauseText(expression)})"
+        is NextValueExpression -> "NEXTVAL(${literal(Value.TextValue(expression.sequenceName))})"
+        is CurrentValueExpression -> "CURRVAL(${literal(Value.TextValue(expression.sequenceName))})"
+        // Unreachable in practice: writeMerge never emits statement.returning at all (RETURNING is
+        // dropped from every persisted DML statement - see writeInsert/writeUpdate/writeDelete's own
+        // callers), so MERGE_ACTION() - only ever legal inside a MERGE's RETURNING - never reaches
+        // this writer. Kept here only to keep `when` exhaustive.
+        is MergeActionExpression -> "MERGE_ACTION()"
+        // Never actually reaches here in practice - canPersist excludes PREPARE/EXECUTE/DEALLOCATE
+        // outright (see its own doc), and resolveExecute always substitutes every ParameterExpression
+        // for a literal before the concrete INSERT/UPDATE/DELETE/SELECT it resolved to is ever handed
+        // to this writer. Kept only so `when` stays exhaustive, and so a `$1` typed directly into a
+        // persistable statement outside PREPARE (structurally legal, just meaningless - Evaluator
+        // throws on it) still round-trips its own text faithfully rather than being silently mangled.
+        is ParameterExpression -> "\$${expression.index}"
     }
 
+    /** STRING_AGG's `separator`/`orderBy` and DISTINCT are the only [FunctionExpression] fields beyond `argument`/`star` - every other aggregate falls through the `?: ""` exactly as before. */
+    private fun functionArgumentsText(function: FunctionExpression): String {
+        if (function.star) return "*"
+        val distinctPrefix = if (function.distinct) "DISTINCT " else ""
+        val value = function.argument?.let { expression(it) } ?: ""
+        val separator = function.separator ?: return "$distinctPrefix$value"
+        val orderBy = if (function.orderBy.isNotEmpty()) {
+            " ORDER BY " + function.orderBy.joinToString(", ") { key -> expression(key.expression) + orderKeySuffix(key) }
+        } else ""
+        return "$distinctPrefix$value, ${expression(separator)}$orderBy"
+    }
+
+    /** `DESC`/`NULLS FIRST`/`NULLS LAST` are omitted when unspecified, so a plain ascending key with the engine's own default null ordering dumps exactly as written, matching every other optional-clause writer in this file. */
+    private fun orderKeySuffix(key: OrderKey): String {
+        val direction = if (key.descending) " DESC" else ""
+        val nulls = when (key.nullsFirst) {
+            true -> " NULLS FIRST"
+            false -> " NULLS LAST"
+            null -> ""
+        }
+        return direction + nulls
+    }
+
+    /** Without this, a view with `COUNT(x) FILTER (WHERE ...)` would dump as plain `COUNT(x)` and silently drop the predicate on reopen. */
+    private fun filterClauseText(function: FunctionExpression): String =
+        function.filter?.let { " FILTER (WHERE ${expression(it)})" } ?: ""
+
+    private fun windowArgumentsText(window: WindowExpression): String {
+        if (window.star) return "*"
+        return listOfNotNull(window.argument, window.offset, window.defaultValue).joinToString(", ") { expression(it) }
+    }
+
+    private fun overClauseText(window: WindowExpression): String {
+        val parts = mutableListOf<String>()
+        if (window.partitionBy.isNotEmpty()) {
+            parts.add("PARTITION BY " + window.partitionBy.joinToString(", ") { expression(it) })
+        }
+        if (window.orderBy.isNotEmpty()) {
+            parts.add(
+                "ORDER BY " + window.orderBy.joinToString(", ") { key -> expression(key.expression) + orderKeySuffix(key) }
+            )
+        }
+        window.frame?.let { frame ->
+            val unit = when (frame.unit) {
+                FrameUnit.Rows -> "ROWS"
+                FrameUnit.Range -> "RANGE"
+                FrameUnit.Groups -> "GROUPS"
+            }
+            val exclude = when (frame.exclude) {
+                FrameExclude.NoOthers -> ""
+                FrameExclude.CurrentRow -> " EXCLUDE CURRENT ROW"
+                FrameExclude.Group -> " EXCLUDE GROUP"
+                FrameExclude.Ties -> " EXCLUDE TIES"
+            }
+            parts.add("$unit BETWEEN ${frameBoundText(frame.start)} AND ${frameBoundText(frame.end)}$exclude")
+        }
+        return parts.joinToString(" ")
+    }
+
+    private fun frameBoundText(bound: FrameBound): String = when (bound.type) {
+        FrameBoundType.UnboundedPreceding -> "UNBOUNDED PRECEDING"
+        FrameBoundType.UnboundedFollowing -> "UNBOUNDED FOLLOWING"
+        FrameBoundType.CurrentRow -> "CURRENT ROW"
+        FrameBoundType.Preceding -> "${expression(bound.offset!!)} PRECEDING"
+        FrameBoundType.Following -> "${expression(bound.offset!!)} FOLLOWING"
+    }
+
+    private fun queryText(query: QueryStatement): String = when (query) {
+        is SelectStatement -> selectText(query)
+        is SetOperationStatement -> setOperationText(query)
+        is WithQuery -> withQueryText(query)
+    }
+
+    private fun setOperationText(statement: SetOperationStatement): String = buildString {
+        append(queryText(statement.left))
+        append(" ")
+        append(setOperatorKeyword(statement.operator))
+        append(" ")
+        append(queryText(statement.right))
+        statement.orderBy?.let { append(orderByText(it)) }
+        statement.limit?.let { append(" LIMIT $it") }
+        statement.offset?.let { append(" OFFSET $it") }
+    }
+
+    private fun setOperatorKeyword(operator: SetOperator): String = when (operator) {
+        SetOperator.Union -> "UNION"
+        SetOperator.UnionAll -> "UNION ALL"
+        SetOperator.Intersect -> "INTERSECT"
+        SetOperator.IntersectAll -> "INTERSECT ALL"
+        SetOperator.Except -> "EXCEPT"
+        SetOperator.ExceptAll -> "EXCEPT ALL"
+    }
+
+    private fun withQueryText(query: WithQuery): String = buildString {
+        append("WITH ")
+        if (query.recursive) append("RECURSIVE ")
+        append(query.ctes.joinToString(", ") { cte ->
+            val columns = cte.columns?.let { "(${it.joinToString(", ")})" } ?: ""
+            "${cte.name}$columns AS (${queryText(cte.query)})"
+        })
+        append(" ")
+        append(queryText(query.body))
+    }
+
+    private fun selectText(select: SelectStatement): String = buildString {
+        append("SELECT ")
+        if (select.distinct) {
+            append("DISTINCT ")
+            if (select.distinctOn.isNotEmpty()) {
+                append("ON (")
+                append(select.distinctOn.joinToString(", ") { expression(it) })
+                append(") ")
+            }
+        }
+        append(projectionText(select.projection))
+        append(" FROM ")
+        append(fromItemText(select.from))
+        for (join in select.joins) {
+            append(
+                when (join.type) {
+                    JoinType.Left -> " LEFT JOIN "
+                    JoinType.Right -> " RIGHT JOIN "
+                    JoinType.Full -> " FULL JOIN "
+                    JoinType.Inner -> " INNER JOIN "
+                    JoinType.Cross -> " CROSS JOIN "
+                }
+            )
+            append(fromItemText(join.from))
+            join.on?.let { append(" ON "); append(expression(it)) }
+        }
+        select.where?.let { append(" WHERE "); append(expression(it)) }
+        if (select.groupingSpec != null || select.groupBy.isNotEmpty()) {
+            append(" GROUP BY ")
+            append(groupByText(select.groupingSpec, select.groupBy))
+        }
+        select.having?.let { append(" HAVING "); append(expression(it)) }
+        select.orderBy?.let { append(orderByText(it)) }
+        select.limit?.let { append(" LIMIT $it") }
+        select.offset?.let { append(" OFFSET $it") }
+    }
+
+    private fun groupByText(spec: GroupingSpec?, groupBy: List<Expression>): String = when (spec) {
+        null -> groupBy.joinToString(", ") { expression(it) }
+        is RollupSpec -> "ROLLUP (" + spec.expressions.joinToString(", ") { expression(it) } + ")"
+        is CubeSpec -> "CUBE (" + spec.expressions.joinToString(", ") { expression(it) } + ")"
+        is GroupingSetsSpec -> "GROUPING SETS (" + spec.sets.joinToString(", ") { groupingSetElementText(it) } + ")"
+    }
+
+    private fun groupingSetElementText(set: List<Expression>): String =
+        if (set.isEmpty()) "()" else "(" + set.joinToString(", ") { expression(it) } + ")"
+
+    private fun orderByText(orderBy: OrderBy): String =
+        " ORDER BY " + orderBy.keys.joinToString(", ") { key -> expression(key.expression) + orderKeySuffix(key) }
+
+    private fun fromItemText(item: FromItem): String = when (item) {
+        is TableSource -> item.name + (item.alias?.let { " AS $it" } ?: "")
+        is SubquerySource -> (if (item.lateral) "LATERAL " else "") + "(${queryText(item.select)}) AS ${item.alias}"
+    }
+
+    private fun projectionText(projection: Projection): String = when (projection) {
+        is StarProjection -> "*"
+        is ExpressionProjection -> projection.items.joinToString(", ") { item ->
+            val base = expression(item.expression)
+            item.alias?.let { "$base AS $it" } ?: base
+        }
+    }
+
+    /**
+     * DECIMAL/DATE values render as `CAST('...' AS type)` (not a bare quoted string)
+     * because column coercion is strict everywhere else in this engine (no implicit
+     * TEXT-to-DECIMAL/DATE on INSERT/UPDATE) - the CAST is what actually converts the
+     * text back on replay. The re-cast uses the value's own scale (already the column's
+     * declared scale, since it can only have gotten here via coercion or CAST) with a
+     * generous precision, so it reproduces the exact BigDecimal rather than rounding
+     * through a Double the way a bare numeric literal would.
+     */
     private fun literal(value: Value): String = when (value) {
         is Value.IntegerValue -> value.value.toString()
         is Value.RealValue -> realText(value.value)
         is Value.TextValue -> "'" + value.value.replace("'", "''") + "'"
         is Value.BooleanValue -> value.value.toString()
+        is Value.DecimalValue ->
+            "CAST('${value.value.toPlainString()}' AS DECIMAL($LITERAL_DECIMAL_PRECISION, ${value.value.scale()}))"
+        is Value.DateValue -> "CAST('${value.value}' AS DATE)"
         is Value.NullValue -> "NULL"
     }
 
@@ -459,4 +676,6 @@ object SqlWriter {
         val plain = value.toString()
         return if (plain.contains('E') || plain.contains('e')) BigDecimal(value).toPlainString() else plain
     }
+
+    private const val LITERAL_DECIMAL_PRECISION = 38
 }
