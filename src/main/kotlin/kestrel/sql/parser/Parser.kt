@@ -1,38 +1,119 @@
 package kestrel.sql.parser
 
 import kestrel.ParseException
+import kestrel.catalog.CheckConstraint
 import kestrel.catalog.Column
+import kestrel.catalog.ForeignKeyAction
+import kestrel.catalog.ForeignKeyConstraint
+import kestrel.catalog.UniqueConstraint
+import kestrel.sql.ast.AddColumn
+import kestrel.sql.ast.AddConstraint
+import kestrel.sql.ast.AddedCheck
+import kestrel.sql.ast.AddedConstraint
+import kestrel.sql.ast.AddedForeignKey
+import kestrel.sql.ast.AddedUnique
+import kestrel.sql.ast.AlterSequenceStatement
+import kestrel.sql.ast.AlterTableAction
+import kestrel.sql.ast.AlterTableStatement
 import kestrel.sql.ast.Assignment
 import kestrel.sql.ast.BeginStatement
+import kestrel.sql.ast.BetweenExpression
 import kestrel.sql.ast.BinaryExpression
 import kestrel.sql.ast.BinaryOperator
+import kestrel.sql.ast.CallExpression
+import kestrel.sql.ast.CaseBranch
+import kestrel.sql.ast.CaseExpression
+import kestrel.sql.ast.CastExpression
+import kestrel.sql.ast.ChangeColumnType
+import kestrel.sql.ast.CollateExpression
 import kestrel.sql.ast.ColumnExpression
 import kestrel.sql.ast.CommitStatement
+import kestrel.sql.ast.CommonTableExpression
+import kestrel.sql.ast.ConflictAction
+import kestrel.sql.ast.ConflictDoNothing
+import kestrel.sql.ast.ConflictDoUpdate
 import kestrel.sql.ast.CreateIndexStatement
+import kestrel.sql.ast.CreateSequenceStatement
 import kestrel.sql.ast.CreateTableStatement
+import kestrel.sql.ast.CreateTriggerStatement
+import kestrel.sql.ast.CreateViewStatement
+import kestrel.sql.ast.CubeSpec
+import kestrel.sql.ast.CurrentValueExpression
+import kestrel.sql.ast.DeallocateStatement
 import kestrel.sql.ast.DeleteStatement
+import kestrel.sql.ast.DropColumn
+import kestrel.sql.ast.DropConstraint
 import kestrel.sql.ast.DropIndexStatement
+import kestrel.sql.ast.DropMode
+import kestrel.sql.ast.DropSequenceStatement
 import kestrel.sql.ast.DropTableStatement
+import kestrel.sql.ast.DropTriggerStatement
+import kestrel.sql.ast.DropViewStatement
+import kestrel.sql.ast.ExecuteStatement
 import kestrel.sql.ast.Expression
 import kestrel.sql.ast.ExpressionProjection
+import kestrel.sql.ast.ExistsExpression
 import kestrel.sql.ast.ExplainStatement
+import kestrel.sql.ast.FrameBound
+import kestrel.sql.ast.FrameBoundType
+import kestrel.sql.ast.FrameExclude
+import kestrel.sql.ast.FrameUnit
+import kestrel.sql.ast.FromItem
 import kestrel.sql.ast.FunctionExpression
+import kestrel.sql.ast.GroupingSetsSpec
+import kestrel.sql.ast.GroupingSpec
+import kestrel.sql.ast.InExpression
+import kestrel.sql.ast.InSubqueryExpression
 import kestrel.sql.ast.InsertStatement
+import kestrel.sql.ast.IsNullExpression
 import kestrel.sql.ast.JoinClause
 import kestrel.sql.ast.JoinType
+import kestrel.sql.ast.LikeExpression
 import kestrel.sql.ast.LiteralExpression
+import kestrel.sql.ast.MergeActionExpression
+import kestrel.sql.ast.MergeMatchedDelete
+import kestrel.sql.ast.MergeMatchedUpdate
+import kestrel.sql.ast.MergeNotMatchedInsert
+import kestrel.sql.ast.MergeStatement
+import kestrel.sql.ast.MergeWhenClause
+import kestrel.sql.ast.NextValueExpression
+import kestrel.sql.ast.OnConflictClause
 import kestrel.sql.ast.OrderBy
+import kestrel.sql.ast.OrderKey
+import kestrel.sql.ast.ParameterExpression
+import kestrel.sql.ast.PrepareStatement
+import kestrel.sql.ast.PreparableStatement
 import kestrel.sql.ast.Projection
+import kestrel.sql.ast.QueryStatement
+import kestrel.sql.ast.ReleaseSavepointStatement
+import kestrel.sql.ast.RenameColumn
+import kestrel.sql.ast.RenameTable
 import kestrel.sql.ast.RollbackStatement
+import kestrel.sql.ast.RollbackToSavepointStatement
+import kestrel.sql.ast.RollupSpec
+import kestrel.sql.ast.SavepointStatement
+import kestrel.sql.ast.ScalarSubqueryExpression
 import kestrel.sql.ast.SelectItem
 import kestrel.sql.ast.SelectStatement
+import kestrel.sql.ast.SetOperationStatement
+import kestrel.sql.ast.SetOperator
 import kestrel.sql.ast.StarProjection
 import kestrel.sql.ast.Statement
+import kestrel.sql.ast.SubquerySource
+import kestrel.sql.ast.TableSource
+import kestrel.sql.ast.TruncateTableStatement
+import kestrel.sql.ast.TriggerEvent
+import kestrel.sql.ast.TriggerTiming
 import kestrel.sql.ast.UnaryExpression
 import kestrel.sql.ast.UnaryOperator
 import kestrel.sql.ast.UpdateStatement
+import kestrel.sql.ast.WindowExpression
+import kestrel.sql.ast.WindowFrame
+import kestrel.sql.ast.WindowFunctionKind
+import kestrel.sql.ast.WithQuery
 import kestrel.sql.lexer.Token
 import kestrel.sql.lexer.TokenType
+import kestrel.storage.Collation
 import kestrel.storage.ColumnType
 import kestrel.storage.Value
 
@@ -56,24 +137,52 @@ class Parser(private val tokens: List<Token>) {
         return when (token.type) {
             TokenType.Create -> parseCreate()
             TokenType.Insert -> parseInsert()
-            TokenType.Select -> parseSelect()
+            TokenType.Select -> parseQueryStatement()
+            TokenType.With -> parseQueryStatement()
             TokenType.Delete -> parseDelete()
             TokenType.Update -> parseUpdate()
             TokenType.Drop -> parseDrop()
+            TokenType.Truncate -> parseTruncate()
+            TokenType.Merge -> parseMerge()
+            TokenType.Alter -> parseAlter()
             TokenType.Explain -> parseExplain()
             TokenType.Begin -> parseBegin()
             TokenType.Commit -> parseCommit()
             TokenType.Rollback -> parseRollback()
+            TokenType.Savepoint -> parseSavepoint()
+            TokenType.Release -> parseReleaseSavepoint()
+            TokenType.Prepare -> parsePrepare()
+            TokenType.Execute -> parseExecute()
+            TokenType.Deallocate -> parseDeallocate()
             else -> throw error("expected a statement but found '${describe(token)}'", token)
         }
     }
 
     private fun parseCreate(): Statement {
         expect(TokenType.Create, "expected CREATE")
+        var orReplace = false
+        if (match(TokenType.Or)) {
+            expect(TokenType.Replace, "expected REPLACE after OR")
+            orReplace = true
+        }
+        if (orReplace && !check(TokenType.View)) {
+            throw error("OR REPLACE is only supported for VIEW but found '${describe(peek())}'", peek())
+        }
+        val temporary = match(TokenType.Temp) || match(TokenType.Temporary)
+        if (temporary && !check(TokenType.Table)) {
+            throw error("TEMP/TEMPORARY is only supported for TABLE but found '${describe(peek())}'", peek())
+        }
         return when {
-            check(TokenType.Table) -> parseCreateTable()
-            check(TokenType.Index) -> parseCreateIndex()
-            else -> throw error("expected TABLE or INDEX after CREATE but found '${describe(peek())}'", peek())
+            check(TokenType.Table) -> parseCreateTable(temporary)
+            check(TokenType.Index) -> parseCreateIndex(unique = false)
+            check(TokenType.Unique) -> parseCreateUniqueIndex()
+            check(TokenType.View) -> parseCreateView(orReplace)
+            check(TokenType.Trigger) -> parseCreateTrigger()
+            check(TokenType.Sequence) -> parseCreateSequence()
+            else -> throw error(
+                "expected TABLE, INDEX, UNIQUE INDEX, VIEW, TRIGGER, or SEQUENCE after CREATE but found '${describe(peek())}'",
+                peek()
+            )
         }
     }
 
