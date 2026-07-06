@@ -186,20 +186,133 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    private fun parseCreateIndex(): CreateIndexStatement {
+    /**
+     * Every numeric option (`INCREMENT [BY]`/`MINVALUE`/`MAXVALUE`/`START [WITH]`) may appear at
+     * most once and in any order, matching Postgres; a repeated option silently keeps the last one
+     * written rather than erroring, the same "last one wins" leniency [parseAlterTable] already
+     * gives `ADD`/`DROP`/`RENAME` if written more than once in spirit (though that one can only ever
+     * carry a single action). `NO MINVALUE`/`NO MAXVALUE` here are never distinguished from "not
+     * written at all" - see [CreateSequenceStatement]'s own doc for why that's fine for CREATE
+     * specifically (unlike [AlterSequenceStatement], there is no earlier bound to preserve).
+     */
+    private fun parseCreateSequence(): CreateSequenceStatement {
+        expect(TokenType.Sequence, "expected SEQUENCE")
+        val name = expectIdentifier("expected sequence name")
+        var incrementBy: Long? = null
+        var minValue: Long? = null
+        var maxValue: Long? = null
+        var startValue: Long? = null
+        var cycle = false
+        while (true) {
+            when {
+                match(TokenType.Increment) -> {
+                    match(TokenType.By)
+                    incrementBy = expectLongLiteral("expected a value after INCREMENT BY")
+                }
+                match(TokenType.Minvalue) -> minValue = expectLongLiteral("expected a value after MINVALUE")
+                match(TokenType.Maxvalue) -> maxValue = expectLongLiteral("expected a value after MAXVALUE")
+                match(TokenType.Start) -> {
+                    match(TokenType.With)
+                    startValue = expectLongLiteral("expected a value after START WITH")
+                }
+                match(TokenType.Cycle) -> cycle = true
+                check(TokenType.No) && peekIsSequenceNoClause() -> {
+                    advance()
+                    when {
+                        match(TokenType.Minvalue) -> minValue = null
+                        match(TokenType.Maxvalue) -> maxValue = null
+                        match(TokenType.Cycle) -> cycle = false
+                        else -> error("unreachable: guarded by peekIsSequenceNoClause")
+                    }
+                }
+                else -> break
+            }
+        }
+        return CreateSequenceStatement(name, incrementBy, minValue, maxValue, startValue, cycle)
+    }
+
+    /** Distinguishes a sequence option's `NO MINVALUE|MAXVALUE|CYCLE` from `ON DELETE NO ACTION`'s unrelated `NO` - both start with the same token. */
+    private fun peekIsSequenceNoClause(): Boolean =
+        peekAt(1)?.type in setOf(TokenType.Minvalue, TokenType.Maxvalue, TokenType.Cycle)
+
+    private fun peekAt(offset: Int): Token? = tokens.getOrNull(position + offset)
+
+    /**
+     * `body` is deliberately restricted to INSERT/UPDATE/DELETE ([parseTriggerBodyStatement]) -
+     * the only statement kinds with a side effect worth firing, matching SQLite's own trigger-body
+     * grammar. The closing `END` here is the trigger body's own terminator, distinct from the `;`
+     * `parseProgram` still expects after the whole CREATE TRIGGER statement.
+     */
+    private fun parseCreateTrigger(): CreateTriggerStatement {
+        expect(TokenType.Trigger, "expected TRIGGER")
+        val triggerName = expectIdentifier("expected trigger name")
+        val timing = when {
+            match(TokenType.Before) -> TriggerTiming.Before
+            match(TokenType.After) -> TriggerTiming.After
+            else -> throw error("expected BEFORE or AFTER after trigger name but found '${describe(peek())}'", peek())
+        }
+        val event = when {
+            match(TokenType.Insert) -> TriggerEvent.Insert
+            match(TokenType.Update) -> TriggerEvent.Update
+            match(TokenType.Delete) -> TriggerEvent.Delete
+            else -> throw error("expected INSERT, UPDATE, or DELETE after ${timing.name.uppercase()} but found '${describe(peek())}'", peek())
+        }
+        expect(TokenType.On, "expected ON after trigger event")
+        val tableName = expectIdentifier("expected table name")
+        expect(TokenType.For, "expected FOR after table name")
+        expect(TokenType.Each, "expected EACH after FOR")
+        expect(TokenType.Row, "expected ROW after EACH")
+        val whenClause = if (match(TokenType.When)) parseExpression() else null
+        expect(TokenType.Begin, "expected BEGIN to start trigger body")
+        val body = mutableListOf<Statement>()
+        while (!check(TokenType.End)) {
+            body.add(parseTriggerBodyStatement())
+            expect(TokenType.Semicolon, "expected ';' after trigger body statement")
+        }
+        expect(TokenType.End, "expected END to close trigger body")
+        return CreateTriggerStatement(triggerName, timing, event, tableName, whenClause, body)
+    }
+
+    private fun parseTriggerBodyStatement(): Statement = when (peek().type) {
+        TokenType.Insert -> parseInsert()
+        TokenType.Update -> parseUpdate()
+        TokenType.Delete -> parseDelete()
+        else -> throw error(
+            "trigger body only supports INSERT, UPDATE, or DELETE statements but found '${describe(peek())}'",
+            peek()
+        )
+    }
+
+    private fun parseCreateView(orReplace: Boolean): CreateViewStatement {
+        expect(TokenType.View, "expected VIEW")
+        val viewName = expectIdentifier("expected view name")
+        expect(TokenType.As, "expected AS after view name")
+        val query = parseQueryStatement()
+        return CreateViewStatement(viewName, query, orReplace)
+    }
+
+    private fun parseCreateUniqueIndex(): CreateIndexStatement {
+        expect(TokenType.Unique, "expected UNIQUE")
+        return parseCreateIndex(unique = true)
+    }
+
+    private fun parseCreateIndex(unique: Boolean): CreateIndexStatement {
         expect(TokenType.Index, "expected INDEX")
         val indexName = expectIdentifier("expected index name")
         expect(TokenType.On, "expected ON after index name")
         val tableName = expectIdentifier("expected table name")
         expect(TokenType.LeftParen, "expected '(' before indexed column")
-        val columnName = expectIdentifier("expected column name")
+        val columnNames = mutableListOf(expectIdentifier("expected column name"))
+        while (match(TokenType.Comma)) {
+            columnNames.add(expectIdentifier("expected column name"))
+        }
         expect(TokenType.RightParen, "expected ')' after indexed column")
-        return CreateIndexStatement(indexName, tableName, columnName)
+        return CreateIndexStatement(indexName, tableName, columnNames, unique)
     }
 
     private fun parseExplain(): ExplainStatement {
         expect(TokenType.Explain, "expected EXPLAIN")
-        return ExplainStatement(parseSelect())
+        return ExplainStatement(parseQueryStatement())
     }
 
     private fun parseBegin(): Statement {
@@ -216,34 +329,149 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseRollback(): Statement {
         expect(TokenType.Rollback, "expected ROLLBACK")
+        if (match(TokenType.To)) {
+            match(TokenType.Savepoint)
+            val name = expectIdentifier("expected savepoint name after ROLLBACK TO")
+            return RollbackToSavepointStatement(name)
+        }
         match(TokenType.Transaction)
         return RollbackStatement
     }
 
-    private fun parseCreateTable(): CreateTableStatement {
+    private fun parseSavepoint(): Statement {
+        expect(TokenType.Savepoint, "expected SAVEPOINT")
+        val name = expectIdentifier("expected savepoint name after SAVEPOINT")
+        return SavepointStatement(name)
+    }
+
+    private fun parseReleaseSavepoint(): Statement {
+        expect(TokenType.Release, "expected RELEASE")
+        match(TokenType.Savepoint)
+        val name = expectIdentifier("expected savepoint name after RELEASE")
+        return ReleaseSavepointStatement(name)
+    }
+
+    private fun parsePrepare(): Statement {
+        expect(TokenType.Prepare, "expected PREPARE")
+        val name = expectIdentifier("expected prepared statement name")
+        expect(TokenType.As, "expected AS after prepared statement name")
+        return PrepareStatement(name, parsePreparableStatement())
+    }
+
+    private fun parsePreparableStatement(): PreparableStatement = when (peek().type) {
+        TokenType.Select, TokenType.With -> parseQueryStatement()
+        TokenType.Insert -> parseInsert()
+        TokenType.Update -> parseUpdate()
+        TokenType.Delete -> parseDelete()
+        TokenType.Merge -> parseMerge()
+        else -> throw error(
+            "PREPARE only supports SELECT, INSERT, UPDATE, DELETE, or MERGE but found '${describe(peek())}'",
+            peek()
+        )
+    }
+
+    private fun parseExecute(): Statement {
+        expect(TokenType.Execute, "expected EXECUTE")
+        val name = expectIdentifier("expected prepared statement name")
+        val arguments = mutableListOf<Expression>()
+        if (match(TokenType.LeftParen)) {
+            if (!check(TokenType.RightParen)) {
+                arguments.add(parseExpression())
+                while (match(TokenType.Comma)) arguments.add(parseExpression())
+            }
+            expect(TokenType.RightParen, "expected ')' after EXECUTE arguments")
+        }
+        return ExecuteStatement(name, arguments)
+    }
+
+    private fun parseDeallocate(): Statement {
+        expect(TokenType.Deallocate, "expected DEALLOCATE")
+        match(TokenType.Prepare)
+        if (match(TokenType.All)) return DeallocateStatement(null, all = true)
+        val name = expectIdentifier("expected prepared statement name or ALL after DEALLOCATE")
+        return DeallocateStatement(name)
+    }
+
+    private fun parseCreateTable(temporary: Boolean = false): CreateTableStatement {
         expect(TokenType.Table, "expected TABLE after CREATE")
         val tableName = expectIdentifier("expected table name")
         expect(TokenType.LeftParen, "expected '(' after table name")
         val columns = mutableListOf<Column>()
+        val foreignKeys = mutableListOf<ForeignKeyConstraint>()
+        val checks = mutableListOf<CheckConstraint>()
+        val uniqueConstraints = mutableListOf<UniqueConstraint>()
+        var compositePrimaryKey: List<String> = emptyList()
         do {
-            columns.add(parseColumnDefinition())
+            when {
+                check(TokenType.Constraint) -> parseNamedTableConstraint(foreignKeys, checks, uniqueConstraints)
+                check(TokenType.Foreign) -> foreignKeys.add(parseTableForeignKey())
+                check(TokenType.Check) -> checks.add(parseTableCheck())
+                check(TokenType.Unique) -> uniqueConstraints.add(parseTableUnique())
+                check(TokenType.Primary) -> {
+                    if (compositePrimaryKey.isNotEmpty()) {
+                        throw error("table declares more than one PRIMARY KEY clause", peek())
+                    }
+                    compositePrimaryKey = parseTablePrimaryKey()
+                }
+                else -> columns.add(parseColumnDefinition(foreignKeys, checks, uniqueConstraints))
+            }
         } while (match(TokenType.Comma))
         expect(TokenType.RightParen, "expected ')' after column definitions")
-        return CreateTableStatement(tableName, columns)
+        return CreateTableStatement(tableName, columns, foreignKeys, checks, uniqueConstraints, compositePrimaryKey, temporary)
     }
 
-    private fun parseColumnDefinition(): Column {
-        val columnName = expectIdentifier("expected column name")
-        val typeToken = advance()
-        val type = when (typeToken.type) {
-            TokenType.Integer -> ColumnType.Integer
-            TokenType.Text -> ColumnType.Text
-            TokenType.Boolean -> ColumnType.Boolean
-            TokenType.Real -> ColumnType.Real
-            else -> throw error("expected a column type but found '${describe(typeToken)}'", typeToken)
+    private fun parseTablePrimaryKey(): List<String> {
+        expect(TokenType.Primary, "expected PRIMARY")
+        expect(TokenType.Key, "expected KEY after PRIMARY")
+        expect(TokenType.LeftParen, "expected '(' after PRIMARY KEY")
+        val columns = mutableListOf<String>()
+        do {
+            columns.add(expectIdentifier("expected column name"))
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after PRIMARY KEY column list")
+        return columns
+    }
+
+    /**
+     * `CONSTRAINT name FOREIGN KEY (...) | CHECK (...) | UNIQUE (...)` - a named table-level
+     * constraint, standard SQL syntax this engine accepts both inline in `CREATE TABLE` (here) and
+     * via `ALTER TABLE ... ADD` (see [parseAlterTable]'s identical dispatch). `PRIMARY KEY` is
+     * deliberately not accepted after `CONSTRAINT name`: [kestrel.catalog.TableSchema] has no name
+     * field for a table's PRIMARY KEY at all, so there would be nowhere to put it, and
+     * `ALTER TABLE ... DROP CONSTRAINT` never needs to target a PRIMARY KEY (see
+     * [kestrel.catalog.Catalog.dropColumn]'s own doc on why dropping a PRIMARY KEY is out of scope
+     * entirely - redesign it or drop the table instead).
+     */
+    private fun parseNamedTableConstraint(
+        foreignKeys: MutableList<ForeignKeyConstraint>,
+        checks: MutableList<CheckConstraint>,
+        uniqueConstraints: MutableList<UniqueConstraint>
+    ) {
+        advance()
+        val name = expectIdentifier("expected constraint name after CONSTRAINT")
+        when {
+            check(TokenType.Foreign) -> foreignKeys.add(parseTableForeignKey().copy(name = name))
+            check(TokenType.Check) -> checks.add(parseTableCheck().copy(name = name))
+            check(TokenType.Unique) -> uniqueConstraints.add(parseTableUnique().copy(name = name))
+            else -> throw error(
+                "expected FOREIGN KEY, CHECK, or UNIQUE after CONSTRAINT $name but found '${describe(peek())}'",
+                peek()
+            )
         }
+    }
+
+    private fun parseColumnDefinition(
+        foreignKeys: MutableList<ForeignKeyConstraint>,
+        checks: MutableList<CheckConstraint>,
+        uniqueConstraints: MutableList<UniqueConstraint>
+    ): Column {
+        val columnName = expectIdentifier("expected column name")
+        val spec = parseTypeSpec()
         var notNull = false
         var primaryKey = false
+        var default: Expression? = null
+        var generated: Expression? = null
+        var collation = Collation.Binary
         while (true) {
             when {
                 check(TokenType.Not) -> {
@@ -257,10 +485,168 @@ class Parser(private val tokens: List<Token>) {
                     primaryKey = true
                     notNull = true
                 }
+                check(TokenType.Unique) -> {
+                    advance()
+                    uniqueConstraints.add(UniqueConstraint(null, listOf(columnName)))
+                }
+                check(TokenType.References) -> foreignKeys.add(parseInlineForeignKey(columnName))
+                check(TokenType.Check) -> checks.add(parseColumnCheck())
+                check(TokenType.Default) -> {
+                    advance()
+                    default = parseExpression()
+                }
+                isContextualKeyword("GENERATED") -> generated = parseGeneratedClause()
+                check(TokenType.Collate) -> collation = parseColumnCollation()
                 else -> break
             }
         }
-        return Column(columnName, type, notNull, primaryKey)
+        if (generated != null && default != null) {
+            throw error("a column cannot declare both DEFAULT and GENERATED ALWAYS AS", peek())
+        }
+        if (generated != null && primaryKey) {
+            throw error("a GENERATED column cannot be a PRIMARY KEY", peek())
+        }
+        return Column(columnName, spec.type, notNull, primaryKey, spec.precision, spec.scale, default, generated, collation)
+    }
+
+    /** `COLLATE name` on a column definition (`CREATE TABLE`/`ALTER TABLE ADD COLUMN`) - reuses the same name validation as expression-level `expr COLLATE name` (see [parseCollate]). */
+    private fun parseColumnCollation(): Collation {
+        advance()
+        val nameToken = expect(TokenType.Identifier, "expected a collation name after COLLATE")
+        return Collation.fromName(nameToken.lexeme) ?: throw error("no such collating sequence: ${nameToken.lexeme}", nameToken)
+    }
+
+    /**
+     * `GENERATED ALWAYS AS ( expression ) STORED` - Postgres only ever supports `STORED` (unlike
+     * MySQL/SQLite, which also allow `VIRTUAL`), so this engine matches Postgres exactly rather than
+     * accepting a keyword it would then have to silently reinterpret. `GENERATED`/`ALWAYS`/`STORED`
+     * are contextual (same mechanism as `ROLLUP`/`CUBE`/`FILTER`), not reserved keywords, so a table
+     * can still name a column `generated` without quoting.
+     */
+    private fun parseGeneratedClause(): Expression {
+        advance()
+        if (!isContextualKeyword("ALWAYS")) throw error("expected ALWAYS after GENERATED", peek())
+        advance()
+        expect(TokenType.As, "expected AS after GENERATED ALWAYS")
+        expect(TokenType.LeftParen, "expected '(' after GENERATED ALWAYS AS")
+        val expression = parseExpression()
+        expect(TokenType.RightParen, "expected ')' to close GENERATED ALWAYS AS expression")
+        if (!isContextualKeyword("STORED")) throw error("expected STORED after GENERATED ALWAYS AS (...)", peek())
+        advance()
+        return expression
+    }
+
+    private fun parseTableUnique(): UniqueConstraint {
+        expect(TokenType.Unique, "expected UNIQUE")
+        expect(TokenType.LeftParen, "expected '(' after UNIQUE")
+        val columns = mutableListOf<String>()
+        do {
+            columns.add(expectIdentifier("expected column name"))
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after UNIQUE column list")
+        return UniqueConstraint(null, columns)
+    }
+
+    private fun parseTableForeignKey(): ForeignKeyConstraint {
+        expect(TokenType.Foreign, "expected FOREIGN")
+        expect(TokenType.Key, "expected KEY after FOREIGN")
+        expect(TokenType.LeftParen, "expected '(' after FOREIGN KEY")
+        val columnNames = mutableListOf<String>()
+        do {
+            columnNames.add(expectIdentifier("expected column name"))
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after foreign key column list")
+        return parseInlineForeignKey(columnNames)
+    }
+
+    private fun parseInlineForeignKey(columnName: String): ForeignKeyConstraint = parseInlineForeignKey(listOf(columnName))
+
+    private fun parseInlineForeignKey(columnNames: List<String>): ForeignKeyConstraint {
+        expect(TokenType.References, "expected REFERENCES")
+        val refTable = expectIdentifier("expected referenced table name")
+        expect(TokenType.LeftParen, "expected '(' before referenced column list")
+        val refColumns = mutableListOf<String>()
+        do {
+            refColumns.add(expectIdentifier("expected referenced column name"))
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after referenced column list")
+        if (refColumns.size != columnNames.size) {
+            throw error(
+                "FOREIGN KEY (${columnNames.joinToString(", ")}) has ${columnNames.size} column(s) but " +
+                    "REFERENCES $refTable(${refColumns.joinToString(", ")}) has ${refColumns.size}",
+                peek()
+            )
+        }
+        var onDelete = ForeignKeyAction.NoAction
+        var onUpdate = ForeignKeyAction.NoAction
+        while (check(TokenType.On)) {
+            advance()
+            when {
+                match(TokenType.Delete) -> onDelete = parseForeignKeyAction()
+                match(TokenType.Update) -> onUpdate = parseForeignKeyAction()
+                else -> throw error("expected DELETE or UPDATE after ON", peek())
+            }
+        }
+        return ForeignKeyConstraint(columnNames, refTable, refColumns, onDelete, onUpdate)
+    }
+
+    private fun parseForeignKeyAction(): ForeignKeyAction = when {
+        match(TokenType.Cascade) -> ForeignKeyAction.Cascade
+        match(TokenType.Restrict) -> ForeignKeyAction.Restrict
+        match(TokenType.Set) -> {
+            expect(TokenType.Null, "expected NULL after SET")
+            ForeignKeyAction.SetNull
+        }
+        match(TokenType.No) -> {
+            expect(TokenType.Action, "expected ACTION after NO")
+            ForeignKeyAction.NoAction
+        }
+        else -> throw error("expected CASCADE, RESTRICT, SET NULL, or NO ACTION but found '${describe(peek())}'", peek())
+    }
+
+    private fun parseTableCheck(): CheckConstraint = parseCheckConstraint()
+
+    private fun parseColumnCheck(): CheckConstraint = parseCheckConstraint()
+
+    private fun parseCheckConstraint(): CheckConstraint {
+        expect(TokenType.Check, "expected CHECK")
+        expect(TokenType.LeftParen, "expected '(' after CHECK")
+        val expression = parseExpression()
+        expect(TokenType.RightParen, "expected ')' after CHECK expression")
+        return CheckConstraint(null, expression)
+    }
+
+    private data class TypeSpec(val type: ColumnType, val precision: Int?, val scale: Int?)
+
+    /** Shared by column definitions (`CREATE TABLE`) and `CAST(... AS type)`. */
+    private fun parseTypeSpec(): TypeSpec {
+        val typeToken = advance()
+        val type = when (typeToken.type) {
+            TokenType.Integer -> ColumnType.Integer
+            TokenType.Text -> ColumnType.Text
+            TokenType.Boolean -> ColumnType.Boolean
+            TokenType.Real -> ColumnType.Real
+            TokenType.Decimal -> ColumnType.Decimal
+            TokenType.Date -> ColumnType.Date
+            else -> throw error("expected a type but found '${describe(typeToken)}'", typeToken)
+        }
+        var precision: Int? = null
+        var scale: Int? = null
+        if (type == ColumnType.Decimal && match(TokenType.LeftParen)) {
+            precision = expectIntLiteral("expected precision in DECIMAL(...)")
+            scale = if (match(TokenType.Comma)) expectIntLiteral("expected scale in DECIMAL(precision, scale)") else 0
+            expect(TokenType.RightParen, "expected ')' after DECIMAL precision/scale")
+        }
+        return TypeSpec(type, precision, scale)
+    }
+
+    private fun expectIntLiteral(message: String): Int = expect(TokenType.IntLiteral, message).intValue!!.toInt()
+
+    /** A sequence option's bound (MINVALUE/MAXVALUE/START WITH/RESTART WITH) needs the full 64-bit range, unlike [expectIntLiteral]'s callers - and, unlike those, may be negative for a descending sequence. */
+    private fun expectLongLiteral(message: String): Long {
+        val negative = match(TokenType.Minus)
+        val value = expect(TokenType.IntLiteral, message).intValue!!
+        return if (negative) -value else value
     }
 
     private fun parseInsert(): InsertStatement {
@@ -277,31 +663,136 @@ class Parser(private val tokens: List<Token>) {
             columns = names
         }
         expect(TokenType.Values, "expected VALUES")
-        val rows = mutableListOf<List<Expression>>()
+        val rows = mutableListOf<List<Expression?>>()
         do {
             expect(TokenType.LeftParen, "expected '(' before value list")
-            val values = mutableListOf<Expression>()
+            val values = mutableListOf<Expression?>()
             do {
-                values.add(parseExpression())
+                values.add(if (match(TokenType.Default)) null else parseExpression())
             } while (match(TokenType.Comma))
             expect(TokenType.RightParen, "expected ')' after value list")
             rows.add(values)
         } while (match(TokenType.Comma))
-        return InsertStatement(tableName, columns, rows)
+        val onConflict = if (check(TokenType.On)) parseOnConflict() else null
+        val returning = parseReturning()
+        return InsertStatement(tableName, columns, rows, onConflict, returning)
+    }
+
+    private fun parseReturning(): Projection? = if (match(TokenType.Returning)) parseProjection() else null
+
+    private fun parseOnConflict(): OnConflictClause {
+        expect(TokenType.On, "expected ON")
+        expect(TokenType.Conflict, "expected CONFLICT after ON")
+        var targetColumns: List<String> = emptyList()
+        if (match(TokenType.LeftParen)) {
+            val names = mutableListOf<String>()
+            do {
+                names.add(expectIdentifier("expected column name"))
+            } while (match(TokenType.Comma))
+            expect(TokenType.RightParen, "expected ')' after ON CONFLICT column list")
+            targetColumns = names
+        }
+        expect(TokenType.Do, "expected DO after ON CONFLICT")
+        val action: ConflictAction = when {
+            match(TokenType.Nothing) -> ConflictDoNothing
+            match(TokenType.Update) -> {
+                expect(TokenType.Set, "expected SET after DO UPDATE")
+                val assignments = parseAssignmentList()
+                val where = if (match(TokenType.Where)) parseExpression() else null
+                ConflictDoUpdate(assignments, where)
+            }
+            else -> throw error("expected NOTHING or UPDATE after DO but found '${describe(peek())}'", peek())
+        }
+        return OnConflictClause(targetColumns, action)
     }
 
     private fun parseSelect(): SelectStatement {
+        val core = parseSelectCore()
+        val orderBy = parseOrderBy()
+        val (limit, offset) = parseLimitOffset()
+        return core.copy(orderBy = orderBy, limit = limit, offset = offset)
+    }
+
+    private fun parseSelectCore(): SelectStatement {
         expect(TokenType.Select, "expected SELECT")
+        val (distinct, distinctOn) = parseDistinctClause()
         val projection = parseProjection()
         expect(TokenType.From, "expected FROM")
-        val (tableName, tableAlias) = parseTableRef()
+        val from = parseFromItem()
         val joins = parseJoins()
         val where = if (match(TokenType.Where)) parseExpression() else null
         val groupBy = parseGroupBy()
         val having = if (match(TokenType.Having)) parseExpression() else null
+        return SelectStatement(
+            projection, from, joins, where, groupBy.groupBy, groupBy.spec, having,
+            distinct = distinct, distinctOn = distinctOn
+        )
+    }
+
+    /** `SELECT [ALL | DISTINCT | DISTINCT ON (expr, ...)] ...` - `ALL` (the default) is accepted and discarded, matching Postgres. */
+    private fun parseDistinctClause(): Pair<Boolean, List<Expression>> {
+        if (match(TokenType.All)) return false to emptyList()
+        if (!match(TokenType.Distinct)) return false to emptyList()
+        if (!match(TokenType.On)) return true to emptyList()
+        expect(TokenType.LeftParen, "expected '(' after DISTINCT ON")
+        val expressions = mutableListOf<Expression>()
+        do {
+            expressions.add(parseExpression())
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after DISTINCT ON expressions")
+        return true to expressions
+    }
+
+    private fun parseQueryStatement(): QueryStatement {
+        if (check(TokenType.With)) return parseWithQuery()
+        return parseCompoundQuery()
+    }
+
+    private fun parseWithQuery(): WithQuery {
+        expect(TokenType.With, "expected WITH")
+        val recursive = match(TokenType.Recursive)
+        val ctes = mutableListOf<CommonTableExpression>()
+        do {
+            val name = expectIdentifier("expected common table expression name")
+            var columns: List<String>? = null
+            if (match(TokenType.LeftParen)) {
+                val names = mutableListOf<String>()
+                do {
+                    names.add(expectIdentifier("expected column name"))
+                } while (match(TokenType.Comma))
+                expect(TokenType.RightParen, "expected ')' after column list")
+                columns = names
+            }
+            expect(TokenType.As, "expected AS after common table expression name")
+            expect(TokenType.LeftParen, "expected '(' after AS")
+            val query = parseCompoundQuery()
+            expect(TokenType.RightParen, "expected ')' after common table expression")
+            ctes.add(CommonTableExpression(name, columns, query))
+        } while (match(TokenType.Comma))
+        val body = parseCompoundQuery()
+        return WithQuery(recursive, ctes, body)
+    }
+
+    private fun parseCompoundQuery(): QueryStatement {
+        var left: QueryStatement = parseSelectCore()
+        while (true) {
+            val operator = when {
+                match(TokenType.Union) -> if (match(TokenType.All)) SetOperator.UnionAll else SetOperator.Union
+                match(TokenType.Intersect) -> if (match(TokenType.All)) SetOperator.IntersectAll else SetOperator.Intersect
+                match(TokenType.Except) -> if (match(TokenType.All)) SetOperator.ExceptAll else SetOperator.Except
+                else -> break
+            }
+            val right = parseSelectCore()
+            left = SetOperationStatement(operator, left, right)
+        }
         val orderBy = parseOrderBy()
-        val limit = parseLimit()
-        return SelectStatement(projection, tableName, tableAlias, joins, where, groupBy, having, orderBy, limit)
+        val (limit, offset) = parseLimitOffset()
+        if (orderBy == null && limit == null && offset == null) return left
+        return when (left) {
+            is SelectStatement -> left.copy(orderBy = orderBy, limit = limit, offset = offset)
+            is SetOperationStatement -> left.copy(orderBy = orderBy, limit = limit, offset = offset)
+            is WithQuery -> error("unreachable: parseSelectCore never produces a WITH query")
+        }
     }
 
     private fun parseProjection(): Projection {
@@ -315,14 +806,27 @@ class Parser(private val tokens: List<Token>) {
         return ExpressionProjection(items)
     }
 
-    private fun parseTableRef(): Pair<String, String?> {
+    private fun parseFromItem(): FromItem {
+        if (match(TokenType.LeftParen)) {
+            if (!check(TokenType.Select) && !check(TokenType.With)) {
+                throw error("expected SELECT or WITH after '(' in FROM but found '${describe(peek())}'", peek())
+            }
+            val select = parseQueryStatement()
+            expect(TokenType.RightParen, "expected ')' after derived table subquery")
+            val alias = when {
+                match(TokenType.As) -> expectIdentifier("expected alias after AS")
+                check(TokenType.Identifier) -> advance().lexeme
+                else -> throw error("a derived table in FROM requires an alias", peek())
+            }
+            return SubquerySource(select, alias)
+        }
         val tableName = expectIdentifier("expected table name")
         val alias = when {
             match(TokenType.As) -> expectIdentifier("expected alias after AS")
             check(TokenType.Identifier) -> advance().lexeme
             else -> null
         }
-        return tableName to alias
+        return TableSource(tableName, alias)
     }
 
     private fun parseJoins(): List<JoinClause> {
@@ -335,41 +839,173 @@ class Parser(private val tokens: List<Token>) {
                 match(TokenType.Left) -> {
                     match(TokenType.Outer); expect(TokenType.Join, "expected JOIN after LEFT"); JoinType.Left
                 }
+                match(TokenType.Right) -> {
+                    match(TokenType.Outer); expect(TokenType.Join, "expected JOIN after RIGHT"); JoinType.Right
+                }
+                match(TokenType.Full) -> {
+                    match(TokenType.Outer); expect(TokenType.Join, "expected JOIN after FULL"); JoinType.Full
+                }
+                match(TokenType.Cross) -> {
+                    expect(TokenType.Join, "expected JOIN after CROSS"); JoinType.Cross
+                }
                 match(TokenType.Join) -> JoinType.Inner
                 else -> break
             }
-            val (tableName, alias) = parseTableRef()
-            expect(TokenType.On, "expected ON after joined table")
-            joins.add(JoinClause(type, tableName, alias, parseExpression()))
+            val lateral = match(TokenType.Lateral)
+            // A LATERAL right-hand side has no independent row set (it is re-evaluated per left
+            // row), so there is nothing to pad with NULLs for an unmatched *right* row - RIGHT/FULL
+            // JOIN LATERAL is therefore meaningless and rejected here rather than at execution time.
+            if (lateral && (type == JoinType.Right || type == JoinType.Full)) {
+                throw error("RIGHT/FULL JOIN LATERAL is not supported: LATERAL has no independent right-hand row set", peek())
+            }
+            val from = parseFromItem()
+            if (lateral && from !is SubquerySource) {
+                throw error("LATERAL is only allowed before a derived table subquery", peek())
+            }
+            val taggedFrom = if (lateral) (from as SubquerySource).copy(lateral = true) else from
+            // CROSS JOIN has no ON clause at all - matches every left/right pairing unconditionally.
+            val on = if (type == JoinType.Cross) {
+                if (check(TokenType.On)) throw error("CROSS JOIN does not take an ON condition", peek())
+                null
+            } else {
+                expect(TokenType.On, "expected ON after joined table")
+                parseExpression()
+            }
+            joins.add(JoinClause(type, taggedFrom, on))
         }
         return joins
     }
 
-    private fun parseGroupBy(): List<Expression> {
-        if (!match(TokenType.Group)) return emptyList()
+    private data class GroupByClause(val groupBy: List<Expression>, val spec: GroupingSpec?)
+
+    /**
+     * `ROLLUP`/`CUBE`/`GROUPING SETS` are not reserved keywords (matching how most SQL engines treat
+     * them - only meaningful right after `GROUP BY`), so they are recognized here by peeking at an
+     * [TokenType.Identifier]'s text rather than via a dedicated token type; a bare column actually
+     * named e.g. `rollup` is unaffected since the lookahead also requires the following token to open
+     * the parenthesized argument list. Mixing plain columns with one of these in the same clause (SQL
+     * allows it, producing a cross product of sets) is a scope cut - exactly one form fills the whole
+     * clause.
+     */
+    private fun parseGroupBy(): GroupByClause {
+        if (!match(TokenType.Group)) return GroupByClause(emptyList(), null)
         expect(TokenType.By, "expected BY after GROUP")
+        if (isContextualKeyword("ROLLUP") && peekNext().type == TokenType.LeftParen) {
+            advance()
+            val expressions = parseParenthesizedExpressionList("ROLLUP")
+            return GroupByClause(expressions, RollupSpec(expressions))
+        }
+        if (isContextualKeyword("CUBE") && peekNext().type == TokenType.LeftParen) {
+            advance()
+            val expressions = parseParenthesizedExpressionList("CUBE")
+            return GroupByClause(expressions, CubeSpec(expressions))
+        }
+        if (isContextualKeyword("GROUPING") && peekNext().let { it.type == TokenType.Identifier && it.lexeme.equals("SETS", ignoreCase = true) }) {
+            advance()
+            advance()
+            expect(TokenType.LeftParen, "expected '(' after GROUPING SETS")
+            val sets = mutableListOf<List<Expression>>()
+            do {
+                sets.add(parseGroupingSetElement())
+            } while (match(TokenType.Comma))
+            expect(TokenType.RightParen, "expected ')' to close GROUPING SETS")
+            val union = sets.flatten().distinct()
+            return GroupByClause(union, GroupingSetsSpec(sets))
+        }
         val expressions = mutableListOf<Expression>()
         do {
             expressions.add(parseExpression())
         } while (match(TokenType.Comma))
+        return GroupByClause(expressions, null)
+    }
+
+    private fun isContextualKeyword(name: String): Boolean =
+        check(TokenType.Identifier) && peek().lexeme.equals(name, ignoreCase = true)
+
+    private fun peekNext(): Token = tokens.getOrElse(position + 1) { tokens.last() }
+
+    private fun parseParenthesizedExpressionList(clauseName: String): List<Expression> {
+        expect(TokenType.LeftParen, "expected '(' after $clauseName")
+        val expressions = mutableListOf<Expression>()
+        if (!check(TokenType.RightParen)) {
+            do {
+                expressions.add(parseExpression())
+            } while (match(TokenType.Comma))
+        }
+        expect(TokenType.RightParen, "expected ')' to close $clauseName argument list")
+        return expressions
+    }
+
+    /** One element of `GROUPING SETS (...)`: `()` (the grand-total set) or a parenthesized expression list. */
+    private fun parseGroupingSetElement(): List<Expression> {
+        expect(TokenType.LeftParen, "expected '(' to open a GROUPING SETS element")
+        if (match(TokenType.RightParen)) return emptyList()
+        val expressions = mutableListOf<Expression>()
+        do {
+            expressions.add(parseExpression())
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' to close a GROUPING SETS element")
         return expressions
     }
 
     private fun parseOrderBy(): OrderBy? {
-        if (!match(TokenType.Order)) return null
-        expect(TokenType.By, "expected BY after ORDER")
-        val expression = parseExpression()
-        val descending = when {
-            match(TokenType.Desc) -> true
-            match(TokenType.Asc) -> false
-            else -> false
-        }
-        return OrderBy(expression, descending)
+        val keys = parseOrderKeys()
+        return if (keys.isEmpty()) null else OrderBy(keys)
     }
 
-    private fun parseLimit(): Int? {
-        if (!match(TokenType.Limit)) return null
-        return expect(TokenType.IntLiteral, "expected an integer after LIMIT").intValue!!.toInt()
+    /** Shared by top-level ORDER BY and a window function's `OVER (... ORDER BY ...)` clause. */
+    private fun parseOrderKeys(): List<OrderKey> {
+        if (!match(TokenType.Order)) return emptyList()
+        expect(TokenType.By, "expected BY after ORDER")
+        val keys = mutableListOf<OrderKey>()
+        do {
+            val expression = parseExpression()
+            val descending = when {
+                match(TokenType.Desc) -> true
+                match(TokenType.Asc) -> false
+                else -> false
+            }
+            val nullsFirst = parseOptionalNullsClause()
+            keys.add(OrderKey(expression, descending, nullsFirst))
+        } while (match(TokenType.Comma))
+        return keys
+    }
+
+    /**
+     * `NULLS FIRST` / `NULLS LAST`, optional after each ORDER BY key's own `ASC`/`DESC`. Like
+     * `ROLLUP`/`CUBE`/`FILTER`/`GENERATED` elsewhere in this parser, `NULLS`/`FIRST`/`LAST` are not
+     * reserved keywords - a column legitimately named any of the three is unaffected outside this
+     * exact position, since [isContextualKeyword] only fires here, right after an order key.
+     */
+    private fun parseOptionalNullsClause(): Boolean? {
+        if (!isContextualKeyword("NULLS")) return null
+        advance()
+        return when {
+            isContextualKeyword("FIRST") -> { advance(); true }
+            isContextualKeyword("LAST") -> { advance(); false }
+            else -> throw error("expected FIRST or LAST after NULLS but found '${describe(peek())}'", peek())
+        }
+    }
+
+    /**
+     * `LIMIT`/`OFFSET` may appear in either order (matching Postgres, unlike the standard's
+     * `OFFSET ... FETCH ...`), but not repeated - a second `LIMIT` or `OFFSET` stops the loop and is
+     * left for whatever follows (typically a parse error from the caller, e.g. a stray token before
+     * `;`) rather than silently overwriting the first.
+     */
+    private fun parseLimitOffset(): Pair<Int?, Int?> {
+        var limit: Int? = null
+        var offset: Int? = null
+        while (true) {
+            if (limit == null && match(TokenType.Limit)) {
+                limit = expect(TokenType.IntLiteral, "expected an integer after LIMIT").intValue!!.toInt()
+            } else if (offset == null && match(TokenType.Offset)) {
+                offset = expect(TokenType.IntLiteral, "expected an integer after OFFSET").intValue!!.toInt()
+            } else {
+                break
+            }
+        }
+        return limit to offset
     }
 
     private fun parseDelete(): DeleteStatement {
@@ -377,29 +1013,119 @@ class Parser(private val tokens: List<Token>) {
         expect(TokenType.From, "expected FROM after DELETE")
         val tableName = expectIdentifier("expected table name")
         val where = if (match(TokenType.Where)) parseExpression() else null
-        return DeleteStatement(tableName, where)
+        val returning = parseReturning()
+        return DeleteStatement(tableName, where, returning)
     }
 
     private fun parseUpdate(): UpdateStatement {
         expect(TokenType.Update, "expected UPDATE")
         val tableName = expectIdentifier("expected table name")
         expect(TokenType.Set, "expected SET after table name")
+        val assignments = parseAssignmentList()
+        val where = if (match(TokenType.Where)) parseExpression() else null
+        val returning = parseReturning()
+        return UpdateStatement(tableName, assignments, where, returning)
+    }
+
+    private fun parseAssignmentList(): List<Assignment> {
         val assignments = mutableListOf<Assignment>()
         do {
             val columnName = expectIdentifier("expected column name")
             expect(TokenType.Equal, "expected '=' in assignment")
-            assignments.add(Assignment(columnName, parseExpression()))
+            val value = if (match(TokenType.Default)) null else parseExpression()
+            assignments.add(Assignment(columnName, value))
         } while (match(TokenType.Comma))
-        val where = if (match(TokenType.Where)) parseExpression() else null
-        return UpdateStatement(tableName, assignments, where)
+        return assignments
+    }
+
+    /**
+     * `MERGE INTO target [[AS] alias] USING source ON condition (WHEN ...)+`. [parseFromItem] is
+     * reused verbatim for the `USING` source: it is exactly a `FROM`-shaped item (bare table name
+     * or a parenthesized, aliased derived-table subquery), not a MERGE-specific grammar production.
+     */
+    private fun parseMerge(): MergeStatement {
+        expect(TokenType.Merge, "expected MERGE")
+        expect(TokenType.Into, "expected INTO after MERGE")
+        val targetTable = expectIdentifier("expected target table name")
+        val targetAlias = parseOptionalAlias()
+        expect(TokenType.Using, "expected USING after MERGE target")
+        val source = parseFromItem()
+        expect(TokenType.On, "expected ON after MERGE USING source")
+        val onCondition = parseExpression()
+        val whenClauses = mutableListOf<MergeWhenClause>()
+        while (match(TokenType.When)) {
+            whenClauses.add(parseMergeWhenClause())
+        }
+        if (whenClauses.isEmpty()) {
+            throw error("MERGE requires at least one WHEN clause", peek())
+        }
+        val returning = parseReturning()
+        return MergeStatement(targetTable, targetAlias, source, onCondition, whenClauses, returning)
+    }
+
+    private fun parseOptionalAlias(): String? = when {
+        match(TokenType.As) -> expectIdentifier("expected alias after AS")
+        check(TokenType.Identifier) -> advance().lexeme
+        else -> null
+    }
+
+    /**
+     * `WHEN [NOT] MATCHED [AND condition] THEN action` - the `AND condition` sits between the
+     * MATCHED/NOT MATCHED keyword and THEN in both categories, matching Postgres. A NOT MATCHED
+     * action is always INSERT (there is no target row for NOT MATCHED to UPDATE or DELETE);
+     * [MergeNotMatchedInsert.values] uses the same "bare DEFAULT keyword or expression" per-slot
+     * grammar as plain INSERT's own VALUES list ([parseInsert]).
+     */
+    private fun parseMergeWhenClause(): MergeWhenClause {
+        val matched = when {
+            match(TokenType.Matched) -> true
+            match(TokenType.Not) -> {
+                expect(TokenType.Matched, "expected MATCHED after NOT")
+                false
+            }
+            else -> throw error("expected MATCHED or NOT MATCHED after WHEN but found '${describe(peek())}'", peek())
+        }
+        val condition = if (match(TokenType.And)) parseExpression() else null
+        expect(TokenType.Then, "expected THEN after WHEN ${if (matched) "MATCHED" else "NOT MATCHED"}")
+        if (matched) {
+            return when {
+                match(TokenType.Update) -> {
+                    expect(TokenType.Set, "expected SET after WHEN MATCHED THEN UPDATE")
+                    MergeMatchedUpdate(condition, parseAssignmentList())
+                }
+                match(TokenType.Delete) -> MergeMatchedDelete(condition)
+                else -> throw error("expected UPDATE or DELETE after WHEN MATCHED THEN but found '${describe(peek())}'", peek())
+            }
+        }
+        expect(TokenType.Insert, "expected INSERT after WHEN NOT MATCHED THEN")
+        var columns: List<String>? = null
+        if (match(TokenType.LeftParen)) {
+            val names = mutableListOf<String>()
+            do {
+                names.add(expectIdentifier("expected column name"))
+            } while (match(TokenType.Comma))
+            expect(TokenType.RightParen, "expected ')' after column list")
+            columns = names
+        }
+        expect(TokenType.Values, "expected VALUES after WHEN NOT MATCHED THEN INSERT")
+        expect(TokenType.LeftParen, "expected '(' before value list")
+        val values = mutableListOf<Expression?>()
+        do {
+            values.add(if (match(TokenType.Default)) null else parseExpression())
+        } while (match(TokenType.Comma))
+        expect(TokenType.RightParen, "expected ')' after value list")
+        return MergeNotMatchedInsert(condition, columns, values)
     }
 
     private fun parseDrop(): Statement {
         expect(TokenType.Drop, "expected DROP")
         return when {
-            match(TokenType.Table) -> DropTableStatement(expectIdentifier("expected table name"))
+            match(TokenType.Table) -> DropTableStatement(expectIdentifier("expected table name"), parseDropMode())
             match(TokenType.Index) -> DropIndexStatement(expectIdentifier("expected index name"))
-            else -> throw error("expected TABLE or INDEX after DROP but found '${describe(peek())}'", peek())
+            match(TokenType.View) -> DropViewStatement(expectIdentifier("expected view name"), parseDropMode())
+            match(TokenType.Trigger) -> DropTriggerStatement(expectIdentifier("expected trigger name"))
+            match(TokenType.Sequence) -> DropSequenceStatement(expectIdentifier("expected sequence name"))
+            else -> throw error("expected TABLE, INDEX, VIEW, TRIGGER, or SEQUENCE after DROP but found '${describe(peek())}'", peek())
         }
     }
 
