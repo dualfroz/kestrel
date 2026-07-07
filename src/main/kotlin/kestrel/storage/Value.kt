@@ -1,7 +1,10 @@
 package kestrel.storage
 
+import java.math.BigDecimal
+import java.time.LocalDate
+
 enum class ColumnType {
-    Integer, Text, Boolean, Real;
+    Integer, Text, Boolean, Real, Decimal, Date;
 
     val displayName: String
         get() = when (this) {
@@ -9,6 +12,8 @@ enum class ColumnType {
             Text -> "TEXT"
             Boolean -> "BOOLEAN"
             Real -> "REAL"
+            Decimal -> "DECIMAL"
+            Date -> "DATE"
         }
 
     companion object {
@@ -17,9 +22,18 @@ enum class ColumnType {
             "TEXT" -> Text
             "BOOLEAN" -> Boolean
             "REAL" -> Real
+            "DECIMAL" -> Decimal
+            "DATE" -> Date
             else -> null
         }
     }
+}
+
+/** Renders a type with its DECIMAL(precision[, scale]) parameters, if any were declared. */
+fun ColumnType.displayWith(precision: Int?, scale: Int?): String = when {
+    this != ColumnType.Decimal || precision == null -> displayName
+    scale == null -> "$displayName($precision)"
+    else -> "$displayName($precision, $scale)"
 }
 
 sealed class Value {
@@ -39,6 +53,30 @@ sealed class Value {
 
     data class BooleanValue(val value: Boolean) : Value() {
         override val type get() = ColumnType.Boolean
+    }
+
+    /**
+     * Arbitrary-precision fixed-point number. Equality and hashing compare by numeric
+     * value (via [BigDecimal.compareTo]) rather than by representation, so `1.5` and
+     * `1.50` are the same value for GROUP BY/DISTINCT/UNION dedup purposes, matching
+     * standard SQL DECIMAL semantics instead of Java's stricter [BigDecimal.equals].
+     */
+    class DecimalValue(val value: BigDecimal) : Value() {
+        override val type get() = ColumnType.Decimal
+
+        override fun equals(other: Any?): Boolean =
+            other is DecimalValue && value.compareTo(other.value) == 0
+
+        override fun hashCode(): Int {
+            val canonical = if (value.signum() == 0) BigDecimal.ZERO else value.stripTrailingZeros()
+            return canonical.hashCode()
+        }
+
+        override fun toString(): String = "DecimalValue(value=$value)"
+    }
+
+    data class DateValue(val value: LocalDate) : Value() {
+        override val type get() = ColumnType.Date
     }
 
     object NullValue : Value() {
