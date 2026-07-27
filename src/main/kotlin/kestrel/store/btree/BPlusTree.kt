@@ -313,3 +313,80 @@ class BPlusTree private constructor(private val bufferPool: PageStore, rootPageI
         bufferPool.unpinPage(childNode.pageId, true)
     }
 
+    private fun borrowFromRight(parent: BTreeNode.Internal, idx: Int, rightPage: Page, rightNode: BTreeNode) {
+        val (childPage, childNode) = fetch(parent.children[idx])
+        when {
+            rightNode is BTreeNode.Leaf && childNode is BTreeNode.Leaf -> {
+                val borrowedKey = rightNode.keys.removeAt(0)
+                val borrowedValue = rightNode.values.removeAt(0)
+                childNode.keys.add(borrowedKey)
+                childNode.values.add(borrowedValue)
+                parent.keys[idx] = rightNode.keys[0]
+            }
+            rightNode is BTreeNode.Internal && childNode is BTreeNode.Internal -> {
+                val movedChild = rightNode.children.removeAt(0)
+                val separatorDown = rightNode.keys.removeAt(0)
+                childNode.children.add(movedChild)
+                childNode.keys.add(parent.keys[idx])
+                parent.keys[idx] = separatorDown
+            }
+            else -> throw BTreeCorruptionException("sibling type mismatch during redistribution")
+        }
+        NodeCodec.writeTo(rightPage, rightNode)
+        NodeCodec.writeTo(childPage, childNode)
+        bufferPool.unpinPage(childNode.pageId, true)
+    }
+
+    private fun mergeChildren(parent: BTreeNode.Internal, leftIdx: Int) {
+        val leftId = parent.children[leftIdx]
+        val rightId = parent.children[leftIdx + 1]
+        val (leftPage, leftNode) = fetch(leftId)
+        val (_, rightNode) = fetch(rightId)
+        when {
+            leftNode is BTreeNode.Leaf && rightNode is BTreeNode.Leaf -> {
+                leftNode.keys.addAll(rightNode.keys)
+                leftNode.values.addAll(rightNode.values)
+                leftNode.nextLeaf = rightNode.nextLeaf
+            }
+            leftNode is BTreeNode.Internal && rightNode is BTreeNode.Internal -> {
+                leftNode.keys.add(parent.keys[leftIdx])
+                leftNode.keys.addAll(rightNode.keys)
+                leftNode.children.addAll(rightNode.children)
+            }
+            else -> throw BTreeCorruptionException("sibling type mismatch during merge")
+        }
+        NodeCodec.writeTo(leftPage, leftNode)
+        bufferPool.unpinPage(leftId, true)
+        bufferPool.unpinPage(rightId, false)
+        bufferPool.deletePage(rightId)
+        parent.keys.removeAt(leftIdx)
+        parent.children.removeAt(leftIdx + 1)
+    }
+
+    private fun isUnderflowNode(node: BTreeNode): Boolean = NodeCodec.serialize(node).size < UNDERFLOW_THRESHOLD
+
+    private fun fetch(pageId: Long): Pair<Page, BTreeNode> {
+        val page = bufferPool.fetchPage(pageId)
+        return page to NodeCodec.readFrom(page)
+    }
+
+    private fun lowerBound(keys: List<ByteArray>, key: ByteArray): Int {
+        var lo = 0
+        var hi = keys.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (KeyCodec.compare(keys[mid], key) < 0) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+
+    private fun childIndexFor(keys: List<ByteArray>, key: ByteArray): Int {
+        var lo = 0
+        var hi = keys.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (KeyCodec.compare(keys[mid], key) <= 0) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+}
