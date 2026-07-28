@@ -1285,3 +1285,478 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
+    /**
+     * PRIMARY KEY uniqueness for a temp table, checked by full scan over [rows] (the whole candidate
+     * set post-mutation, not just the newly touched rows - same reasoning as
+     * [kestrel.engine.Executor.enforcePrimaryKeyUniqueness]) since a temp table has no B+Tree to
+     * enforce it structurally the way [DiskTable.rejectDuplicatePrimaryKey] does. Ported 1:1 from
+     * that same in-memory method, [DiskExecutorException] aside.
+     */
+    private fun enforceTemporaryPrimaryKeyUniqueness(schema: TableSchema, rows: List<Row>) {
+        val indices = schema.primaryKeyIndices
+        if (indices.isEmpty()) return
+        val seen = HashSet<List<Value>>()
+        for (row in rows) {
+            val key = collationFoldedUniquenessKey(schema, indices, indices.map { row.values[it] })
+            if (!seen.add(key)) {
+                val columnList = indices.joinToString(", ") { schema.columns[it].name }
+                throw DiskExecutorException("UNIQUE constraint failed: ${schema.name}($columnList)")
+            }
+        }
+    }
+
+    /** UNIQUE-constraint counterpart of [enforceTemporaryPrimaryKeyUniqueness] - ported 1:1 from [kestrel.engine.Executor.enforceUniqueConstraints]. */
+    private fun enforceTemporaryUniqueConstraints(schema: TableSchema, rows: List<Row>) {
+        for (unique in schema.uniqueConstraints) {
+            val columnIndices = unique.columns.map { schema.columnIndex(it)!! }
+            val seen = HashSet<List<Value>>()
+            for (row in rows) {
+                val rawKey = columnIndices.map { row.values[it] }
+                if (rawKey.any { it is Value.NullValue }) continue
+                if (!seen.add(collationFoldedUniquenessKey(schema, columnIndices, rawKey))) {
+                    val label = unique.name?.let { " $it" } ?: ""
+                    val columnList = unique.columns.joinToString(", ")
+                    throw DiskExecutorException("UNIQUE constraint$label failed: ${schema.name}($columnList)")
+                }
+            }
+        }
+    }
+
+    /**
+     * Deliberately duplicated from [kestrel.engine.Executor.validateUniqueDefinitions] (same
+     * reasoning as [coerceForColumn]): only checks that every referenced column exists, mirroring
+     * the in-memory engine exactly - it does not reject a constraint naming the same column twice
+     * (`UNIQUE (a, a)`), because the in-memory engine does not either.
+     */
+    private fun validateUniqueDefinitions(statement: CreateTableStatement) {
+        for (unique in statement.uniqueConstraints) {
+            for (columnName in unique.columns) {
+                if (statement.columns.none { it.name.equals(columnName, ignoreCase = true) }) {
+                    throw DiskExecutorException("UNIQUE constraint refers to unknown column: $columnName")
+                }
+            }
+        }
+    }
+
+    /**
+     * A table-level `PRIMARY KEY (a, b, ...)` implies NOT NULL on every listed column, exactly
+     * like the inline `col TYPE PRIMARY KEY` spelling already does. Deliberately duplicated from
+     * [kestrel.engine.Executor.applyCompositePrimaryKey] (same reasoning as [coerceForColumn]):
+     * this executor reuses the in-memory engine's AST/types but must stay free-standing so a
+     * change to the in-memory engine's error handling can never silently affect the disk-backed
+     * path or vice versa.
+     */
+    private fun applyCompositePrimaryKey(statement: CreateTableStatement): List<Column> {
+        if (statement.compositePrimaryKey.isEmpty()) return statement.columns
+        val declared = statement.compositePrimaryKey.map { it.lowercase() }.toSet()
+        if (declared.size != statement.compositePrimaryKey.size) {
+            throw DiskExecutorException("table '${statement.tableName}' declares a duplicate column in its PRIMARY KEY")
+        }
+        for (name in statement.compositePrimaryKey) {
+            if (statement.columns.none { it.name.equals(name, ignoreCase = true) }) {
+                throw DiskExecutorException("PRIMARY KEY refers to unknown column: $name")
+            }
+        }
+        return statement.columns.map { column ->
+            if (column.name.lowercase() in declared) column.copy(notNull = true) else column
+        }
+    }
+
+    private fun executeDropTable(statement: DropTableStatement): StatementResult {
+        if (catalog.temporaryTableOrNull(statement.tableName) != null) {
+            catalog.dropTemporaryTable(statement.tableName)
+        } else {
+            catalog.dropTable(statement.tableName, cascade = statement.mode == DropMode.Cascade)
+        }
+        return DropTableResult(statement.tableName)
+    }
+
+    /**
+     * Deliberately NOT in [isDdl] - like DELETE, TRUNCATE's row-clearing is fully covered by the
+     * storage engine's own WAL/2PL transaction, so it may run inside an explicit `BEGIN` and roll
+     * back cleanly with everything else that transaction did. `RESTART IDENTITY` is the one
+     * exception: [DiskCatalog.alterSequence] always opens and commits its own transaction (mirroring
+     * [DiskCatalog.nextValue]'s already-non-transactional sequence position - see that method's own
+     * doc), so a sequence restarted here stays restarted even if the enclosing statement transaction
+     * later rolls back. This is a deliberate, bounded asymmetry with [kestrel.engine.Executor]'s
+     * in-memory engine, where RESTART IDENTITY *is* undone by ROLLBACK because ALTER SEQUENCE there
+     * mutates a map entry covered by the whole-catalog snapshot/restore (see
+     * [kestrel.catalog.Catalog.truncateTables]).
+     */
+    private fun executeTruncate(statement: TruncateTableStatement): StatementResult {
+        val truncated = withStatementTransaction { txn ->
+            catalog.truncateTables(txn, statement.tableNames, statement.mode == DropMode.Cascade)
+        }
+        if (statement.restartIdentity) {
+            for (name in truncated) restartOwnedSequences(catalog.table(name).schema)
+        }
+        return TruncateTableResult(truncated)
+    }
+
+    /** Ported 1:1 from [kestrel.catalog.Catalog.restartOwnedSequences] - see that method's own doc for why a NEXTVAL DEFAULT is this engine's only signal for "this column is identity-backed". */
+    private fun restartOwnedSequences(schema: TableSchema) {
+        for (column in schema.columns) {
+            val default = column.default
+            if (default is NextValueExpression) {
+                val sequence = catalog.sequenceOrNull(default.sequenceName) ?: continue
+                catalog.alterSequence(default.sequenceName, sequence.definition, restartAt = sequence.definition.startValue)
+            }
+        }
+    }
+
+    private fun executeAlterTable(statement: AlterTableStatement): StatementResult {
+        when (val action = statement.action) {
+            is AddColumn -> executeAddColumn(statement.tableName, action.column)
+            is DropColumn -> catalog.dropColumn(statement.tableName, action.columnName, cascade = action.mode == DropMode.Cascade)
+            is RenameColumn -> catalog.renameColumn(statement.tableName, action.oldName, action.newName)
+            is RenameTable -> catalog.renameTable(statement.tableName, action.newName)
+            is AddConstraint -> executeAddConstraint(statement.tableName, action.constraint)
+            is DropConstraint -> catalog.dropConstraint(statement.tableName, action.name, cascade = action.mode == DropMode.Cascade)
+            is ChangeColumnType -> executeChangeColumnType(statement.tableName, action)
+        }
+        val resultName = (statement.action as? RenameTable)?.newName ?: statement.tableName
+        return AlterTableResult(resultName)
+    }
+
+    /** Mirrors [kestrel.engine.Executor.executeAddConstraint] - see that method's own doc. */
+    private fun executeAddConstraint(tableName: String, added: AddedConstraint) {
+        when (added) {
+            is AddedCheck -> executeAddCheckConstraint(tableName, added.check)
+            is AddedUnique -> executeAddUniqueConstraint(tableName, added.unique)
+            is AddedForeignKey -> executeAddForeignKeyConstraint(tableName, added.foreignKey)
+        }
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name CHECK (...)` - mirrors
+     * [kestrel.engine.Executor.executeAddCheckConstraint]: validated exactly like a CREATE TABLE-time
+     * CHECK ([validateCheckDefinitions]: known columns only, no subquery), PLUS every existing row is
+     * evaluated against it up front (under its own probe transaction, mirroring [executeAddColumn]'s
+     * `probeTxn`) before the constraint is installed via [DiskCatalog.addCheckConstraint].
+     */
+    private fun executeAddCheckConstraint(tableName: String, check: CheckConstraint) {
+        val table = catalog.table(tableName)
+        val schema = table.schema
+        check.name?.let { requireUniqueConstraintName(schema, it) }
+        checkColumns(check.expression, schema)
+        requireNoSubquery(check.expression)
+        val probeTxn = catalog.beginTransaction()
+        runInTransaction(probeTxn) {
+            val subqueries = subqueryRunnerFor(probeTxn)
+            for ((_, row) in table.scan(probeTxn)) {
+                val result = Evaluator(schema, row, subqueries).evaluate(check.expression)
+                if (result is Value.BooleanValue && !result.value) {
+                    val label = check.name?.let { " $it" } ?: ""
+                    throw DiskExecutorException("CHECK constraint$label failed: an existing row in $tableName violates it")
+                }
+            }
+        }
+        catalog.addCheckConstraint(tableName, check)
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name UNIQUE (...)` - mirrors
+     * [kestrel.engine.Executor.executeAddUniqueConstraint]: every existing row is checked for a
+     * duplicate combination of [unique]'s columns (folded through [collationFoldedUniquenessKey], NULL
+     * exempt per standard SQL) under its own probe transaction before the constraint is installed.
+     */
+    private fun executeAddUniqueConstraint(tableName: String, unique: UniqueConstraint) {
+        val table = catalog.table(tableName)
+        val schema = table.schema
+        unique.name?.let { requireUniqueConstraintName(schema, it) }
+        for (columnName in unique.columns) {
+            if (schema.columnIndex(columnName) == null) {
+                throw DiskExecutorException("UNIQUE constraint refers to unknown column: $columnName")
+            }
+        }
+        val columnIndices = unique.columns.map { schema.columnIndex(it)!! }
+        val probeTxn = catalog.beginTransaction()
+        runInTransaction(probeTxn) {
+            val seen = HashSet<List<Value>>()
+            for ((_, row) in table.scan(probeTxn)) {
+                val rawKey = columnIndices.map { row.values[it] }
+                if (rawKey.any { it is Value.NullValue }) continue
+                if (!seen.add(collationFoldedUniquenessKey(schema, columnIndices, rawKey))) {
+                    val label = unique.name?.let { " $it" } ?: ""
+                    throw DiskExecutorException(
+                        "UNIQUE constraint$label failed: an existing row combination in " +
+                            "$tableName(${unique.columns.joinToString(", ")}) is already duplicated"
+                    )
+                }
+            }
+        }
+        catalog.addUniqueConstraint(tableName, unique)
+    }
+
+    /**
+     * `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...` - mirrors
+     * [kestrel.engine.Executor.executeAddForeignKeyConstraint]: validated the same way
+     * [validateForeignKeyDefinitions] validates one at CREATE TABLE time, PLUS every existing row of
+     * [tableName] is checked against it via [DiskForeignKeyEnforcer.validateRow] (under its own probe
+     * transaction) against a throwaway [TableSchema] carrying [foreignKey] alongside every FOREIGN KEY
+     * [tableName] already has, so a self-referencing FOREIGN KEY can find its own sibling rows.
+     */
+    private fun executeAddForeignKeyConstraint(tableName: String, foreignKey: ForeignKeyConstraint) {
+        val table = catalog.table(tableName)
+        val schema = table.schema
+        foreignKey.name?.let { requireUniqueConstraintName(schema, it) }
+        if (foreignKey.columns.size != foreignKey.referencedColumns.size) {
+            throw DiskExecutorException(
+                "FOREIGN KEY (${foreignKey.columns.joinToString(", ")}) column count does not match " +
+                    "REFERENCES ${foreignKey.referencedTable}(${foreignKey.referencedColumns.joinToString(", ")})"
+            )
+        }
+        for (columnName in foreignKey.columns) {
+            if (schema.columnIndex(columnName) == null) {
+                throw DiskExecutorException("FOREIGN KEY refers to unknown column: $columnName")
+            }
+        }
+        val selfReference = foreignKey.referencedTable.equals(tableName, ignoreCase = true)
+        val referencedSchema = if (selfReference) {
+            schema
+        } else {
+            catalog.tableOrNull(foreignKey.referencedTable)?.schema
+                ?: throw DiskExecutorException("FOREIGN KEY references unknown table: ${foreignKey.referencedTable}")
+        }
+        for (columnName in foreignKey.referencedColumns) {
+            if (referencedSchema.column(columnName) == null) {
+                throw DiskExecutorException("FOREIGN KEY references unknown column: ${foreignKey.referencedTable}.$columnName")
+            }
+        }
+        if (!referencedSchema.hasEnforcedUniqueness(foreignKey.referencedColumns)) {
+            throw DiskExecutorException(
+                "FOREIGN KEY must reference a PRIMARY KEY or UNIQUE column(s), but " +
+                    "${foreignKey.referencedTable}(${foreignKey.referencedColumns.joinToString(", ")}) is not one"
+            )
+        }
+        val tempSchema = TableSchema(
+            schema.name, schema.columns, schema.foreignKeys + foreignKey, schema.checks, schema.uniqueConstraints, schema.compositePrimaryKey
+        )
+        val probeTxn = catalog.beginTransaction()
+        runInTransaction(probeTxn) {
+            for ((_, row) in table.scan(probeTxn)) {
+                DiskForeignKeyEnforcer.validateRow(catalog, probeTxn, tempSchema, row.values)
+            }
+        }
+        catalog.addForeignKey(tableName, foreignKey)
+    }
+
+    /**
+     * Mirrors [kestrel.engine.Executor.executeChangeColumnType] - same RESTRICT-only dependency
+     * checks (PRIMARY KEY/FOREIGN KEY on either side/UNIQUE constraint/secondary index/GENERATED,
+     * all rejected outright rather than threading a type change through them) and the same DEFAULT
+     * compatibility pre-check. The one structural difference: [DiskCatalog.changeColumnType]'s
+     * `valueForRow` callback runs DURING the real per-row rewrite (via [DiskTable.rewriteRows]), not
+     * before it - see that method's own doc for why a NOT NULL/CHECK failure discovered mid-rewrite
+     * is still safe (transaction abort unwinds it), the same contract a NOT NULL `GENERATED ALWAYS
+     * AS` backfill already relies on.
+     */
+    private fun executeChangeColumnType(tableName: String, action: ChangeColumnType) {
+        val table = catalog.table(tableName)
+        val schema = table.schema
+        val columnIndex = schema.columnIndex(action.columnName)
+            ?: throw DiskExecutorException("no such column: ${action.columnName} in table $tableName")
+        val column = schema.columns[columnIndex]
+        if (column.generated != null) {
+            throw DiskExecutorException(
+                "cannot change the type of GENERATED column ${action.columnName} in $tableName; drop and re-add it instead"
+            )
+        }
+        if (schema.primaryKeyColumns.any { it.equals(action.columnName, ignoreCase = true) }) {
+            throw DiskExecutorException(
+                "cannot change the type of column ${action.columnName} because it is part of the PRIMARY KEY of $tableName"
+            )
+        }
+        if (schema.foreignKeys.any { fk -> fk.columns.any { it.equals(action.columnName, ignoreCase = true) } }) {
+            throw DiskExecutorException(
+                "cannot change the type of column ${action.columnName} because it is used by one of ${tableName}'s own " +
+                    "FOREIGN KEY constraints; drop the constraint first"
+            )
+        }
+        val referencingTables = catalog.tableNames.filter { other ->
+            !other.equals(tableName, ignoreCase = true) &&
+                catalog.tableOrNull(other)?.schema?.foreignKeys?.any { fk ->
+                    fk.referencedTable.equals(tableName, ignoreCase = true) &&
+                        fk.referencedColumns.any { it.equals(action.columnName, ignoreCase = true) }
+                } == true
+        }
+        if (referencingTables.isNotEmpty()) {
+            throw DiskExecutorException(
+                "cannot change the type of column ${action.columnName} because table(s) ${referencingTables.joinToString(", ")} " +
+                    "have a FOREIGN KEY referencing it; drop the constraint first"
+            )
+        }
+        if (schema.uniqueConstraints.any { unique -> unique.columns.any { it.equals(action.columnName, ignoreCase = true) } }) {
+            throw DiskExecutorException(
+                "cannot change the type of column ${action.columnName} because it is used by a UNIQUE constraint of $tableName; " +
+                    "drop the constraint first"
+            )
+        }
+        val dependentIndexes = table.secondaryIndexes.filter { it.columnNames.any { c -> c.equals(action.columnName, ignoreCase = true) } }
+        if (dependentIndexes.isNotEmpty()) {
+            throw DiskExecutorException(
+                "cannot change the type of column ${action.columnName} because index(es) " +
+                    "${dependentIndexes.joinToString(", ") { it.name }} are defined on it; drop the index first"
+            )
+        }
+
+        val newColumn = column.copy(type = action.newType, precision = action.precision, scale = action.scale)
+        newColumn.default?.let { default ->
+            try {
+                coerceForColumn(Evaluator().evaluate(default), newColumn)
+            } catch (e: KestrelException) {
+                throw DiskExecutorException(
+                    "cannot change the type of column ${action.columnName}: its DEFAULT expression is not compatible " +
+                        "with ${action.newType.displayWith(action.precision, action.scale)} (${e.message})"
+                )
+            }
+        }
+        val newSchema = TableSchema(
+            schema.name, schema.columns.toMutableList().also { it[columnIndex] = newColumn }, schema.foreignKeys,
+            schema.checks, schema.uniqueConstraints, schema.compositePrimaryKey
+        )
+
+        val using = action.using ?: ColumnExpression(action.columnName)
+        catalog.changeColumnType(tableName, action.columnName, newColumn) { row ->
+            val value = coerceForColumn(Evaluator(schema, row).evaluate(using), newColumn)
+            if (newColumn.notNull && value is Value.NullValue) {
+                throw DiskExecutorException("NOT NULL constraint failed: $tableName.${action.columnName}")
+            }
+            val newRow = Row(row.values.toMutableList().also { it[columnIndex] = value })
+            for (check in newSchema.checks) {
+                val result = Evaluator(newSchema, newRow).evaluate(check.expression)
+                if (result is Value.BooleanValue && !result.value) {
+                    val label = check.name?.let { " $it" } ?: ""
+                    throw DiskExecutorException("CHECK constraint$label failed: $tableName")
+                }
+            }
+            value
+        }
+    }
+
+    /** Mirrors [kestrel.engine.Executor.requireUniqueConstraintName] - see that method's own doc. */
+    private fun requireUniqueConstraintName(schema: TableSchema, name: String) {
+        val taken = schema.foreignKeys.any { it.name?.equals(name, ignoreCase = true) == true } ||
+            schema.checks.any { it.name?.equals(name, ignoreCase = true) == true } ||
+            schema.uniqueConstraints.any { it.name?.equals(name, ignoreCase = true) == true }
+        if (taken) throw DiskExecutorException("constraint '$name' already exists on table ${schema.name}")
+    }
+
+    /**
+     * A NOT NULL column added to a table that already has rows must carry a DEFAULT (there is no
+     * value to backfill existing rows with otherwise) - an empty table has no such requirement.
+     * Mirrors [kestrel.engine.Executor.executeAddColumn] (same reasoning as [coerceForColumn]):
+     * duplicated rather than shared, since this executor's [DiskTable] has no equivalent of the
+     * in-memory engine's `Table.rows` to check emptiness against without a transaction of its own.
+     * GENERATED ALWAYS AS sidesteps the NOT NULL/DEFAULT requirement entirely - see
+     * [addGeneratedColumnValue].
+     */
+    private fun executeAddColumn(tableName: String, column: Column) {
+        val table = catalog.table(tableName)
+        if (column.generated != null) {
+            validateAddGeneratedColumn(table.schema, column)
+            catalog.addColumn(tableName, column) { row -> addGeneratedColumnValue(table.schema, column, row) }
+            return
+        }
+        column.default?.let { validateConstantDefault(it) }
+        val probeTxn = catalog.beginTransaction()
+        val hasRows = runInTransaction(probeTxn) { table.scan(probeTxn).isNotEmpty() }
+        if (column.notNull && column.default == null && hasRows) {
+            throw DiskExecutorException(
+                "cannot add NOT NULL column ${column.name} to table $tableName with existing rows without a DEFAULT value"
+            )
+        }
+        val defaultValue = column.default?.let { coerceForColumn(Evaluator().evaluate(it), column) } ?: Value.NullValue
+        catalog.addColumn(tableName, column) { defaultValue }
+    }
+
+    /** Mirrors [kestrel.engine.Executor.validateAddGeneratedColumn] - see that method's own doc. */
+    private fun validateAddGeneratedColumn(schema: TableSchema, column: Column) {
+        val generated = column.generated!!
+        checkColumns(generated, schema)
+        requireNoSubquery(generated)
+        val generatedNames = schema.columns.filter { it.generated != null }.map { it.name.lowercase() }.toSet()
+        requireNoGeneratedColumnReference(generated, generatedNames, column.name)
+    }
+
+    /** Mirrors [kestrel.engine.Executor.addGeneratedColumnValue] - see that method's own doc. */
+    private fun addGeneratedColumnValue(schema: TableSchema, column: Column, row: Row): Value {
+        val value = coerceForColumn(Evaluator(schema, row).evaluate(column.generated!!), column)
+        if (column.notNull && value is Value.NullValue) {
+            throw DiskExecutorException("NOT NULL constraint failed: ${schema.name}.${column.name}")
+        }
+        return value
+    }
+
+    /**
+     * A DEFAULT must be a constant expression: no column reference (there is no row to read one
+     * from when backfilling `ALTER TABLE ... ADD COLUMN`), no subquery, and no aggregate. Ported
+     * 1:1 from [kestrel.engine.Executor.validateConstantDefault] - see [checkColumns] for why this
+     * executor duplicates rather than shares this kind of validation.
+     */
+    private fun validateConstantDefault(expression: Expression) {
+        when (expression) {
+            is ColumnExpression -> throw DiskExecutorException("DEFAULT expression cannot reference a column")
+            is ScalarSubqueryExpression, is ExistsExpression, is InSubqueryExpression ->
+                throw DiskExecutorException("DEFAULT expression cannot contain a subquery")
+            is FunctionExpression -> throw DiskExecutorException("DEFAULT expression cannot contain an aggregate function")
+            is BinaryExpression -> {
+                validateConstantDefault(expression.left)
+                validateConstantDefault(expression.right)
+            }
+            is UnaryExpression -> validateConstantDefault(expression.operand)
+            is CallExpression -> expression.arguments.forEach { validateConstantDefault(it) }
+            is IsNullExpression -> validateConstantDefault(expression.operand)
+            is InExpression -> {
+                validateConstantDefault(expression.operand)
+                expression.values.forEach { validateConstantDefault(it) }
+            }
+            is BetweenExpression -> {
+                validateConstantDefault(expression.operand)
+                validateConstantDefault(expression.low)
+                validateConstantDefault(expression.high)
+            }
+            is LikeExpression -> {
+                validateConstantDefault(expression.operand)
+                validateConstantDefault(expression.pattern)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { validateConstantDefault(it) }
+                expression.branches.forEach {
+                    validateConstantDefault(it.condition)
+                    validateConstantDefault(it.result)
+                }
+                expression.elseExpression?.let { validateConstantDefault(it) }
+            }
+            is CastExpression -> validateConstantDefault(expression.operand)
+            is CollateExpression -> validateConstantDefault(expression.operand)
+            is WindowExpression -> throw DiskExecutorException("DEFAULT expression cannot contain a window function")
+            is NextValueExpression ->
+                throw DiskExecutorException(
+                    "NEXTVAL cannot be used as an ADD COLUMN DEFAULT - it would give every existing row " +
+                        "the exact same value instead of a growing sequence, silently defeating the one thing NEXTVAL is for"
+                )
+            is CurrentValueExpression -> throw DiskExecutorException("DEFAULT expression cannot contain CURRVAL")
+            is MergeActionExpression -> throw DiskExecutorException("DEFAULT expression cannot contain MERGE_ACTION()")
+            is ParameterExpression -> throw DiskExecutorException("DEFAULT expression cannot contain a parameter reference")
+            is LiteralExpression -> Unit
+        }
+    }
+
+    /**
+     * Builds every row's final values first (in [newRows], none written yet) and only then validates
+     * and inserts them one at a time - not inline in a single pass - so that a self-referencing FK
+     * can see sibling rows from the same multi-row INSERT regardless of their order in the statement,
+     * exactly like [kestrel.engine.Executor.executeInsert]'s own `uncommittedSiblings = newRows`.
+     */
+    private fun executeInsert(statement: InsertStatement, triggerContext: TriggerRowContext? = null): StatementResult {
+        catalog.temporaryTableOrNull(statement.tableName)?.let { return executeTemporaryInsert(statement, it) }
+        val table = catalog.table(statement.tableName)
+        val schema = table.schema
+        return withStatementTransaction { txn ->
+            withTriggerAtomicity(schema.name, txn, triggerContext) {
+                executeInsertInTxn(statement, table, schema, txn, triggerContext)
+            }
+        }
+    }
+
