@@ -2399,3 +2399,339 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return SelectResult(left.columns, rows)
     }
 
+    /**
+     * Mirrors [kestrel.engine.SelectRunner]'s own `declaredSetOperationCollation` 1:1 (separate
+     * copy, historical reasons like the rest of this class): the declared `COLLATE` of a set
+     * operation's combined output column, traced back to a real table column in [statement]'s LEFT
+     * branch only, resolving only for a plain `SELECT ... FROM realTable [JOIN realTable ...]` with
+     * no CTE, view, or derived table anywhere in its FROM clause. Everything else - an expression,
+     * a nested set operation, a subquery source - reports no declared collation, same as before this
+     * function existed.
+     */
+    private fun declaredSetOperationCollation(statement: SetOperationStatement, columns: List<String>): (ColumnExpression) -> Collation? =
+        (statement.left as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
+
+    /**
+     * Mirrors [kestrel.engine.SelectRunner]'s own `declaredCollationForSelectOutput` 1:1 (separate
+     * copy, historical reasons like the rest of this class): factored out of
+     * [declaredSetOperationCollation] so [declaredRecursiveCteCollation] can apply the identical
+     * "plain SELECT over real tables" resolution to a recursive CTE's own anchor (base) term.
+     */
+    private fun declaredCollationForSelectOutput(select: SelectStatement, columns: List<String>): (ColumnExpression) -> Collation? {
+        val items = listOf(select.from) + select.joins.map { it.from }
+        val sources = items.map { item ->
+            (item as? TableSource)?.let { source -> catalog.tableOrNull(source.name)?.schema?.let { (source.alias ?: source.name) to it } }
+        }
+        if (sources.any { it == null }) return { null }
+        val resolvedSources = sources.filterNotNull()
+        fun columnCollation(expression: ColumnExpression): Collation? {
+            val matches = resolvedSources
+                .filter { (alias, _) -> expression.qualifier == null || alias.equals(expression.qualifier, ignoreCase = true) }
+                .mapNotNull { (_, schema) -> schema.column(expression.name) }
+            return matches.singleOrNull()?.collation
+        }
+        return when (val projection = select.projection) {
+            is ExpressionProjection -> outputExpr@{ outputExpr ->
+                val index = columns.indexOfFirst { it.equals(outputExpr.name, ignoreCase = true) }
+                val itemExpression = index.takeIf { it in projection.items.indices }?.let { projection.items[it].expression }
+                (itemExpression as? ColumnExpression)?.let(::columnCollation)
+            }
+            is StarProjection -> outputExpr@{ outputExpr ->
+                val index = columns.indexOfFirst { it.equals(outputExpr.name, ignoreCase = true) }
+                if (index < 0) return@outputExpr null
+                var remaining = index
+                for ((_, schema) in resolvedSources) {
+                    if (remaining < schema.columns.size) return@outputExpr schema.columns[remaining].collation
+                    remaining -= schema.columns.size
+                }
+                null
+            }
+        }
+    }
+
+    /** Mirrors [kestrel.engine.SelectRunner]'s own `declaredRecursiveCteCollation` 1:1 (separate copy, historical reasons like the rest of this class). */
+    private fun declaredRecursiveCteCollation(base: QueryStatement, columns: List<String>): (ColumnExpression) -> Collation? =
+        (base as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
+
+    private fun multisetFilter(
+        left: List<List<Value>>,
+        right: List<List<Value>>,
+        keepOnMatch: Boolean,
+        keyOf: (List<Value>) -> List<Value>
+    ): List<List<Value>> {
+        val remainingInRight = right.groupingBy(keyOf).eachCount().toMutableMap()
+        return left.filter { row ->
+            val key = keyOf(row)
+            val remaining = remainingInRight[key] ?: 0
+            if (remaining > 0) {
+                remainingInRight[key] = remaining - 1
+                keepOnMatch
+            } else {
+                !keepOnMatch
+            }
+        }
+    }
+
+    private fun multiKeyComparator(
+        keys: List<OrderKey>,
+        evaluate: (Expression, List<Value>) -> Value,
+        declaredCollationOf: (ColumnExpression) -> Collation? = { null }
+    ): Comparator<List<Value>> =
+        Comparator { first, second ->
+            var result = 0
+            for (key in keys) {
+                val comparison = compareOrderKeyValues(
+                    evaluate(key.expression, first), evaluate(key.expression, second), key, declaredCollationOf
+                )
+                if (comparison != 0) {
+                    result = comparison
+                    break
+                }
+            }
+            result
+        }
+
+    /** Resolves ORDER BY columns of a combined UNION/INTERSECT/EXCEPT result purely by output column name (never qualified). */
+    private fun evaluateOutputRow(columns: List<String>, expression: Expression, row: List<Value>, txn: Long): Value {
+        val resolver = ColumnResolver { column ->
+            if (column.qualifier != null) throw DiskExecutorException("no such column: ${column.qualifier}.${column.name}")
+            val index = columns.indexOfFirst { it.equals(column.name, ignoreCase = true) }
+            if (index == -1) throw DiskExecutorException("no such column: ${column.name}")
+            row[index]
+        }
+        return Evaluator(resolver, subqueryRunnerFor(txn)).evaluate(expression)
+    }
+
+    /**
+     * Pushes every CTE of [query] onto [activeCtes] (in definition order, so a later CTE may
+     * reference an earlier one, mirroring [kestrel.engine.SelectRunner.runWith]), runs [query]'s
+     * body, then pops them back off - a CTE is scoped to the single query that defines it, unlike a
+     * VIEW, which lives in the catalog.
+     */
+    private fun runWith(query: WithQuery, txn: Long, outer: ColumnResolver?): SelectResult {
+        var pushed = 0
+        try {
+            for (cte in query.ctes) {
+                activeCtes.add(buildCteScope(query.recursive, cte, txn))
+                pushed++
+            }
+            return runQuery(query.body, txn, outer)
+        } finally {
+            repeat(pushed) { activeCtes.removeAt(activeCtes.size - 1) }
+        }
+    }
+
+    /**
+     * Materializes one CTE's rows. A non-recursive CTE just runs its query once. A recursive one
+     * (`WITH RECURSIVE name AS (base UNION [ALL] recursiveTerm)`, split by [splitRecursiveCte])
+     * repeatedly re-runs [RecursiveCtePlan.recursiveTerm] with [CteScope.rows] set to only the
+     * *previous iteration's new rows* (the standard fixed-point working-set semantics, not the
+     * whole accumulated set - mirrors [kestrel.engine.SelectRunner.buildCteScope] exactly, including
+     * the [MAX_RECURSION_ITERATIONS] safety cap against a query that never reaches a fixed point).
+     */
+    private fun buildCteScope(recursive: Boolean, cte: CommonTableExpression, txn: Long): CteScope {
+        val recursivePlan = if (recursive) splitRecursiveCte(cte) else null
+        if (recursivePlan == null) {
+            val result = runQuery(cte.query, txn, outer = null)
+            return CteScope(cte.name, cteSchema(cte, result), result.rows)
+        }
+        val (base, operator, recursiveTerm) = recursivePlan
+        val baseResult = runQuery(base, txn, outer = null)
+        val schema = cteSchema(cte, baseResult)
+        val scope = CteScope(cte.name, schema, baseResult.rows)
+        val declaredCollationOf = declaredRecursiveCteCollation(base, baseResult.columns)
+        val outputExpressions = baseResult.columns.map { ColumnExpression(it) }
+        val seenKeys = if (operator == SetOperator.Union)
+            baseResult.rows.mapTo(HashSet()) { collationFoldedKey(it, outputExpressions, declaredCollationOf) }
+        else null
+        activeCtes.add(scope)
+        try {
+            val accumulated = mutableListOf<List<Value>>()
+            accumulated.addAll(baseResult.rows)
+            var working = baseResult.rows
+            var iterations = 0
+            while (working.isNotEmpty()) {
+                iterations++
+                if (iterations > MAX_RECURSION_ITERATIONS) {
+                    throw DiskExecutorException(
+                        "recursive common table expression '${cte.name}' did not terminate within $MAX_RECURSION_ITERATIONS iterations"
+                    )
+                }
+                scope.rows = working
+                var newRows = runQuery(recursiveTerm, txn, outer = null).rows
+                if (operator == SetOperator.Union) {
+                    newRows = newRows.filter { candidate -> seenKeys!!.add(collationFoldedKey(candidate, outputExpressions, declaredCollationOf)) }
+                }
+                if (newRows.isEmpty()) break
+                accumulated.addAll(newRows)
+                working = newRows
+            }
+            scope.rows = accumulated
+        } finally {
+            activeCtes.removeAt(activeCtes.size - 1)
+        }
+        return scope
+    }
+
+    private data class RecursiveCtePlan(val base: QueryStatement, val operator: SetOperator, val recursiveTerm: QueryStatement)
+
+    /**
+     * Recognizes `base UNION [ALL] recursiveTerm` where exactly one side names [cte] in its own
+     * FROM/JOIN - structurally, on the AST, without running anything - mirroring
+     * [kestrel.engine.SelectRunner.splitRecursiveCte] 1:1. Both sides referencing it, or neither,
+     * are rejected/treated as a plain (non-recursive) compound respectively, exactly like the
+     * in-memory engine.
+     */
+    private fun splitRecursiveCte(cte: CommonTableExpression): RecursiveCtePlan? {
+        val query = cte.query
+        if (query !is SetOperationStatement) return null
+        if (query.operator != SetOperator.Union && query.operator != SetOperator.UnionAll) return null
+        val leftRefs = referencesName(query.left, cte.name)
+        val rightRefs = referencesName(query.right, cte.name)
+        return when {
+            leftRefs && rightRefs ->
+                throw DiskExecutorException(
+                    "recursive common table expression '${cte.name}' must not reference itself on both sides of ${query.operator}"
+                )
+            rightRefs -> RecursiveCtePlan(query.left, query.operator, query.right)
+            leftRefs -> RecursiveCtePlan(query.right, query.operator, query.left)
+            else -> null
+        }
+    }
+
+    private fun referencesName(query: QueryStatement, name: String): Boolean = when (query) {
+        is SelectStatement -> referencesName(query.from, name) || query.joins.any { referencesName(it.from, name) }
+        is SetOperationStatement -> referencesName(query.left, name) || referencesName(query.right, name)
+        is WithQuery -> query.ctes.none { it.name.equals(name, ignoreCase = true) } && referencesName(query.body, name)
+    }
+
+    private fun referencesName(item: FromItem, name: String): Boolean = when (item) {
+        is TableSource -> item.name.equals(name, ignoreCase = true)
+        is SubquerySource -> referencesName(item.select, name)
+    }
+
+    private fun cteSchema(cte: CommonTableExpression, result: SelectResult): TableSchema {
+        val labels = cte.columns ?: result.columns
+        if (labels.size != result.columns.size) {
+            throw DiskExecutorException(
+                "common table expression '${cte.name}' expects ${labels.size} columns but its query produces ${result.columns.size}"
+            )
+        }
+        return derivedSchema(cte.name, result, labels)
+    }
+
+    /**
+     * A synthetic schema for a CTE's materialized rows: same idea as
+     * [kestrel.engine.SelectRunner.derivedSchema] - each column's type is inferred from the first
+     * non-NULL value seen in it (defaulting to TEXT when every row is NULL there), since a CTE has
+     * no backing [TableSchema] of its own to borrow one from.
+     */
+    private fun derivedSchema(name: String, result: SelectResult, labels: List<String> = result.columns): TableSchema {
+        val columns = labels.mapIndexed { index, columnName ->
+            val type = result.rows.asSequence().map { it[index] }.firstOrNull { !it.isNull }?.type ?: ColumnType.Text
+            Column(columnName, type, notNull = false, primaryKey = false)
+        }
+        return TableSchema(name, columns)
+    }
+
+    private class CteScope(val name: String, val schema: TableSchema, var rows: List<List<Value>>)
+
+    /** One FROM/JOIN source's row supply: either a real disk table or a CTE's already-materialized rows. */
+    private sealed interface DiskFromSource {
+        val schema: TableSchema
+        fun scan(txn: Long): List<List<Value>>
+    }
+
+    private class DiskTableSource(val table: DiskTable) : DiskFromSource {
+        override val schema get() = table.schema
+        override fun scan(txn: Long): List<List<Value>> = table.scan(txn).map { it.second.values }
+    }
+
+    private class CteRowSource(override val schema: TableSchema, val rows: List<List<Value>>) : DiskFromSource {
+        override fun scan(txn: Long): List<List<Value>> = rows
+    }
+
+    /**
+     * Resolves one FROM/JOIN [name] to its row supply: an active CTE shadows a same-named real
+     * table or view (checked innermost-first via [MutableList.lastOrNull], exactly like
+     * [kestrel.engine.SelectRunner.resolveNamedSource]'s own CTE lookup), then a temp table, then a
+     * real disk table, and only then a view - materialized fresh by running its defining query
+     * inside the same [txn], with [expandingViews] guarding against a view (directly or
+     * transitively) referencing itself, mirroring [kestrel.engine.SelectRunner.resolveNamedSource]
+     * exactly. A temp table's current rows are captured into a [CteRowSource] snapshot exactly like
+     * a CTE's or view's - a plain SELECT never mutates its own FROM source mid-query, so this is
+     * exactly as fresh as scanning a live [DiskTable] would be, and it is what gives a temp table
+     * full JOIN/subquery/aggregate participation for free instead of needing its own parallel query
+     * pipeline. A name that is neither falls through to [DiskCatalog.table], solely for its
+     * "no such table" [DiskCatalogException] - already confirmed absent from
+     * [DiskCatalog.temporaryTableOrNull]/[DiskCatalog.tableOrNull]/[DiskCatalog.viewOrNull], so this
+     * always throws, preserving the exact exception type callers relied on before views existed.
+     */
+    private fun resolveFromSource(name: String, txn: Long): DiskFromSource {
+        activeCtes.lastOrNull { it.name.equals(name, ignoreCase = true) }?.let { return CteRowSource(it.schema, it.rows) }
+        catalog.temporaryTableOrNull(name)?.let { return CteRowSource(it.schema, it.rows.map { row -> row.values }) }
+        catalog.tableOrNull(name)?.let { return DiskTableSource(it) }
+        val view = catalog.viewOrNull(name) ?: return DiskTableSource(catalog.table(name))
+        val key = name.lowercase()
+        if (!expandingViews.add(key)) {
+            throw DiskExecutorException("recursive view definition: $name")
+        }
+        try {
+            val result = runQuery(view, txn, outer = null)
+            return CteRowSource(derivedSchema(name, result), result.rows)
+        } finally {
+            expandingViews.remove(key)
+        }
+    }
+
+    /**
+     * Resolves one FROM/JOIN [item] to its row supply, mirroring
+     * [kestrel.engine.SelectRunner.resolveSource]/`buildSources`: a [TableSource] falls through to
+     * [resolveFromSource] by name (CTE/table/view, unchanged); a non-LATERAL [SubquerySource] (a
+     * derived table) runs its query eagerly, right here, inside the same [txn] - it cannot correlate
+     * to anything, so its rows are fixed for the whole statement, exactly like a materialized view. A
+     * LATERAL [SubquerySource] is different: its rows depend on whichever row of an earlier FROM/JOIN
+     * source it correlates with, which does not exist yet at this point - only its column *names* are
+     * needed here (via [lateralSchema], computed structurally from the AST without running anything)
+     * for offset bookkeeping; its real rows are produced later, per left row, in [executeLateralJoin].
+     */
+    private fun resolveFromItem(item: FromItem, txn: Long): DiskFromSource = when (item) {
+        is TableSource -> resolveFromSource(item.name, txn)
+        is SubquerySource ->
+            if (item.lateral) {
+                CteRowSource(lateralSchema(item), emptyList())
+            } else {
+                val result = runQuery(item.select, txn, outer = null)
+                CteRowSource(derivedSchema(item.alias, result), result.rows)
+            }
+    }
+
+    private fun lateralSchema(item: SubquerySource): TableSchema {
+        val labels = structuralColumnNames(item.select)
+        val columns = labels.map { Column(it, ColumnType.Text, notNull = false, primaryKey = false) }
+        return TableSchema(item.alias, columns)
+    }
+
+    /**
+     * The output column names of [query], derived purely from its AST (no execution, no catalog row
+     * data) - needed to give a LATERAL derived table a stable schema before any row of the source it
+     * correlates with is known. Mirrors [kestrel.engine.SelectRunner.structuralColumnNames] 1:1.
+     */
+    private fun structuralColumnNames(query: QueryStatement, localCtes: Map<String, List<String>> = emptyMap()): List<String> =
+        when (query) {
+            is SelectStatement -> when (val projection = query.projection) {
+                is StarProjection ->
+                    structuralSourceColumnNames(query.from, localCtes) +
+                        query.joins.flatMap { structuralSourceColumnNames(it.from, localCtes) }
+                is ExpressionProjection -> projection.items.mapIndexed { index, item -> columnLabel(item, index) }
+            }
+            is SetOperationStatement -> structuralColumnNames(query.left, localCtes)
+            is WithQuery -> {
+                val extended = localCtes.toMutableMap()
+                for (cte in query.ctes) {
+                    extended[cte.name.lowercase()] = cte.columns ?: structuralColumnNames(cte.query, extended)
+                }
+                structuralColumnNames(query.body, extended)
+            }
+        }
+
