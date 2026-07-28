@@ -642,3 +642,646 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
+    /**
+     * Runs a fired trigger's body statements in order, directly against [txn] - NOT through
+     * [executeInsert]/[executeUpdate]/[executeDelete] (which would re-select a transaction via
+     * [withStatementTransaction] and re-take a trigger-atomicity savepoint via
+     * [withTriggerAtomicity]) - so the whole cascade shares exactly one disk transaction and exactly
+     * one savepoint, taken once by the outermost caller. Mirrors [kestrel.engine.Executor.
+     * runTriggerBody], including [MAX_TRIGGER_DEPTH].
+     */
+    private fun runTriggerBody(trigger: TriggerDefinition, context: TriggerRowContext, txn: Long) {
+        if (triggerDepth >= MAX_TRIGGER_DEPTH) {
+            throw DiskExecutorException(
+                "trigger recursion limit ($MAX_TRIGGER_DEPTH) exceeded while firing '${trigger.name}' - " +
+                    "check for a trigger whose body ends up re-triggering itself"
+            )
+        }
+        triggerDepth++
+        try {
+            for (bodyStatement in trigger.body) {
+                when (bodyStatement) {
+                    is InsertStatement -> {
+                        val table = catalog.table(bodyStatement.tableName)
+                        executeInsertInTxn(bodyStatement, table, table.schema, txn, context)
+                    }
+                    is UpdateStatement -> {
+                        val table = catalog.table(bodyStatement.tableName)
+                        executeUpdateInTxn(bodyStatement, buildAssignments(table.schema, bodyStatement), table, table.schema, txn, context)
+                    }
+                    is DeleteStatement -> {
+                        val table = catalog.table(bodyStatement.tableName)
+                        executeDeleteInTxn(bodyStatement, table, table.schema, txn, context)
+                    }
+                    else -> error("unreachable: trigger bodies only ever contain INSERT/UPDATE/DELETE")
+                }
+            }
+        } finally {
+            triggerDepth--
+        }
+    }
+
+    private fun buildAssignments(schema: TableSchema, statement: UpdateStatement): List<Pair<Int, Expression?>> =
+        statement.assignments.map { assignment ->
+            val index = schema.columnIndex(assignment.columnName)
+                ?: throw DiskExecutorException("no such column: ${assignment.columnName} in table ${schema.name}")
+            rejectGeneratedAssignment(schema.columns[index], explicitValueGiven = assignment.value != null)
+            index to assignment.value
+        }
+
+    private fun executeCreateIndex(statement: CreateIndexStatement): StatementResult {
+        catalog.createIndex(statement.tableName, statement.indexName, statement.columnNames, statement.unique)
+        return CreateIndexResult(statement.indexName)
+    }
+
+    private fun executeDropIndex(statement: DropIndexStatement): StatementResult {
+        catalog.dropIndex(statement.indexName)
+        return DropIndexResult(statement.indexName)
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.executeCreateSequence] - see that method's own doc
+     * for the ascending/descending default resolution and the one thing [SequenceDefinition]'s own
+     * `init` cannot check itself (START WITH falling inside [MINVALUE, MAXVALUE]).
+     */
+    private fun executeCreateSequence(statement: CreateSequenceStatement): StatementResult {
+        val incrementBy = statement.incrementBy ?: 1L
+        if (incrementBy == 0L) throw DiskExecutorException("sequence '${statement.sequenceName}' INCREMENT BY cannot be zero")
+        val ascending = incrementBy > 0
+        val minValue = statement.minValue ?: if (ascending) 1L else Long.MIN_VALUE
+        val maxValue = statement.maxValue ?: if (ascending) Long.MAX_VALUE else -1L
+        if (minValue > maxValue) {
+            throw DiskExecutorException("sequence '${statement.sequenceName}' MINVALUE ($minValue) must not exceed MAXVALUE ($maxValue)")
+        }
+        val startValue = statement.startValue ?: if (ascending) minValue else maxValue
+        if (startValue < minValue || startValue > maxValue) {
+            throw DiskExecutorException(
+                "START WITH ($startValue) must be between MINVALUE ($minValue) and MAXVALUE ($maxValue)"
+            )
+        }
+        catalog.createSequence(SequenceDefinition(statement.sequenceName, incrementBy, minValue, maxValue, startValue, statement.cycle))
+        return CreateSequenceResult(statement.sequenceName)
+    }
+
+    private fun executeDropSequence(statement: DropSequenceStatement): StatementResult {
+        catalog.dropSequence(statement.sequenceName)
+        return DropSequenceResult(statement.sequenceName)
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.executeAlterSequence] - see that method's own doc. */
+    private fun executeAlterSequence(statement: AlterSequenceStatement): StatementResult {
+        val existing = catalog.sequence(statement.sequenceName).definition
+        val incrementBy = statement.incrementBy ?: existing.incrementBy
+        if (incrementBy == 0L) throw DiskExecutorException("sequence '${statement.sequenceName}' INCREMENT BY cannot be zero")
+        val ascending = incrementBy > 0
+        val minValue = when {
+            statement.clearMinValue -> if (ascending) 1L else Long.MIN_VALUE
+            statement.minValue != null -> statement.minValue
+            else -> existing.minValue
+        }
+        val maxValue = when {
+            statement.clearMaxValue -> if (ascending) Long.MAX_VALUE else -1L
+            statement.maxValue != null -> statement.maxValue
+            else -> existing.maxValue
+        }
+        if (minValue > maxValue) {
+            throw DiskExecutorException("sequence '${statement.sequenceName}' MINVALUE ($minValue) must not exceed MAXVALUE ($maxValue)")
+        }
+        val cycle = statement.cycle ?: existing.cycle
+        val newDefinition = SequenceDefinition(statement.sequenceName, incrementBy, minValue, maxValue, existing.startValue, cycle)
+        val restartAt = if (statement.restart) (statement.restartWith ?: existing.startValue) else null
+        if (restartAt != null && (restartAt < minValue || restartAt > maxValue)) {
+            throw DiskExecutorException("RESTART value ($restartAt) must be between MINVALUE ($minValue) and MAXVALUE ($maxValue)")
+        }
+        catalog.alterSequence(statement.sequenceName, newDefinition, restartAt)
+        return AlterSequenceResult(statement.sequenceName)
+    }
+
+    /**
+     * Runs [CreateViewStatement.query] once, discarding the result, purely to fail fast on a bad
+     * column/table reference before anything is persisted - mirrors [kestrel.engine.Executor.
+     * executeCreateView] calling `selectRunner.explain` for the same reason, just via a real
+     * execution rather than a plan-only walk (this executor has no `explain`).
+     */
+    private fun executeCreateView(statement: CreateViewStatement): StatementResult {
+        val txn = catalog.beginTransaction()
+        runInTransaction(txn) { runQuery(statement.query, txn, outer = null) }
+        catalog.createView(statement.viewName, statement.query, statement.orReplace)
+        return CreateViewResult(statement.viewName)
+    }
+
+    private fun executeDropView(statement: DropViewStatement): StatementResult {
+        catalog.dropView(statement.viewName, cascade = statement.mode == DropMode.Cascade)
+        return DropViewResult(statement.viewName)
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.executeCreateTrigger]: body statements are
+     * deliberately NOT deep-validated here (no eager check that every column referenced in a body
+     * statement's WHERE/SET/VALUES actually exists) - a trigger body can target a different table per
+     * statement, and this executor already defers exactly this kind of check to the moment the
+     * trigger actually fires, same as SQLite. What IS checked eagerly: the trigger's own table and
+     * every body statement's target table both exist right now, and the WHEN clause - evaluated
+     * directly by this executor rather than through a nested statement run, so nothing else will ever
+     * validate it - contains no subquery/aggregate and only ever references NEW/OLD columns that both
+     * exist on this table and are actually available for this trigger's event.
+     */
+    private fun executeCreateTrigger(statement: CreateTriggerStatement): StatementResult {
+        val schema = catalog.table(statement.tableName).schema
+        statement.whenClause?.let { whenClause ->
+            requireNoSubquery(whenClause)
+            validateTriggerRowReferences(whenClause, statement.event, schema)
+        }
+        for (bodyStatement in statement.body) validateTriggerBodyStatementTarget(bodyStatement)
+        catalog.createTrigger(
+            TriggerDefinition(statement.triggerName, statement.timing, statement.event, statement.tableName, statement.whenClause, statement.body)
+        )
+        return CreateTriggerResult(statement.triggerName)
+    }
+
+    private fun validateTriggerBodyStatementTarget(statement: Statement) {
+        when (statement) {
+            is InsertStatement -> { catalog.table(statement.tableName); rejectReturning(statement.returning) }
+            is UpdateStatement -> { catalog.table(statement.tableName); rejectReturning(statement.returning) }
+            is DeleteStatement -> { catalog.table(statement.tableName); rejectReturning(statement.returning) }
+            else -> throw DiskExecutorException("trigger body only supports INSERT, UPDATE, or DELETE statements")
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.rejectReturning]: a trigger body statement's own [runTriggerBody] discards whatever [StatementResult] it returns, so a RETURNING clause there would compute output nobody could ever see. */
+    private fun rejectReturning(returning: Projection?) {
+        if (returning != null) {
+            throw DiskExecutorException("RETURNING is not allowed in a trigger body statement - its result would never be visible to anything")
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.validateTriggerRowReferences]. */
+    private fun validateTriggerRowReferences(expression: Expression, event: TriggerEvent, schema: TableSchema) {
+        when (expression) {
+            is ColumnExpression -> {
+                val qualifier = expression.qualifier
+                    ?: throw DiskExecutorException("column '${expression.name}' in trigger WHEN clause must be qualified with NEW or OLD")
+                val isNew = qualifier.equals("new", ignoreCase = true)
+                val isOld = qualifier.equals("old", ignoreCase = true)
+                if (!isNew && !isOld) throw DiskExecutorException("no such table or alias: $qualifier")
+                val availableForEvent = when (event) {
+                    TriggerEvent.Insert -> isNew
+                    TriggerEvent.Delete -> isOld
+                    TriggerEvent.Update -> true
+                }
+                if (!availableForEvent) {
+                    throw DiskExecutorException("${if (isNew) "NEW" else "OLD"} is not available in a trigger ON ${event.name.uppercase()}")
+                }
+                if (schema.columnIndex(expression.name) == null) {
+                    throw DiskExecutorException("no such column: ${expression.name}")
+                }
+            }
+            is BinaryExpression -> {
+                validateTriggerRowReferences(expression.left, event, schema)
+                validateTriggerRowReferences(expression.right, event, schema)
+            }
+            is UnaryExpression -> validateTriggerRowReferences(expression.operand, event, schema)
+            is CallExpression -> expression.arguments.forEach { validateTriggerRowReferences(it, event, schema) }
+            is IsNullExpression -> validateTriggerRowReferences(expression.operand, event, schema)
+            is InExpression -> {
+                validateTriggerRowReferences(expression.operand, event, schema)
+                expression.values.forEach { validateTriggerRowReferences(it, event, schema) }
+            }
+            is BetweenExpression -> {
+                validateTriggerRowReferences(expression.operand, event, schema)
+                validateTriggerRowReferences(expression.low, event, schema)
+                validateTriggerRowReferences(expression.high, event, schema)
+            }
+            is LikeExpression -> {
+                validateTriggerRowReferences(expression.operand, event, schema)
+                validateTriggerRowReferences(expression.pattern, event, schema)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { validateTriggerRowReferences(it, event, schema) }
+                expression.branches.forEach {
+                    validateTriggerRowReferences(it.condition, event, schema)
+                    validateTriggerRowReferences(it.result, event, schema)
+                }
+                expression.elseExpression?.let { validateTriggerRowReferences(it, event, schema) }
+            }
+            is CastExpression -> validateTriggerRowReferences(expression.operand, event, schema)
+            is CollateExpression -> validateTriggerRowReferences(expression.operand, event, schema)
+            is LiteralExpression -> Unit
+            is FunctionExpression, is WindowExpression, is ScalarSubqueryExpression,
+            is ExistsExpression, is InSubqueryExpression,
+            is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression ->
+                error("unreachable: banned by requireNoSubquery")
+        }
+    }
+
+    private fun executeDropTrigger(statement: DropTriggerStatement): StatementResult {
+        catalog.dropTrigger(statement.triggerName)
+        return DropTriggerResult(statement.triggerName)
+    }
+
+    private fun executeCreateTable(statement: CreateTableStatement): StatementResult {
+        if (statement.temporary) return executeCreateTemporaryTable(statement)
+        if (statement.columns.count { it.primaryKey } > 1 ||
+            (statement.compositePrimaryKey.isNotEmpty() && statement.columns.any { it.primaryKey })
+        ) {
+            throw DiskExecutorException("table ${statement.tableName} declares more than one primary key")
+        }
+        validateUniqueDefinitions(statement)
+        validateCheckDefinitions(statement)
+        val columns = applyCompositePrimaryKey(statement)
+        validateForeignKeyDefinitions(statement, columns)
+        for (column in columns) {
+            when (val default = column.default) {
+                is NextValueExpression -> validateNextValueDefault(default, column)
+                is CurrentValueExpression -> throw DiskExecutorException("DEFAULT expression cannot contain CURRVAL")
+                else -> Unit
+            }
+        }
+        validateGeneratedDefinitions(columns)
+        catalog.createTable(
+            statement.tableName, columns, statement.compositePrimaryKey, statement.uniqueConstraints,
+            statement.checks, statement.foreignKeys
+        )
+        return CreateTableResult(statement.tableName)
+    }
+
+    /**
+     * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` - the disk-backed executor's counterpart of
+     * [executeCreateTable], but building a [kestrel.storage.Table] via [DiskCatalog.createTemporaryTable]
+     * instead of a [DiskTable]: a real, live table for the rest of this process's lifetime (INSERT/
+     * SELECT/UPDATE/DELETE, WHERE/JOIN/ORDER BY/subqueries, NOT NULL/PRIMARY KEY/UNIQUE/CHECK/DEFAULT/
+     * GENERATED all enforced exactly like a permanent table - see [executeTemporaryInsert]/
+     * [executeTemporaryUpdate]/[executeTemporaryDelete] and [resolveFromSource]), simply never
+     * touching the pager/WAL and never surviving a reopen. FOREIGN KEY is rejected outright rather
+     * than silently ignored: [DiskForeignKeyEnforcer] and its cascade bookkeeping are wired to
+     * [DiskTable]/[DiskCatalog]'s directory, which a temp table deliberately has no entry in, so
+     * honoring the constraint would need a parallel enforcement path this session scoped out - a
+     * named, documented scope-cut rather than a constraint that looks declared but is never checked.
+     */
+    private fun executeCreateTemporaryTable(statement: CreateTableStatement): StatementResult {
+        if (statement.foreignKeys.isNotEmpty()) {
+            throw DiskExecutorException("FOREIGN KEY on a temporary table is not supported by the disk-backed executor yet")
+        }
+        if (statement.columns.count { it.primaryKey } > 1 ||
+            (statement.compositePrimaryKey.isNotEmpty() && statement.columns.any { it.primaryKey })
+        ) {
+            throw DiskExecutorException("table ${statement.tableName} declares more than one primary key")
+        }
+        validateUniqueDefinitions(statement)
+        validateCheckDefinitions(statement)
+        val columns = applyCompositePrimaryKey(statement)
+        for (column in columns) {
+            when (val default = column.default) {
+                is NextValueExpression -> validateNextValueDefault(default, column)
+                is CurrentValueExpression -> throw DiskExecutorException("DEFAULT expression cannot contain CURRVAL")
+                else -> Unit
+            }
+        }
+        validateGeneratedDefinitions(columns)
+        val schema = TableSchema(
+            statement.tableName, columns,
+            checks = statement.checks,
+            uniqueConstraints = statement.uniqueConstraints,
+            compositePrimaryKey = statement.compositePrimaryKey,
+            temporary = true
+        )
+        catalog.createTemporaryTable(schema)
+        return CreateTableResult(statement.tableName)
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.validateNextValueDefault]: checked statically rather
+     * than by evaluating the DEFAULT for real, since a bare `CREATE TABLE` must not itself consume a
+     * sequence value before a single row exists.
+     */
+    private fun validateNextValueDefault(default: NextValueExpression, column: Column) {
+        catalog.sequence(default.sequenceName)
+        if (column.type != ColumnType.Integer) {
+            throw DiskExecutorException("NEXTVAL can only be used as a DEFAULT for an INTEGER column, but ${column.name} is ${column.type.displayName}")
+        }
+    }
+
+    /**
+     * Deliberately duplicated from [kestrel.engine.Executor.validateForeignKeyDefinitions] (same
+     * reasoning as [coerceForColumn]): [columns] is already normalized by [applyCompositePrimaryKey],
+     * matching the in-memory engine's own call order. A self-reference (`referencedTable` equal to
+     * the table being created) is checked against a [TableSchema] built from [columns] rather than
+     * the catalog, because the table doesn't exist there yet while it's being created.
+     */
+    private fun validateForeignKeyDefinitions(statement: CreateTableStatement, columns: List<Column>) {
+        for (fk in statement.foreignKeys) {
+            if (fk.columns.size != fk.referencedColumns.size) {
+                throw DiskExecutorException(
+                    "FOREIGN KEY (${fk.columns.joinToString(", ")}) column count does not match " +
+                        "REFERENCES ${fk.referencedTable}(${fk.referencedColumns.joinToString(", ")})"
+                )
+            }
+            for (columnName in fk.columns) {
+                if (columns.none { it.name.equals(columnName, ignoreCase = true) }) {
+                    throw DiskExecutorException("FOREIGN KEY refers to unknown column: $columnName")
+                }
+            }
+            val selfReference = fk.referencedTable.equals(statement.tableName, ignoreCase = true)
+            val hasEnforcedUniqueness = if (selfReference) {
+                for (columnName in fk.referencedColumns) {
+                    if (columns.none { it.name.equals(columnName, ignoreCase = true) }) {
+                        throw DiskExecutorException("FOREIGN KEY references unknown column: ${fk.referencedTable}.$columnName")
+                    }
+                }
+                val selfSchema = TableSchema(
+                    statement.tableName, columns,
+                    uniqueConstraints = statement.uniqueConstraints,
+                    compositePrimaryKey = statement.compositePrimaryKey
+                )
+                selfSchema.hasEnforcedUniqueness(fk.referencedColumns)
+            } else {
+                val referencedTable = catalog.tableOrNull(fk.referencedTable)
+                    ?: throw DiskExecutorException("FOREIGN KEY references unknown table: ${fk.referencedTable}")
+                for (columnName in fk.referencedColumns) {
+                    if (referencedTable.schema.column(columnName) == null) {
+                        throw DiskExecutorException("FOREIGN KEY references unknown column: ${fk.referencedTable}.$columnName")
+                    }
+                }
+                referencedTable.schema.hasEnforcedUniqueness(fk.referencedColumns)
+            }
+            if (!hasEnforcedUniqueness) {
+                throw DiskExecutorException(
+                    "FOREIGN KEY must reference a PRIMARY KEY or UNIQUE column(s), but " +
+                        "${fk.referencedTable}(${fk.referencedColumns.joinToString(", ")}) is not one"
+                )
+            }
+        }
+    }
+
+    /**
+     * Deliberately duplicated from [kestrel.engine.Executor.validateCheckDefinitions] (same
+     * reasoning as [coerceForColumn]): every CHECK expression must only reference a real column of
+     * the table being created and must contain no subquery, aggregate, or window function - there is
+     * no row yet to run one against, and this executor's [Evaluator] has no aggregation pass of its
+     * own outside [GroupAggregation].
+     */
+    private fun validateCheckDefinitions(statement: CreateTableStatement) {
+        val schema = TableSchema(statement.tableName, statement.columns)
+        for (check in statement.checks) {
+            checkColumns(check.expression, schema)
+            requireNoSubquery(check.expression)
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.checkColumns] - see [validateCheckDefinitions]. */
+    private fun checkColumns(expression: Expression, schema: TableSchema) {
+        when (expression) {
+            is ColumnExpression -> if (schema.columnIndex(expression.name) == null) {
+                throw DiskExecutorException("no such column: ${expression.name}")
+            }
+            is BinaryExpression -> {
+                checkColumns(expression.left, schema)
+                checkColumns(expression.right, schema)
+            }
+            is UnaryExpression -> checkColumns(expression.operand, schema)
+            is FunctionExpression -> throw DiskExecutorException("aggregate functions are not allowed here")
+            is WindowExpression -> throw DiskExecutorException("window functions are not allowed here")
+            is LiteralExpression -> Unit
+            is CallExpression -> expression.arguments.forEach { checkColumns(it, schema) }
+            is IsNullExpression -> checkColumns(expression.operand, schema)
+            is InExpression -> {
+                checkColumns(expression.operand, schema)
+                expression.values.forEach { checkColumns(it, schema) }
+            }
+            is BetweenExpression -> {
+                checkColumns(expression.operand, schema)
+                checkColumns(expression.low, schema)
+                checkColumns(expression.high, schema)
+            }
+            is LikeExpression -> {
+                checkColumns(expression.operand, schema)
+                checkColumns(expression.pattern, schema)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { checkColumns(it, schema) }
+                expression.branches.forEach {
+                    checkColumns(it.condition, schema)
+                    checkColumns(it.result, schema)
+                }
+                expression.elseExpression?.let { checkColumns(it, schema) }
+            }
+            is ScalarSubqueryExpression -> Unit
+            is ExistsExpression -> Unit
+            is InSubqueryExpression -> checkColumns(expression.operand, schema)
+            is CastExpression -> checkColumns(expression.operand, schema)
+            is CollateExpression -> checkColumns(expression.operand, schema)
+            is NextValueExpression, is CurrentValueExpression ->
+                throw DiskExecutorException("NEXTVAL/CURRVAL are not allowed in a CHECK constraint or GENERATED column expression")
+            is MergeActionExpression -> throw DiskExecutorException("MERGE_ACTION() is not allowed in a CHECK constraint or GENERATED column expression")
+            is ParameterExpression -> throw DiskExecutorException("a parameter reference is not allowed in a CHECK constraint or GENERATED column expression")
+        }
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.checkColumns] (the general-purpose variant used for
+     * WHERE/SET/RETURNING) - NOT [checkColumns] above, which is CHECK-constraint specific and
+     * rejects NEXTVAL/CURRVAL outright. Used only by [evaluateReturning]: validates every column
+     * reference in a RETURNING projection item exists on [schema] and that no aggregate/window
+     * function sneaks in.
+     */
+    private fun checkReturningColumns(expression: Expression, schema: TableSchema) {
+        when (expression) {
+            is ColumnExpression -> if (schema.columnIndex(expression.name) == null) {
+                throw DiskExecutorException("no such column: ${expression.name}")
+            }
+            is BinaryExpression -> {
+                checkReturningColumns(expression.left, schema)
+                checkReturningColumns(expression.right, schema)
+            }
+            is UnaryExpression -> checkReturningColumns(expression.operand, schema)
+            is FunctionExpression -> throw DiskExecutorException("aggregate functions are not allowed here")
+            is WindowExpression -> throw DiskExecutorException("window functions are not allowed here")
+            is LiteralExpression -> Unit
+            is CallExpression -> expression.arguments.forEach { checkReturningColumns(it, schema) }
+            is IsNullExpression -> checkReturningColumns(expression.operand, schema)
+            is InExpression -> {
+                checkReturningColumns(expression.operand, schema)
+                expression.values.forEach { checkReturningColumns(it, schema) }
+            }
+            is BetweenExpression -> {
+                checkReturningColumns(expression.operand, schema)
+                checkReturningColumns(expression.low, schema)
+                checkReturningColumns(expression.high, schema)
+            }
+            is LikeExpression -> {
+                checkReturningColumns(expression.operand, schema)
+                checkReturningColumns(expression.pattern, schema)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { checkReturningColumns(it, schema) }
+                expression.branches.forEach {
+                    checkReturningColumns(it.condition, schema)
+                    checkReturningColumns(it.result, schema)
+                }
+                expression.elseExpression?.let { checkReturningColumns(it, schema) }
+            }
+            is ScalarSubqueryExpression -> Unit
+            is ExistsExpression -> Unit
+            is InSubqueryExpression -> checkReturningColumns(expression.operand, schema)
+            is CastExpression -> checkReturningColumns(expression.operand, schema)
+            is CollateExpression -> checkReturningColumns(expression.operand, schema)
+            // Structurally harmless (no column reference to check) - whether MERGE_ACTION() is
+            // actually legal at this particular call site (MERGE's own RETURNING: yes; plain INSERT/
+            // UPDATE/DELETE's RETURNING: no) is enforced by whether the Evaluator this feeds into was
+            // actually given a mergeAction, exactly like NEXTVAL/CURRVAL is enforced by SequenceAccess -
+            // see evaluateMergeReturning, the one call site that binds one.
+            is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.requireNoSubquery] - see [validateCheckDefinitions]. */
+    private fun requireNoSubquery(expression: Expression) {
+        when (expression) {
+            is ScalarSubqueryExpression, is ExistsExpression, is InSubqueryExpression ->
+                throw DiskExecutorException("CHECK constraints and GENERATED column expressions cannot contain subqueries")
+            is FunctionExpression -> throw DiskExecutorException("aggregate functions are not allowed in CHECK constraints")
+            is BinaryExpression -> {
+                requireNoSubquery(expression.left)
+                requireNoSubquery(expression.right)
+            }
+            is UnaryExpression -> requireNoSubquery(expression.operand)
+            is CallExpression -> expression.arguments.forEach { requireNoSubquery(it) }
+            is IsNullExpression -> requireNoSubquery(expression.operand)
+            is InExpression -> {
+                requireNoSubquery(expression.operand)
+                expression.values.forEach { requireNoSubquery(it) }
+            }
+            is BetweenExpression -> {
+                requireNoSubquery(expression.operand)
+                requireNoSubquery(expression.low)
+                requireNoSubquery(expression.high)
+            }
+            is LikeExpression -> {
+                requireNoSubquery(expression.operand)
+                requireNoSubquery(expression.pattern)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { requireNoSubquery(it) }
+                expression.branches.forEach {
+                    requireNoSubquery(it.condition)
+                    requireNoSubquery(it.result)
+                }
+                expression.elseExpression?.let { requireNoSubquery(it) }
+            }
+            is CastExpression -> requireNoSubquery(expression.operand)
+            is CollateExpression -> requireNoSubquery(expression.operand)
+            is WindowExpression -> throw DiskExecutorException("window functions are not allowed in CHECK constraints")
+            is NextValueExpression, is CurrentValueExpression ->
+                throw DiskExecutorException("NEXTVAL/CURRVAL are not allowed in a CHECK constraint or GENERATED column expression")
+            is MergeActionExpression -> throw DiskExecutorException("MERGE_ACTION() is not allowed in a CHECK constraint or GENERATED column expression")
+            is ParameterExpression -> throw DiskExecutorException("a parameter reference is not allowed in a CHECK constraint or GENERATED column expression")
+            is ColumnExpression, is LiteralExpression -> Unit
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.validateGeneratedDefinitions] - see that method's own doc. */
+    private fun validateGeneratedDefinitions(columns: List<Column>) {
+        val schema = TableSchema("", columns)
+        val generatedNames = columns.filter { it.generated != null }.map { it.name.lowercase() }.toSet()
+        for (column in columns) {
+            val generated = column.generated ?: continue
+            if (column.default != null) {
+                throw DiskExecutorException("column ${column.name} cannot declare both DEFAULT and GENERATED ALWAYS AS")
+            }
+            checkColumns(generated, schema)
+            requireNoSubquery(generated)
+            requireNoGeneratedColumnReference(generated, generatedNames, column.name)
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.requireNoGeneratedColumnReference]. */
+    private fun requireNoGeneratedColumnReference(expression: Expression, generatedNames: Set<String>, ownerColumn: String) {
+        when (expression) {
+            is ColumnExpression -> if (expression.name.lowercase() in generatedNames) {
+                throw DiskExecutorException(
+                    "GENERATED column $ownerColumn cannot reference another GENERATED column: ${expression.name}"
+                )
+            }
+            is LiteralExpression -> Unit
+            is BinaryExpression -> {
+                requireNoGeneratedColumnReference(expression.left, generatedNames, ownerColumn)
+                requireNoGeneratedColumnReference(expression.right, generatedNames, ownerColumn)
+            }
+            is UnaryExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+            is CallExpression -> expression.arguments.forEach { requireNoGeneratedColumnReference(it, generatedNames, ownerColumn) }
+            is IsNullExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+            is InExpression -> {
+                requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+                expression.values.forEach { requireNoGeneratedColumnReference(it, generatedNames, ownerColumn) }
+            }
+            is BetweenExpression -> {
+                requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+                requireNoGeneratedColumnReference(expression.low, generatedNames, ownerColumn)
+                requireNoGeneratedColumnReference(expression.high, generatedNames, ownerColumn)
+            }
+            is LikeExpression -> {
+                requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+                requireNoGeneratedColumnReference(expression.pattern, generatedNames, ownerColumn)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { requireNoGeneratedColumnReference(it, generatedNames, ownerColumn) }
+                expression.branches.forEach {
+                    requireNoGeneratedColumnReference(it.condition, generatedNames, ownerColumn)
+                    requireNoGeneratedColumnReference(it.result, generatedNames, ownerColumn)
+                }
+                expression.elseExpression?.let { requireNoGeneratedColumnReference(it, generatedNames, ownerColumn) }
+            }
+            is CastExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+            is CollateExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
+            is FunctionExpression, is WindowExpression, is ScalarSubqueryExpression, is ExistsExpression,
+            is InSubqueryExpression, is NextValueExpression, is CurrentValueExpression, is MergeActionExpression,
+            is ParameterExpression -> Unit
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.applyGeneratedColumns]. */
+    private fun applyGeneratedColumns(schema: TableSchema, values: MutableList<Value>, subqueries: SubqueryRunner) {
+        if (schema.columns.none { it.generated != null }) return
+        val evaluator = Evaluator(schema, Row(values), subqueries)
+        for ((index, column) in schema.columns.withIndex()) {
+            val generated = column.generated ?: continue
+            values[index] = coerceForColumn(evaluator.evaluate(generated), column)
+        }
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.rejectGeneratedAssignment]. */
+    private fun rejectGeneratedAssignment(column: Column, explicitValueGiven: Boolean) {
+        if (explicitValueGiven && column.generated != null) {
+            throw DiskExecutorException("cannot assign an explicit value to GENERATED column ${column.name}")
+        }
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.enforceChecks]: a CHECK expression that evaluates to
+     * SQL `FALSE` rejects the row; `TRUE` or `NULL` (three-valued "unknown", e.g. a comparison against
+     * a NULL column) both accept it, per standard SQL.
+     */
+    private fun enforceChecks(schema: TableSchema, row: Row, subqueries: SubqueryRunner) {
+        for (check in schema.checks) {
+            val result = Evaluator(schema, row, subqueries).evaluate(check.expression)
+            if (result is Value.BooleanValue && !result.value) {
+                val label = check.name?.let { " $it" } ?: ""
+                throw DiskExecutorException("CHECK constraint$label failed: ${schema.name}")
+            }
+        }
+    }
+
+    /**
+     * NOT NULL enforcement for a temp table row - [DiskTable.insert]/[DiskTable.update] get this for
+     * free from their own private `requireArity`, but a temp table's plain [kestrel.storage.Table]
+     * has no such gate, so [executeTemporaryInsert]/[executeTemporaryUpdate] call this directly.
+     * Ported 1:1 from [kestrel.engine.Executor.validateNotNull].
+     */
+    private fun validateTemporaryNotNull(schema: TableSchema, values: List<Value>) {
+        for ((index, column) in schema.columns.withIndex()) {
+            if (column.notNull && values[index] is Value.NullValue) {
+                throw DiskExecutorException("NOT NULL constraint failed: ${schema.name}.${column.name}")
+            }
+        }
+    }
+
