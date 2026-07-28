@@ -3510,3 +3510,324 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
+    /**
+     * Resolves an explicit `ROWS|RANGE BETWEEN ... AND ...` [WindowFrame] to a range of positions
+     * into [ordered] for the row at [position] - clamped to the partition's edges rather than
+     * erroring, exactly like the implicit default frame already does. Mirrors
+     * [kestrel.engine.SelectRunner]'s own `frameRange` exactly.
+     */
+    private fun frameRange(
+        window: WindowExpression,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): IntRange {
+        val frame = window.frame!!
+        if (frame.unit == FrameUnit.Groups) {
+            return groupsFrameRange(frame, window.orderBy, position, ordered, combined, evaluateRow)
+        }
+        val size = ordered.size
+        val start = resolveFrameBound(frame, frame.start, window, position, ordered, combined, isStart = true, evaluateRow)
+        val end = resolveFrameBound(frame, frame.end, window, position, ordered, combined, isStart = false, evaluateRow)
+        val clampedStart = start.coerceAtLeast(0)
+        val clampedEnd = end.coerceAtMost(size - 1)
+        return if (clampedStart > clampedEnd) IntRange.EMPTY else clampedStart..clampedEnd
+    }
+
+    private fun resolveFrameBound(
+        frame: WindowFrame,
+        bound: FrameBound,
+        window: WindowExpression,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        isStart: Boolean,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int = when (bound.type) {
+        FrameBoundType.UnboundedPreceding -> 0
+        FrameBoundType.UnboundedFollowing -> ordered.size - 1
+        FrameBoundType.CurrentRow ->
+            if (frame.unit == FrameUnit.Rows) position else peerBoundary(window.orderBy, position, ordered, combined, isStart, evaluateRow)
+        FrameBoundType.Preceding ->
+            if (frame.unit == FrameUnit.Rows) {
+                position - resolveIntegerFrameOffset(bound, combined[ordered[position]], "ROWS", evaluateRow)
+            } else {
+                rangeBoundary(bound, window.orderBy, position, ordered, combined, isStart, subtract = true, evaluateRow)
+            }
+        FrameBoundType.Following ->
+            if (frame.unit == FrameUnit.Rows) {
+                position + resolveIntegerFrameOffset(bound, combined[ordered[position]], "ROWS", evaluateRow)
+            } else {
+                rangeBoundary(bound, window.orderBy, position, ordered, combined, isStart, subtract = false, evaluateRow)
+            }
+    }
+
+    private fun resolveIntegerFrameOffset(
+        bound: FrameBound,
+        row: List<Value>,
+        unit: String,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int {
+        val value = evaluateRow(bound.offset!!, row)
+        val amount = (value as? Value.IntegerValue)?.value ?: throw DiskExecutorException("$unit frame offset must be an integer")
+        if (amount < 0) throw DiskExecutorException("$unit frame offset must not be negative")
+        return amount.toInt()
+    }
+
+    /**
+     * `GROUPS BETWEEN <bound> AND <bound>` counts whole peer groups rather than physical rows
+     * ([FrameUnit.Rows]) or distance in a value ([FrameUnit.Range]) - mirrors
+     * [kestrel.engine.SelectRunner]'s own `groupsFrameRange` exactly.
+     */
+    private fun groupsFrameRange(
+        frame: WindowFrame,
+        orderBy: List<OrderKey>,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): IntRange {
+        val groups = peerGroupRanges(orderBy, ordered, combined, evaluateRow)
+        val currentGroup = groups.indexOfFirst { position in it }
+        val row = combined[ordered[position]]
+        val startGroup = resolveGroupBound(frame.start, currentGroup, groups.size, row, evaluateRow).coerceAtLeast(0)
+        val endGroup = resolveGroupBound(frame.end, currentGroup, groups.size, row, evaluateRow).coerceAtMost(groups.size - 1)
+        return if (startGroup > endGroup) IntRange.EMPTY else groups[startGroup].first..groups[endGroup].last
+    }
+
+    private fun resolveGroupBound(
+        bound: FrameBound,
+        currentGroup: Int,
+        groupCount: Int,
+        row: List<Value>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int = when (bound.type) {
+        FrameBoundType.UnboundedPreceding -> 0
+        FrameBoundType.UnboundedFollowing -> groupCount - 1
+        FrameBoundType.CurrentRow -> currentGroup
+        FrameBoundType.Preceding -> currentGroup - resolveIntegerFrameOffset(bound, row, "GROUPS", evaluateRow)
+        FrameBoundType.Following -> currentGroup + resolveIntegerFrameOffset(bound, row, "GROUPS", evaluateRow)
+    }
+
+    /**
+     * `CURRENT ROW` in a RANGE frame means the boundary of the current row's peer group (every row
+     * tied with it on the OVER's ORDER BY, or the whole partition with no ORDER BY) - mirrors
+     * [kestrel.engine.SelectRunner]'s own `peerBoundary` exactly.
+     */
+    private fun peerBoundary(
+        orderBy: List<OrderKey>,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        isStart: Boolean,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int {
+        if (orderBy.isEmpty()) return if (isStart) 0 else ordered.size - 1
+        fun keyAt(index: Int) = orderBy.map { evaluateRow(it.expression, combined[ordered[index]]) }
+        val key = keyAt(position)
+        var boundary = position
+        if (isStart) {
+            while (boundary > 0 && keyAt(boundary - 1) == key) boundary--
+        } else {
+            while (boundary < ordered.size - 1 && keyAt(boundary + 1) == key) boundary++
+        }
+        return boundary
+    }
+
+    /**
+     * `<value> PRECEDING`/`<value> FOLLOWING` in a RANGE frame measure distance in the value of a
+     * single numeric or DATE ORDER BY column rather than a row count - binary search works because
+     * [ordered] is already sorted on this column. Mirrors [kestrel.engine.SelectRunner]'s own
+     * `rangeBoundary` exactly.
+     */
+    private fun rangeBoundary(
+        bound: FrameBound,
+        orderBy: List<OrderKey>,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        isStart: Boolean,
+        subtract: Boolean,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int {
+        if (orderBy.size != 1) {
+            throw DiskExecutorException("a RANGE frame with a PRECEDING/FOLLOWING bound requires exactly one ORDER BY column")
+        }
+        val key = orderBy.single()
+        val current = rangeLogicalValue(key, combined[ordered[position]], evaluateRow)
+        val offset = resolveRangeFrameOffset(bound, combined[ordered[position]], evaluateRow)
+        val threshold = if (subtract) current - offset else current + offset
+        return if (isStart) {
+            rangeLowerBound(ordered, combined, key, threshold, evaluateRow)
+        } else {
+            rangeUpperBound(ordered, combined, key, threshold, evaluateRow)
+        }
+    }
+
+    private fun rangeLowerBound(
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        key: OrderKey,
+        threshold: BigDecimal,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int {
+        var low = 0
+        var high = ordered.size
+        while (low < high) {
+            val mid = (low + high) / 2
+            if (rangeLogicalValue(key, combined[ordered[mid]], evaluateRow) >= threshold) high = mid else low = mid + 1
+        }
+        return low
+    }
+
+    private fun rangeUpperBound(
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        key: OrderKey,
+        threshold: BigDecimal,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): Int {
+        var low = 0
+        var high = ordered.size
+        while (low < high) {
+            val mid = (low + high) / 2
+            if (rangeLogicalValue(key, combined[ordered[mid]], evaluateRow) <= threshold) low = mid + 1 else high = mid
+        }
+        return low - 1
+    }
+
+    private fun rangeLogicalValue(key: OrderKey, row: List<Value>, evaluateRow: (Expression, List<Value>) -> Value): BigDecimal {
+        val magnitude = rangeMagnitude(evaluateRow(key.expression, row))
+        return if (key.descending) magnitude.negate() else magnitude
+    }
+
+    private fun rangeMagnitude(value: Value): BigDecimal = when (value) {
+        is Value.IntegerValue -> BigDecimal(value.value)
+        is Value.DecimalValue -> value.value
+        is Value.RealValue -> BigDecimal.valueOf(value.value)
+        is Value.DateValue -> BigDecimal(value.value.toEpochDay())
+        else -> throw DiskExecutorException("a RANGE frame requires the ORDER BY column to be numeric or DATE")
+    }
+
+    private fun resolveRangeFrameOffset(bound: FrameBound, row: List<Value>, evaluateRow: (Expression, List<Value>) -> Value): BigDecimal {
+        val offset = when (val value = evaluateRow(bound.offset!!, row)) {
+            is Value.IntegerValue -> BigDecimal(value.value)
+            is Value.DecimalValue -> value.value
+            is Value.RealValue -> BigDecimal.valueOf(value.value)
+            else -> throw DiskExecutorException("RANGE frame offset must be numeric")
+        }
+        if (offset.signum() < 0) throw DiskExecutorException("RANGE frame offset must not be negative")
+        return offset
+    }
+
+    /**
+     * Splits [ordered] into contiguous "peer group" ranges of rows tied on the order key - or one
+     * range spanning the whole partition when there is no ORDER BY. Mirrors
+     * [kestrel.engine.SelectRunner]'s own `peerGroupRanges` exactly.
+     */
+    private fun peerGroupRanges(
+        orderBy: List<OrderKey>,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): List<IntRange> {
+        if (orderBy.isEmpty()) return listOf(ordered.indices)
+        val keys = ordered.map { index -> orderBy.map { key -> evaluateRow(key.expression, combined[index]) } }
+        val ranges = mutableListOf<IntRange>()
+        var i = 0
+        while (i < ordered.size) {
+            var j = i
+            while (j < ordered.size && keys[j] == keys[i]) j++
+            ranges.add(i until j)
+            i = j
+        }
+        return ranges
+    }
+
+    private fun aggregateWindowValue(window: WindowExpression, rows: List<List<Value>>, evaluateRow: (Expression, List<Value>) -> Value): Value =
+        AggregateFunctions.compute(window.name, window.argument, window.star, rows, evaluateRow)
+
+    /**
+     * LAG (direction -1) / LEAD (direction +1): reads [WindowExpression.argument] from the row
+     * [WindowExpression.offset] positions before/after the current one in [ordered] (default 1).
+     * Past either edge of the partition, falls back to [WindowExpression.defaultValue] (evaluated
+     * against the *current* row) or NULL. Mirrors [kestrel.engine.SelectRunner]'s own
+     * `assignOffsetWindowValues` exactly.
+     */
+    private fun assignOffsetWindowValues(
+        window: WindowExpression,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        out: Array<Value?>,
+        direction: Int,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ) {
+        ordered.forEachIndexed { position, index ->
+            val offset = resolveOffset(window, combined[index], evaluateRow)
+            val targetPosition = position + direction * offset
+            out[index] = if (targetPosition in ordered.indices) {
+                evaluateRow(window.argument!!, combined[ordered[targetPosition]])
+            } else {
+                window.defaultValue?.let { evaluateRow(it, combined[index]) } ?: Value.NullValue
+            }
+        }
+    }
+
+    private fun resolveOffset(window: WindowExpression, row: List<Value>, evaluateRow: (Expression, List<Value>) -> Value): Int {
+        val expression = window.offset ?: return 1
+        val value = evaluateRow(expression, row)
+        val amount = (value as? Value.IntegerValue)?.value ?: throw DiskExecutorException("${window.name}() offset must be an integer")
+        if (amount < 0) throw DiskExecutorException("${window.name}() offset must not be negative")
+        return amount.toInt()
+    }
+
+    /**
+     * NTILE(n): splits the partition into `n` buckets as evenly as possible - when the partition
+     * size does not divide evenly, the first `size % n` buckets get one extra row. Mirrors
+     * [kestrel.engine.SelectRunner]'s own `assignNtileWindowValues` exactly.
+     */
+    private fun assignNtileWindowValues(
+        window: WindowExpression,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        out: Array<Value?>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ) {
+        val bucketValue = evaluateRow(window.argument!!, combined[ordered.first()])
+        val buckets = (bucketValue as? Value.IntegerValue)?.value ?: throw DiskExecutorException("${window.name}() bucket count must be an integer")
+        if (buckets <= 0) throw DiskExecutorException("${window.name}() bucket count must be positive")
+        val bucketCount = buckets.toInt()
+        val base = ordered.size / bucketCount
+        val remainder = ordered.size % bucketCount
+        var position = 0
+        for (bucket in 1..bucketCount) {
+            val size = base + if (bucket <= remainder) 1 else 0
+            repeat(size) {
+                out[ordered[position]] = Value.IntegerValue(bucket.toLong())
+                position++
+            }
+        }
+    }
+
+    /**
+     * Candidate (rid, row) pairs for [where] over [table]: an indexed
+     * point/range/secondary lookup via [DiskIndexAccessPlanner] when the
+     * predicate allows it, a full [DiskTable.scan] otherwise. Callers must
+     * still evaluate the full [where] against whatever this returns - the
+     * chosen plan only narrows candidates, it never claims to satisfy every
+     * conjunct of the predicate (see [DiskAccessPlan]'s own documentation).
+     */
+    private fun candidateRows(table: DiskTable, txn: Long, where: Expression?, alias: String?): List<Pair<RecordId, Row>> =
+        when (val plan = accessPlanner.plan(table.schema, table.secondaryIndexes, where, alias)) {
+            DiskAccessPlan.FullScan -> table.scan(txn)
+            is DiskAccessPlan.PrimaryKeyPoint -> listOfNotNull(table.findByPrimaryKey(txn, plan.key))
+            is DiskAccessPlan.PrimaryKeyRange -> table.rangeByPrimaryKey(txn, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)
+            is DiskAccessPlan.CompositePrimaryKeyPoint -> listOfNotNull(table.findByPrimaryKey(txn, plan.keys))
+            is DiskAccessPlan.CompositePrimaryKeyRange ->
+                table.rangeByPrimaryKey(txn, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive, plan.prefix)
+            is DiskAccessPlan.Secondary -> table.findBySecondary(txn, plan.indexName, plan.keys)
+            is DiskAccessPlan.SecondaryRange ->
+                table.rangeBySecondary(txn, plan.indexName, plan.prefix, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)
+        }
+
