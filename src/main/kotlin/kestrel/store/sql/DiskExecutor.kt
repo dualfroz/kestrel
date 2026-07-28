@@ -2238,3 +2238,164 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return parts.joinToString(" AND ")
     }
 
+    private fun joinLabel(type: JoinType): String = when (type) {
+        JoinType.Left -> "Left"
+        JoinType.Right -> "Right"
+        JoinType.Full -> "Full"
+        JoinType.Inner -> "Inner"
+        JoinType.Cross -> "Cross"
+    }
+
+    private fun describe(expression: ColumnExpression): String =
+        expression.qualifier?.let { "$it.${expression.name}" } ?: expression.name
+
+    /** Ported 1:1 from [kestrel.engine.SelectRunner.describeExpression] - renders any expression as SQL text for an EXPLAIN header (currently only GROUP BY keys reach this). */
+    private fun describeExpression(expression: Expression): String = when (expression) {
+        is ColumnExpression -> describe(expression)
+        is LiteralExpression -> literalText(expression.value)
+        is FunctionExpression -> "${expression.name}(${describeFunctionArguments(expression)})${describeFilterClause(expression)}"
+        is BinaryExpression -> "${describeExpression(expression.left)} ${expression.operator.symbol} ${describeExpression(expression.right)}"
+        is UnaryExpression -> "${expression.operator.symbol} ${describeExpression(expression.operand)}"
+        is CallExpression -> "${expression.name}(${expression.arguments.joinToString(", ") { describeExpression(it) }})"
+        is IsNullExpression -> "${describeExpression(expression.operand)} IS ${if (expression.negated) "NOT " else ""}NULL"
+        is InExpression ->
+            "${describeExpression(expression.operand)} ${if (expression.negated) "NOT " else ""}IN (${expression.values.joinToString(", ") { describeExpression(it) }})"
+        is BetweenExpression ->
+            "${describeExpression(expression.operand)} ${if (expression.negated) "NOT " else ""}BETWEEN ${describeExpression(expression.low)} AND ${describeExpression(expression.high)}"
+        is LikeExpression ->
+            "${describeExpression(expression.operand)} ${if (expression.negated) "NOT " else ""}LIKE ${describeExpression(expression.pattern)}"
+        is CaseExpression -> buildString {
+            append("CASE ")
+            expression.operand?.let { append(describeExpression(it)); append(' ') }
+            expression.branches.forEach { append("WHEN ${describeExpression(it.condition)} THEN ${describeExpression(it.result)} ") }
+            expression.elseExpression?.let { append("ELSE ${describeExpression(it)} ") }
+            append("END")
+        }
+        is ScalarSubqueryExpression -> "(subquery)"
+        is ExistsExpression -> "EXISTS (subquery)"
+        is InSubqueryExpression ->
+            "${describeExpression(expression.operand)} ${if (expression.negated) "NOT " else ""}IN (subquery)"
+        is CastExpression ->
+            "CAST(${describeExpression(expression.operand)} AS ${expression.targetType.displayWith(expression.precision, expression.scale)})"
+        is CollateExpression -> "${describeExpression(expression.operand)} COLLATE ${expression.collation.sqlName}"
+        is WindowExpression ->
+            "${expression.name}(${if (expression.star) "*" else expression.argument?.let { describeExpression(it) } ?: ""}) OVER (...)"
+        is NextValueExpression -> "NEXTVAL('${expression.sequenceName}')"
+        is CurrentValueExpression -> "CURRVAL('${expression.sequenceName}')"
+        is MergeActionExpression -> "MERGE_ACTION()"
+        is ParameterExpression -> "\$${expression.index}"
+    }
+
+    private fun describeFunctionArguments(expression: FunctionExpression): String {
+        if (expression.star) return "*"
+        val distinctPrefix = if (expression.distinct) "DISTINCT " else ""
+        val value = expression.argument?.let { describeExpression(it) } ?: ""
+        val separator = expression.separator ?: return "$distinctPrefix$value"
+        val orderBy = if (expression.orderBy.isNotEmpty()) {
+            " ORDER BY " + expression.orderBy.joinToString(", ") { key -> describeExpression(key.expression) + orderKeySuffix(key) }
+        } else ""
+        return "$distinctPrefix$value, ${describeExpression(separator)}$orderBy"
+    }
+
+    private fun orderKeySuffix(key: OrderKey): String {
+        val direction = if (key.descending) " DESC" else ""
+        val nulls = when (key.nullsFirst) {
+            true -> " NULLS FIRST"
+            false -> " NULLS LAST"
+            null -> ""
+        }
+        return direction + nulls
+    }
+
+    private fun describeFilterClause(expression: FunctionExpression): String =
+        expression.filter?.let { " FILTER (WHERE ${describeExpression(it)})" } ?: ""
+
+    private fun literalText(value: Value): String = when (value) {
+        is Value.IntegerValue -> value.value.toString()
+        is Value.RealValue -> value.value.toString()
+        is Value.TextValue -> "'${value.value}'"
+        is Value.BooleanValue -> value.value.toString()
+        is Value.DecimalValue -> value.value.toPlainString()
+        is Value.DateValue -> value.value.toString()
+        is Value.NullValue -> "NULL"
+    }
+
+    /** Runs [select] within [txn] and hands the result straight back to whichever [Evaluator] asked for it. */
+    private fun subqueryRunnerFor(txn: Long): SubqueryRunner = SubqueryRunner { select, outer -> runSelect(select, txn, outer) }
+
+    /**
+     * Dispatches [query] to the runner matching its concrete shape, mirroring
+     * [kestrel.engine.SelectRunner.runQuery] 1:1: a plain SELECT runs directly, a
+     * UNION/INTERSECT/EXCEPT chain combines two independently-run sides, and a WITH/WITH RECURSIVE
+     * query first materializes its common table expressions (visible only for the duration of this
+     * call, via [activeCtes]) before running its body.
+     */
+    private fun runQuery(query: QueryStatement, txn: Long, outer: ColumnResolver?): SelectResult = when (query) {
+        is SelectStatement -> runSelect(query, txn, outer)
+        is SetOperationStatement -> runSetOperation(query, txn, outer)
+        is WithQuery -> runWith(query, txn, outer)
+    }
+
+    private fun setOperatorKeyword(operator: SetOperator): String = when (operator) {
+        SetOperator.Union -> "UNION"
+        SetOperator.UnionAll -> "UNION ALL"
+        SetOperator.Intersect -> "INTERSECT"
+        SetOperator.IntersectAll -> "INTERSECT ALL"
+        SetOperator.Except -> "EXCEPT"
+        SetOperator.ExceptAll -> "EXCEPT ALL"
+    }
+
+    /**
+     * Deliberately mirrors [kestrel.engine.SelectRunner]'s own `runSetOperation`: both sides run
+     * independently (each may itself be a nested set operation, WITH query, or plain SELECT), then
+     * combined by multiset/set semantics (UNION/INTERSECT/EXCEPT dedupe via `List<Value>` structural
+     * equality, the `ALL` variants preserve duplicate counts through [multisetFilter]), with ORDER
+     * BY/LIMIT applying only to the combined result - never to either side individually, which is
+     * why [kestrel.sql.parser.Parser] never lets an inner SELECT-core in a compound query own its own
+     * ORDER BY/LIMIT.
+     */
+    private fun runSetOperation(statement: SetOperationStatement, txn: Long, outer: ColumnResolver?): SelectResult {
+        val left = runQuery(statement.left, txn, outer)
+        val right = runQuery(statement.right, txn, outer)
+        if (left.columns.size != right.columns.size) {
+            throw DiskExecutorException(
+                "${setOperatorKeyword(statement.operator)} queries must have the same number of columns " +
+                    "but got ${left.columns.size} and ${right.columns.size}"
+            )
+        }
+        val declaredCollationOf = declaredSetOperationCollation(statement, left.columns)
+        val outputExpressions = left.columns.map { ColumnExpression(it) }
+        fun foldedKey(row: List<Value>) = collationFoldedKey(row, outputExpressions, declaredCollationOf)
+        var rows = when (statement.operator) {
+            SetOperator.UnionAll -> left.rows + right.rows
+            SetOperator.Union -> (left.rows + right.rows).distinctBy(::foldedKey)
+            SetOperator.Intersect -> {
+                val rightKeys = right.rows.mapTo(HashSet(), ::foldedKey)
+                left.rows.filter { foldedKey(it) in rightKeys }.distinctBy(::foldedKey)
+            }
+            SetOperator.Except -> {
+                val rightKeys = right.rows.mapTo(HashSet(), ::foldedKey)
+                left.rows.filter { foldedKey(it) !in rightKeys }.distinctBy(::foldedKey)
+            }
+            SetOperator.IntersectAll -> multisetFilter(left.rows, right.rows, keepOnMatch = true, keyOf = ::foldedKey)
+            SetOperator.ExceptAll -> multisetFilter(left.rows, right.rows, keepOnMatch = false, keyOf = ::foldedKey)
+        }
+        val orderKeys = statement.orderBy?.keys.orEmpty()
+        if (orderKeys.isNotEmpty()) {
+            rows = rows.sortedWith(
+                multiKeyComparator(
+                    orderKeys,
+                    evaluate = { expression, row -> evaluateOutputRow(left.columns, expression, row, txn) },
+                    declaredCollationOf = declaredCollationOf
+                )
+            )
+        }
+        statement.offset?.let { if (it < 0) throw DiskExecutorException("OFFSET must not be negative") }
+        statement.limit?.let { if (it < 0) throw DiskExecutorException("LIMIT must not be negative") }
+        if (statement.offset != null || statement.limit != null) {
+            rows = rows.drop(statement.offset ?: 0)
+            statement.limit?.let { rows = rows.take(it) }
+        }
+        return SelectResult(left.columns, rows)
+    }
+
