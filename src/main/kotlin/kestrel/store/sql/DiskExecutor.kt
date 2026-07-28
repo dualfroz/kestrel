@@ -1760,3 +1760,160 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
+    /**
+     * INSERT into a temp table's plain [Table.rows] list - ported from the same validate-the-whole-
+     * batch-before-mutating-anything shape as [executeInsertInTxn]/[kestrel.engine.Executor.
+     * executeInsertInner], minus [DiskForeignKeyEnforcer]/trigger firing (both rejected outright at
+     * `CREATE TEMP TABLE` time - see [executeCreateTemporaryTable]) and minus ON CONFLICT (a separate,
+     * documented scope-cut: [executeInsertWithConflictHandling]'s `findConflictingRow` scans a live
+     * [DiskTable] via [DiskTable.scan], which a temp table has none of). Still opens a real disk
+     * transaction via [withStatementTransaction] purely so a DEFAULT/CHECK/GENERATED expression's
+     * scalar subquery (via [subqueryRunnerFor]) or a NEXTVAL default can read/advance the disk
+     * catalog consistently - nothing about the temp table's own row list ever touches it.
+     */
+    private fun executeTemporaryInsert(statement: InsertStatement, table: Table): StatementResult {
+        if (statement.onConflict != null) {
+            throw DiskExecutorException("INSERT ... ON CONFLICT on a temporary table is not supported by the disk-backed executor yet")
+        }
+        val schema = table.schema
+        return withStatementTransaction { txn ->
+            val targetIndices = resolveInsertTargets(schema, statement.columns)
+            val subqueries = subqueryRunnerFor(txn)
+            val evaluator = Evaluator(composeResolver(null, null), subqueries, this)
+            val newRows = statement.rows.map { rawRow ->
+                if (rawRow.size != targetIndices.size) {
+                    throw DiskExecutorException(
+                        "table ${schema.name} expects ${targetIndices.size} values but ${rawRow.size} were supplied"
+                    )
+                }
+                val values = MutableList<Value>(schema.columns.size) { Value.NullValue }
+                val touched = BooleanArray(schema.columns.size)
+                for ((position, expression) in rawRow.withIndex()) {
+                    val columnIndex = targetIndices[position]
+                    if (expression != null) {
+                        rejectGeneratedAssignment(schema.columns[columnIndex], explicitValueGiven = true)
+                        values[columnIndex] = coerceForColumn(evaluator.evaluate(expression), schema.columns[columnIndex])
+                        touched[columnIndex] = true
+                    }
+                }
+                for ((index, column) in schema.columns.withIndex()) {
+                    val default = column.default
+                    if (!touched[index] && default != null) {
+                        values[index] = coerceForColumn(evaluator.evaluate(default), column)
+                    }
+                }
+                applyGeneratedColumns(schema, values, subqueries)
+                validateTemporaryNotNull(schema, values)
+                Row(values)
+            }
+            for (row in newRows) enforceChecks(schema, row, subqueries)
+            enforceTemporaryPrimaryKeyUniqueness(schema, table.rows + newRows)
+            enforceTemporaryUniqueConstraints(schema, table.rows + newRows)
+            table.rows.addAll(newRows)
+            val returning = statement.returning?.let { evaluateReturning(schema, newRows, it, subqueries) }
+            InsertResult(newRows.size, returning)
+        }
+    }
+
+    private fun executeInsertInTxn(
+        statement: InsertStatement, table: DiskTable, schema: TableSchema, txn: Long, triggerContext: TriggerRowContext?
+    ): StatementResult {
+        val targetIndices = resolveInsertTargets(schema, statement.columns)
+        val onConflict = statement.onConflict
+        val subqueries = subqueryRunnerFor(txn)
+        val evaluator = Evaluator(composeResolver(null, triggerContext), subqueries, this)
+        val newRows = statement.rows.map { rawRow ->
+            if (rawRow.size != targetIndices.size) {
+                throw DiskExecutorException(
+                    "table ${schema.name} expects ${targetIndices.size} values but ${rawRow.size} were supplied"
+                )
+            }
+            val values = MutableList<Value>(schema.columns.size) { Value.NullValue }
+            val touched = BooleanArray(schema.columns.size)
+            for ((position, expression) in rawRow.withIndex()) {
+                val columnIndex = targetIndices[position]
+                if (expression != null) {
+                    rejectGeneratedAssignment(schema.columns[columnIndex], explicitValueGiven = true)
+                    values[columnIndex] = coerceForColumn(evaluator.evaluate(expression), schema.columns[columnIndex])
+                    touched[columnIndex] = true
+                }
+            }
+            for ((index, column) in schema.columns.withIndex()) {
+                val default = column.default
+                if (!touched[index] && default != null) {
+                    values[index] = coerceForColumn(evaluator.evaluate(default), column)
+                }
+            }
+            applyGeneratedColumns(schema, values, subqueries)
+            Row(values)
+        }
+        if (onConflict == null) {
+            // Fires before any constraint is even checked, matching SQLite/Postgres: a BEFORE
+            // trigger can reject the whole statement (by having its body throw) before this
+            // executor's own FOREIGN KEY/CHECK/UNIQUE validation ever runs.
+            fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Insert, newRows.map { null to it }, txn)
+            for (row in newRows) {
+                DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, row.values, uncommittedSiblings = newRows)
+                enforceChecks(schema, row, subqueries)
+            }
+            for (row in newRows) table.insert(txn, row)
+            fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Insert, newRows.map { null to it }, txn)
+            val returning = statement.returning?.let { evaluateReturning(schema, newRows, it, subqueries) }
+            return InsertResult(newRows.size, returning)
+        }
+        return executeInsertWithConflictHandling(schema, table, txn, newRows, onConflict, subqueries, statement.returning, triggerContext)
+    }
+
+    private class DiskUniqueKey(val columnIndices: List<Int>, val columnNames: List<String>)
+
+    /** Ported 1:1 from [kestrel.engine.Executor.uniqueKeysOf]: PRIMARY KEY, then every declared UNIQUE constraint, then every UNIQUE secondary index - the same three sources a conflict target may name. */
+    private fun diskUniqueKeysOf(schema: TableSchema, table: DiskTable): List<DiskUniqueKey> {
+        val keys = mutableListOf<DiskUniqueKey>()
+        val pkIndices = schema.primaryKeyIndices
+        if (pkIndices.isNotEmpty()) keys.add(DiskUniqueKey(pkIndices, pkIndices.map { schema.columns[it].name }))
+        for (unique in schema.uniqueConstraints) {
+            val indices = unique.columns.map { schema.columnIndex(it)!! }
+            keys.add(DiskUniqueKey(indices, unique.columns))
+        }
+        for (handle in table.secondaryIndexes) {
+            if (!handle.unique) continue
+            keys.add(DiskUniqueKey(handle.columnIndices, handle.columnNames))
+        }
+        return keys
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.resolveConflictTargetKeys]: empty [targetColumns] (bare `ON CONFLICT DO ...`) matches against any of [keys]. */
+    private fun resolveConflictTargetKeys(schema: TableSchema, targetColumns: List<String>, keys: List<DiskUniqueKey>): List<DiskUniqueKey> {
+        if (targetColumns.isEmpty()) return keys
+        val targetIndices = targetColumns.map { name ->
+            schema.columnIndex(name) ?: throw DiskExecutorException("no such column: $name")
+        }
+        val targetSet = targetIndices.toSet()
+        val matched = keys.firstOrNull { it.columnIndices.toSet() == targetSet }
+            ?: throw DiskExecutorException(
+                "no unique or primary key constraint matching ON CONFLICT specification: " +
+                    targetColumns.joinToString(", ")
+            )
+        return listOf(matched)
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.findConflictingRow], but scanning the live
+     * [DiskTable] (via [DiskTable.scan]) rather than an in-memory `List<Row>` snapshot - the
+     * transactional heap already reflects any row this same statement inserted or updated
+     * earlier in [executeInsertWithConflictHandling]'s per-row loop, giving the same
+     * read-your-own-writes semantics the in-memory engine gets from folding sibling rows into
+     * its candidate list by hand. NULLs never collide with each other (standard SQL).
+     */
+    private fun findConflictingRow(txn: Long, table: DiskTable, candidate: List<Value>, keys: List<DiskUniqueKey>): Pair<RecordId, Row>? {
+        for ((existingRid, existing) in table.scan(txn)) {
+            for (key in keys) {
+                val candidateKey = key.columnIndices.map { candidate[it] }
+                if (candidateKey.any { it is Value.NullValue }) continue
+                val existingKey = key.columnIndices.map { existing.values[it] }
+                if (candidateKey == existingKey) return existingRid to existing
+            }
+        }
+        return null
+    }
+
