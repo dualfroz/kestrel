@@ -1917,3 +1917,324 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return null
     }
 
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.executeInsertWithConflictHandling]: each candidate
+     * row is processed as its own micro-insert against the table's current state (not a
+     * batch-validated snapshot), so a later row in the same multi-row INSERT correctly sees an
+     * earlier row's insert or update. [triggerContext] can be non-null here for two independent
+     * reasons: [schema] itself may have triggers of its own (fired per row below, exactly like
+     * [kestrel.engine.Executor] does), and/or this INSERT ... ON CONFLICT may itself be a trigger
+     * body statement targeting a *different* table, so `NEW`/`OLD` from the outer firing trigger
+     * must still resolve in its DO UPDATE assignment values - both compose without conflict since
+     * [fireRowTriggers] below builds its own fresh [TriggerRowContext] from [schema]'s own triggers,
+     * independent of [triggerContext]. Unlike the batch INSERT/UPDATE paths, no separate reindex step
+     * is needed around trigger firing here: [DiskTable]'s secondary indexes are B+Trees maintained
+     * incrementally by [table.insert]/[table.update] themselves, not rebuilt in a batch pass like
+     * [kestrel.catalog.Catalog.reindexTable], so a trigger body's own query against this table always
+     * sees a consistent index the instant this row's own mutation returns.
+     */
+    private fun executeInsertWithConflictHandling(
+        schema: TableSchema,
+        table: DiskTable,
+        txn: Long,
+        candidateRows: List<Row>,
+        onConflict: OnConflictClause,
+        subqueries: SubqueryRunner,
+        returning: Projection? = null,
+        triggerContext: TriggerRowContext? = null
+    ): StatementResult {
+        val keys = diskUniqueKeysOf(schema, table)
+        val targetKeys = resolveConflictTargetKeys(schema, onConflict.targetColumns, keys)
+        var affected = 0
+        // DO NOTHING contributes no row, and a DO UPDATE row whose WHERE guard fails `continue`s
+        // before reaching the append below - both absent from RETURNING, matching Postgres, same
+        // as the in-memory engine.
+        val returnedRows = mutableListOf<Row>()
+        for (row in candidateRows) {
+            val conflict = findConflictingRow(txn, table, row.values, targetKeys)
+            if (conflict == null) {
+                fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Insert, listOf(null to row), txn)
+                DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, row.values, uncommittedSiblings = emptyList())
+                enforceChecks(schema, row, subqueries)
+                table.insert(txn, row)
+                affected++
+                returnedRows.add(row)
+                fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Insert, listOf(null to row), txn)
+                continue
+            }
+            val (conflictingRid, conflictingRow) = conflict
+            when (val action = onConflict.action) {
+                ConflictDoNothing -> Unit
+                is ConflictDoUpdate -> {
+                    val resolver = composeResolver(excludedAwareResolver(schema, conflictingRow, row), triggerContext)
+                    // NEXTVAL/CURRVAL are deliberately usable in the assignment values below but not
+                    // in this WHERE-shaped guard, matching the in-memory engine's own two-Evaluator split.
+                    val conditionEvaluator = Evaluator(resolver, subqueries)
+                    if (action.where != null && !isTrue(conditionEvaluator.evaluate(action.where))) continue
+                    val assignmentEvaluator = Evaluator(resolver, subqueries, this)
+                    val values = conflictingRow.values.toMutableList()
+                    for (assignment in action.assignments) {
+                        val index = schema.columnIndex(assignment.columnName)
+                            ?: throw DiskExecutorException("no such column: ${assignment.columnName}")
+                        val column = schema.columns[index]
+                        rejectGeneratedAssignment(column, explicitValueGiven = assignment.value != null)
+                        values[index] = if (assignment.value != null) {
+                            coerceForColumn(assignmentEvaluator.evaluate(assignment.value), column)
+                        } else {
+                            column.default?.let { coerceForColumn(assignmentEvaluator.evaluate(it), column) } ?: Value.NullValue
+                        }
+                    }
+                    applyGeneratedColumns(schema, values, subqueries)
+                    val updated = Row(values)
+                    // Fires before any constraint below is checked, same as executeUpdateInTxn's own
+                    // BEFORE trigger - a BEFORE UPDATE trigger's body can reject this row's update
+                    // before this executor's own validation ever runs.
+                    fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, listOf(conflictingRow to updated), txn)
+                    DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, updated.values, uncommittedSiblings = emptyList())
+                    enforceChecks(schema, updated, subqueries)
+                    // Same as executeUpdate: any table with a FK pointing at one of this table's
+                    // enforced-unique key groups needs a cascade/RESTRICT pass when that group's
+                    // value actually changes, not just the PRIMARY KEY.
+                    for (group in schema.enforcedUniqueKeyGroups()) {
+                        val columnIndices = group.map { schema.columnIndex(it)!! }
+                        val oldKey = columnIndices.map { conflictingRow.values[it] }
+                        val newKey = columnIndices.map { updated.values[it] }
+                        DiskForeignKeyEnforcer.cascadeUpdate(catalog, txn, schema.name, group, listOf(oldKey to newKey))
+                    }
+                    table.update(txn, conflictingRid, updated)
+                    affected++
+                    returnedRows.add(updated)
+                    fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Update, listOf(conflictingRow to updated), txn)
+                }
+            }
+        }
+        return InsertResult(affected, returning?.let { evaluateReturning(schema, returnedRows, it, subqueries) })
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.excludedAwareResolver]: bare column names resolve
+     * against [target] (the existing conflicting row, matching plain UPDATE semantics), while
+     * `EXCLUDED.column` resolves against [excluded] (the row proposed by this INSERT that failed
+     * to land) - the same pseudo-table Postgres exposes in DO UPDATE.
+     */
+    private fun excludedAwareResolver(schema: TableSchema, target: Row, excluded: Row): ColumnResolver = object : ColumnResolver {
+        override fun resolve(expression: ColumnExpression): Value {
+            val qualifier = expression.qualifier
+            val useExcluded = qualifier != null && qualifier.equals("excluded", ignoreCase = true)
+            if (qualifier != null && !useExcluded && !qualifier.equals(schema.name, ignoreCase = true)) {
+                throw DiskExecutorException("no such table or alias: $qualifier")
+            }
+            val index = schema.columnIndex(expression.name)
+                ?: throw DiskExecutorException("no such column: ${expression.name}")
+            return if (useExcluded) excluded.values[index] else target.values[index]
+        }
+
+        override fun declaredCollation(expression: ColumnExpression): Collation? = schema.column(expression.name)?.collation
+    }
+
+    private fun resolveInsertTargets(schema: TableSchema, columns: List<String>?): List<Int> {
+        if (columns == null) return schema.columns.indices.toList()
+        return columns.map { columnName ->
+            schema.columnIndex(columnName)
+                ?: throw DiskExecutorException("no such column: $columnName in table ${schema.name}")
+        }
+    }
+
+    private fun executeQuery(statement: QueryStatement): StatementResult =
+        withStatementTransaction { txn -> runQuery(statement, txn, outer = null) }
+
+    /**
+     * Closes the "this executor has no `explain`" scope cut documented on [executeCreateView]:
+     * describes the plan [runSelect]/[runQuery] would use for [statement.select] without running
+     * it, mirroring [kestrel.engine.SelectRunner.explain]'s shape (Seq Scan/Index Scan header per
+     * driving source, Nested Loop per JOIN, GroupAggregate/Aggregate, Sort, Limit, CTE/UNION/WITH
+     * RECURSIVE nesting) with two differences forced by this executor's disk-backed row supply
+     * rather than the in-memory engine's already-resident rows:
+     *
+     * - A materialized CTE, a VIEW, or a non-LATERAL derived table in FROM still runs its defining
+     *   query for real via [resolveFromItem]/[buildCteScope] (exactly what [runSelect] itself would
+     *   do, and exactly what [kestrel.engine.SelectRunner.explain] does too through `resolveSource`)
+     *   since only running it produces a real schema/row set to plan further nesting against. The
+     *   query's own driving table(s) are never scanned this way, though: [resolveFromItem] only
+     *   wraps a real [DiskTable] in a [DiskTableSource] (schema/index metadata, no I/O) - the
+     *   [DiskTableSource.scan] a real [runSelect] would call to actually read rows is deliberately
+     *   never invoked here, so `EXPLAIN SELECT * FROM huge_table` costs nothing proportional to
+     *   `huge_table`'s size the way `SELECT * FROM huge_table` would.
+     * - [applyJoin] has no hash-join optimization at all (see its own doc), so "Nested Loop" is the
+     *   only join header this ever prints - "Hash Join" (which the in-memory engine's EXPLAIN can
+     *   print for an equality ON condition) never appears here.
+     *
+     * Deliberately narrower than [kestrel.engine.SelectRunner.explain] in one respect: it reuses
+     * every validation [runSelect] performs *structurally*, independent of row data - duplicate
+     * alias detection ([buildJoinSources]), window-function placement ([rejectWindowFunction]/
+     * [validateWindows]), and GROUP BY/aggregate correctness ([validateAggregation], itself
+     * structural since [resolveIndex] only consults [JoinSource.schema], never row data) - but does
+     * NOT eagerly resolve WHERE/ON column references the way [kestrel.engine.SelectRunner.explain]'s
+     * `Plan.validate()` does. [runSelect] itself only resolves those against real row data inside
+     * `combined.filter { ... }`/[applyJoin], so on an empty table a bad WHERE/ON column reference
+     * never surfaces there either (a pre-existing, documented gap versus the in-memory engine, not
+     * a new one introduced here) - EXPLAIN staying exactly as permissive keeps its guarantees no
+     * stronger than what actually running the statement would give you.
+     */
+    private fun executeExplain(statement: ExplainStatement): StatementResult =
+        withStatementTransaction { txn -> ExplainResult(explainQuery(statement.select, txn)) }
+
+    private fun explainQuery(query: QueryStatement, txn: Long): List<String> = when (query) {
+        is SelectStatement -> explainSelect(query, txn)
+        is SetOperationStatement -> explainSetOperation(query, txn)
+        is WithQuery -> explainWith(query, txn)
+    }
+
+    /** Title-case labels for an EXPLAIN header - deliberately separate from [setOperatorKeyword]'s ALL-CAPS SQL-keyword text used in error messages. */
+    private fun explainOperatorLabel(operator: SetOperator): String = when (operator) {
+        SetOperator.Union -> "Union"
+        SetOperator.UnionAll -> "Union All"
+        SetOperator.Intersect -> "Intersect"
+        SetOperator.IntersectAll -> "Intersect All"
+        SetOperator.Except -> "Except"
+        SetOperator.ExceptAll -> "Except All"
+    }
+
+    private fun explainSetOperation(statement: SetOperationStatement, txn: Long): List<String> {
+        val header = explainOperatorLabel(statement.operator)
+        val left = explainQuery(statement.left, txn).map { "  -> $it" }
+        val right = explainQuery(statement.right, txn).map { "  -> $it" }
+        var lines = listOf(header) + left + right
+        statement.orderBy?.let { lines = listOf("Sort") + lines.map { line -> "  $line" } }
+        statement.offset?.let { lines = listOf("Offset ${statement.offset}") + lines.map { line -> "  $line" } }
+        statement.limit?.let { lines = listOf("Limit ${statement.limit}") + lines.map { line -> "  $line" } }
+        return lines
+    }
+
+    /**
+     * Materializes every CTE for real via [buildCteScope] (needed so a query nested under this WITH
+     * can itself be explained against a real schema/row set), then re-walks each CTE's own query a
+     * second time purely to render its plan text - the same double pass [kestrel.engine.SelectRunner.
+     * explainWith] already accepts for the in-memory engine, including the same cost of re-running a
+     * *nested* recursive CTE's fixed point twice over if one WITH RECURSIVE is nested inside another.
+     */
+    private fun explainWith(query: WithQuery, txn: Long): List<String> {
+        var pushed = 0
+        try {
+            for (cte in query.ctes) {
+                activeCtes.add(buildCteScope(query.recursive, cte, txn))
+                pushed++
+            }
+            val cteLines = query.ctes.flatMap { cte ->
+                listOf("CTE ${cte.name}") + explainQuery(cte.query, txn).map { "  -> $it" }
+            }
+            return cteLines + explainQuery(query.body, txn)
+        } finally {
+            repeat(pushed) { activeCtes.removeAt(activeCtes.size - 1) }
+        }
+    }
+
+    private fun explainSelect(statement: SelectStatement, txn: Long): List<String> {
+        val fromItems = listOf(statement.from) + statement.joins.map { it.from }
+        val fromSources = fromItems.map { item -> resolveFromItem(item, txn) }
+        val sources = buildJoinSources(fromItems, fromSources.map { it.schema })
+        statement.joins.forEach { join -> join.on?.let { rejectWindowFunction(it, "an ON condition") } }
+        var body = explainJoinLines(statement, sources, fromSources)
+        statement.where?.let { rejectWindowFunction(it, "WHERE") }
+        statement.groupBy.forEach { rejectWindowFunction(it, "GROUP BY") }
+        statement.having?.let { rejectWindowFunction(it, "HAVING") }
+        statement.distinctOn.forEach { rejectWindowFunction(it, "DISTINCT ON") }
+        val orderKeys = resolvedOrderKeys(statement)
+        val aggregated = statement.groupBy.isNotEmpty() || statement.groupingSpec != null ||
+            containsAggregate(statement.projection) ||
+            (statement.having != null && containsAggregate(statement.having))
+        if (statement.distinctOn.isNotEmpty()) validateDistinctOn(statement, orderKeys, aggregated)
+        val windowExpressions = collectWindowExpressions(statement.projection, orderKeys)
+        if (windowExpressions.isNotEmpty()) validateWindows(windowExpressions, aggregated)
+        if (aggregated) {
+            if (statement.projection is StarProjection) {
+                throw DiskExecutorException("cannot use * with GROUP BY or aggregate functions")
+            }
+            validateAggregation(statement, orderKeys, sources)
+            val keys = statement.groupBy.map { describeExpression(it) }
+            val header = if (keys.isEmpty()) {
+                "Aggregate"
+            } else {
+                val setCount = GroupingSetExpansion.setsFor(statement.groupingSpec, statement.groupBy).size
+                val suffix = if (setCount > 1) " ($setCount grouping sets)" else ""
+                "GroupAggregate keys: ${keys.joinToString(", ")}$suffix"
+            }
+            body = listOf(header) + body.map { "  $it" }
+        }
+        statement.orderBy?.let { body = listOf("Sort") + body.map { "  $it" } }
+        if (statement.distinct) {
+            val label = if (statement.distinctOn.isNotEmpty()) "Unique (DISTINCT ON)" else "Unique"
+            body = listOf(label) + body.map { "  $it" }
+        }
+        statement.offset?.let { body = listOf("Offset ${statement.offset}") + body.map { "  $it" } }
+        statement.limit?.let { body = listOf("Limit ${statement.limit}") + body.map { "  $it" } }
+        return body
+    }
+
+    private fun explainJoinLines(statement: SelectStatement, sources: List<JoinSource>, fromSources: List<DiskFromSource>): List<String> {
+        var lines = listOf(explainScanLine(statement, fromSources.first()))
+        statement.joins.forEachIndexed { position, join ->
+            val right = sources[position + 1]
+            val lateral = lateralSelectOf(join.from) != null
+            val label = joinLabel(join.type) + if (lateral) " Lateral" else ""
+            val header = "Nested Loop $label"
+            val rightScan = if (lateral) "Lateral Subquery Scan on ${right.schema.name}" else "Seq Scan on ${right.schema.name}"
+            lines = listOf(header) + lines.map { "  -> $it" } + listOf("  -> $rightScan")
+        }
+        return lines
+    }
+
+    /** The driving source's scan line: an indexed [DiskAccessPlan] when there is no JOIN and it is a real disk table, a full scan otherwise - mirrors [initialRows]'s own choice of when to push down. */
+    private fun explainScanLine(statement: SelectStatement, fromSource: DiskFromSource): String {
+        if (statement.joins.isEmpty() && fromSource is DiskTableSource) {
+            val alias = (statement.from as? TableSource)?.alias
+            val plan = accessPlanner.plan(fromSource.table.schema, fromSource.table.secondaryIndexes, statement.where, alias)
+            return describeAccessPlan(plan, fromSource.table.schema, fromSource.table.secondaryIndexes)
+        }
+        return "Seq Scan on ${fromSource.schema.name}"
+    }
+
+    private fun describeAccessPlan(plan: DiskAccessPlan, schema: TableSchema, secondaryIndexes: List<SecondaryIndexHandle>): String {
+        val tableName = schema.name
+        return when (plan) {
+            DiskAccessPlan.FullScan -> "Seq Scan on $tableName"
+            is DiskAccessPlan.PrimaryKeyPoint -> {
+                val pkColumn = schema.columns[schema.primaryKeyIndex!!].name
+                "Primary Key Scan on $tableName ($pkColumn = ${literalText(plan.key)})"
+            }
+            is DiskAccessPlan.PrimaryKeyRange -> {
+                val pkColumn = schema.columns[schema.primaryKeyIndex!!].name
+                "Primary Key Range Scan on $tableName (${rangeDescription(pkColumn, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)})"
+            }
+            is DiskAccessPlan.CompositePrimaryKeyPoint -> {
+                val parts = schema.primaryKeyColumns.zip(plan.keys) { name, value -> "$name = ${literalText(value)}" }
+                "Primary Key Scan on $tableName (${parts.joinToString(" AND ")})"
+            }
+            is DiskAccessPlan.CompositePrimaryKeyRange -> {
+                val columnName = schema.primaryKeyColumns[plan.prefix.size]
+                val prefixParts = schema.primaryKeyColumns.zip(plan.prefix) { name, value -> "$name = ${literalText(value)}" }
+                val rangePart = rangeDescription(columnName, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)
+                "Primary Key Range Scan on $tableName (${(prefixParts + rangePart).joinToString(" AND ")})"
+            }
+            is DiskAccessPlan.Secondary -> {
+                val handle = secondaryIndexes.first { it.name == plan.indexName }
+                val parts = handle.columnNames.zip(plan.keys) { name, value -> "$name = ${literalText(value)}" }
+                "Index Scan using ${plan.indexName} on $tableName (${parts.joinToString(" AND ")})"
+            }
+            is DiskAccessPlan.SecondaryRange -> {
+                val handle = secondaryIndexes.first { it.name == plan.indexName }
+                val columnName = handle.columnNames[plan.prefix.size]
+                val prefixParts = handle.columnNames.zip(plan.prefix) { name, value -> "$name = ${literalText(value)}" }
+                val rangePart = rangeDescription(columnName, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)
+                "Index Range Scan using ${plan.indexName} on $tableName (${(prefixParts + rangePart).joinToString(" AND ")})"
+            }
+        }
+    }
+
+    private fun rangeDescription(columnName: String, lower: Value?, lowerInclusive: Boolean, upper: Value?, upperInclusive: Boolean): String {
+        val parts = mutableListOf<String>()
+        lower?.let { parts.add("$columnName ${if (lowerInclusive) ">=" else ">"} ${literalText(it)}") }
+        upper?.let { parts.add("$columnName ${if (upperInclusive) "<=" else "<"} ${literalText(it)}") }
+        return parts.joinToString(" AND ")
+    }
+
