@@ -3038,3 +3038,475 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return matches.singleOrNull()
     }
 
+    /**
+     * Resolves [expression]'s columns against [sources] first, falling back to [outer] (the
+     * enclosing statement's row, when this call is itself part of a correlated subquery) exactly
+     * once a name cannot be found locally - mirroring [kestrel.engine.SelectRunner]'s own
+     * `rowResolver`. The resulting [Evaluator] carries [subqueries] so any [ScalarSubqueryExpression]/
+     * [ExistsExpression]/[InSubqueryExpression] nested inside [expression] can itself run, correlated
+     * back to this very row through that same resolver.
+     */
+    private fun evaluateCombinedRow(
+        sources: List<JoinSource>,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        expression: Expression,
+        row: List<Value>
+    ): Value {
+        val resolver = object : ColumnResolver {
+            override fun resolve(columnExpression: ColumnExpression): Value {
+                val index = resolveIndexOrNull(sources, columnExpression)
+                return if (index != null) {
+                    row[index]
+                } else {
+                    (outer ?: throw DiskExecutorException("no such column: ${columnExpression.name}")).resolve(columnExpression)
+                }
+            }
+
+            override fun declaredCollation(columnExpression: ColumnExpression): Collation? =
+                declaredCollationOrNull(sources, columnExpression) ?: outer?.declaredCollation(columnExpression)
+        }
+        return Evaluator(resolver, subqueries).evaluate(expression)
+    }
+
+    private fun sortCombinedRows(
+        sources: List<JoinSource>,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        rows: List<List<Value>>,
+        orderKeys: List<OrderKey>,
+        windowExpressions: List<WindowExpression>,
+        baseColumnCount: Int
+    ): List<List<Value>> {
+        val keyed = rows.map { row ->
+            row to orderKeys.map { key -> evaluateWindowAware(sources, outer, subqueries, windowExpressions, baseColumnCount, key.expression, row) }
+        }
+        val comparator = Comparator<List<Value>> { left, right ->
+            for ((index, key) in orderKeys.withIndex()) {
+                val comparison = compareOrderKeyValues(left[index], right[index], key) { expression ->
+                    declaredCollationOrNull(sources, expression)
+                }
+                if (comparison != 0) return@Comparator comparison
+            }
+            0
+        }
+        return keyed.sortedWith(compareBy(comparator) { it.second }).map { it.first }
+    }
+
+    /**
+     * When [windowExpressions] is non-empty, [row] may carry extra trailing values appended to
+     * [combined][runSelect] (one per entry, right after the real columns) - rewrites any
+     * [WindowExpression] node in [expression] into a [LiteralExpression] reading straight from
+     * that trailing slot before [evaluateCombinedRow] ever sees it, mirroring
+     * [kestrel.engine.SelectRunner]'s own `evaluateRow`/`substituteWindowValues`.
+     */
+    private fun evaluateWindowAware(
+        sources: List<JoinSource>,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        windowExpressions: List<WindowExpression>,
+        baseColumnCount: Int,
+        expression: Expression,
+        row: List<Value>
+    ): Value {
+        val prepared = if (windowExpressions.isEmpty()) expression else substituteWindowValues(expression, row, windowExpressions, baseColumnCount)
+        return evaluateCombinedRow(sources, outer, subqueries, prepared, row)
+    }
+
+    private fun substituteWindowValues(
+        expression: Expression,
+        row: List<Value>,
+        windowExpressions: List<WindowExpression>,
+        baseColumnCount: Int
+    ): Expression {
+        fun recurse(inner: Expression) = substituteWindowValues(inner, row, windowExpressions, baseColumnCount)
+        return when (expression) {
+            is WindowExpression -> LiteralExpression(row[baseColumnCount + windowExpressions.indexOf(expression)])
+            is BinaryExpression -> expression.copy(left = recurse(expression.left), right = recurse(expression.right))
+            is UnaryExpression -> expression.copy(operand = recurse(expression.operand))
+            is CallExpression -> expression.copy(arguments = expression.arguments.map(::recurse))
+            is IsNullExpression -> expression.copy(operand = recurse(expression.operand))
+            is InExpression -> expression.copy(operand = recurse(expression.operand), values = expression.values.map(::recurse))
+            is BetweenExpression -> expression.copy(operand = recurse(expression.operand), low = recurse(expression.low), high = recurse(expression.high))
+            is LikeExpression -> expression.copy(operand = recurse(expression.operand), pattern = recurse(expression.pattern))
+            is CaseExpression -> expression.copy(
+                operand = expression.operand?.let(::recurse),
+                branches = expression.branches.map { it.copy(condition = recurse(it.condition), result = recurse(it.result)) },
+                elseExpression = expression.elseExpression?.let(::recurse)
+            )
+            is CastExpression -> expression.copy(operand = recurse(expression.operand))
+            is CollateExpression -> expression.copy(operand = recurse(expression.operand))
+            else -> expression
+        }
+    }
+
+    private fun projectCombined(
+        projection: Projection,
+        sources: List<JoinSource>,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        rows: List<List<Value>>,
+        windowExpressions: List<WindowExpression>,
+        baseColumnCount: Int
+    ): Pair<List<String>, List<List<Value>>> =
+        when (projection) {
+            // rows may carry trailing window-function values appended in runSelect (only reachable
+            // here if ORDER BY names one directly, since SELECT * cannot spell an OVER clause
+            // itself) - trimmed back off so the row width matches the schema's own columns.
+            StarProjection -> sources.flatMap { it.schema.columnNames } to rows.map { it.subList(0, baseColumnCount) }
+            is ExpressionProjection -> {
+                val columns = projection.items.mapIndexed { index, item -> columnLabel(item, index) }
+                val values = rows.map { row ->
+                    projection.items.map { item ->
+                        evaluateWindowAware(sources, outer, subqueries, windowExpressions, baseColumnCount, item.expression, row)
+                    }
+                }
+                columns to values
+            }
+        }
+
+    private fun columnLabel(item: SelectItem, index: Int): String =
+        item.alias ?: when (val expression = item.expression) {
+            is ColumnExpression -> expression.name
+            is FunctionExpression -> expression.name.lowercase()
+            is CallExpression -> expression.name.lowercase()
+            else -> "column${index + 1}"
+        }
+
+    /**
+     * Deliberately duplicated from [kestrel.engine.SelectRunner]'s own `containsAggregate`/
+     * `requireGrouped` (same reasoning as [coerceForColumn]): this executor must stay free-standing
+     * from the in-memory engine's own validation, so a change to one can never silently affect the
+     * other. `else -> false` covers every [Expression] variant this executor gives no
+     * aggregation-aware meaning to (a literal, a window function - rejected whenever it is actually
+     * evaluated, by [Evaluator] itself - or a subquery, whose own aggregates belong to that nested
+     * [SelectStatement]'s independent [runSelect] call, never to this one).
+     */
+    private fun containsAggregate(projection: Projection): Boolean = when (projection) {
+        StarProjection -> false
+        is ExpressionProjection -> projection.items.any { containsAggregate(it.expression) }
+    }
+
+    private fun containsAggregate(expression: Expression): Boolean = when (expression) {
+        is FunctionExpression -> true
+        is BinaryExpression -> containsAggregate(expression.left) || containsAggregate(expression.right)
+        is UnaryExpression -> containsAggregate(expression.operand)
+        is CallExpression -> expression.arguments.any { containsAggregate(it) }
+        is IsNullExpression -> containsAggregate(expression.operand)
+        is InExpression -> containsAggregate(expression.operand) || expression.values.any { containsAggregate(it) }
+        is BetweenExpression ->
+            containsAggregate(expression.operand) || containsAggregate(expression.low) || containsAggregate(expression.high)
+        is LikeExpression -> containsAggregate(expression.operand) || containsAggregate(expression.pattern)
+        is CaseExpression ->
+            (expression.operand?.let { containsAggregate(it) } ?: false) ||
+                expression.branches.any { containsAggregate(it.condition) || containsAggregate(it.result) } ||
+                (expression.elseExpression?.let { containsAggregate(it) } ?: false)
+        is CastExpression -> containsAggregate(expression.operand)
+        is CollateExpression -> containsAggregate(expression.operand)
+        else -> false
+    }
+
+    /** See [kestrel.engine.SelectRunner]'s `Plan.validateDistinctOn` for why both checks exist. */
+    private fun validateDistinctOn(statement: SelectStatement, orderKeys: List<OrderKey>, aggregated: Boolean) {
+        if (aggregated) {
+            throw DiskExecutorException("DISTINCT ON cannot be combined with GROUP BY or aggregate functions")
+        }
+        if (statement.orderBy != null) {
+            val leading = orderKeys.take(statement.distinctOn.size).map { it.expression }
+            if (leading != statement.distinctOn) {
+                throw DiskExecutorException("SELECT DISTINCT ON expressions must match initial ORDER BY expressions")
+            }
+        }
+    }
+
+    private fun validateAggregation(statement: SelectStatement, orderKeys: List<OrderKey>, sources: List<JoinSource>) {
+        val groupColumns = statement.groupBy.filterIsInstance<ColumnExpression>()
+            .map { resolveIndex(sources, it) }.toSet()
+        if (statement.projection is ExpressionProjection) {
+            statement.projection.items.forEach { requireGrouped(it.expression, statement.groupBy, groupColumns, sources) }
+        }
+        statement.having?.let { requireGrouped(it, statement.groupBy, groupColumns, sources) }
+        orderKeys.forEach { requireGrouped(it.expression, statement.groupBy, groupColumns, sources) }
+    }
+
+    private fun requireGrouped(expression: Expression, groupBy: List<Expression>, groupColumns: Set<Int>, sources: List<JoinSource>) {
+        if (expression in groupBy) return
+        when (expression) {
+            is FunctionExpression -> Unit
+            is ColumnExpression -> if (resolveIndex(sources, expression) !in groupColumns) {
+                throw DiskExecutorException(
+                    "column ${expression.name} must appear in GROUP BY or be used in an aggregate function"
+                )
+            }
+            is BinaryExpression -> {
+                requireGrouped(expression.left, groupBy, groupColumns, sources)
+                requireGrouped(expression.right, groupBy, groupColumns, sources)
+            }
+            is UnaryExpression -> requireGrouped(expression.operand, groupBy, groupColumns, sources)
+            is CallExpression -> expression.arguments.forEach { requireGrouped(it, groupBy, groupColumns, sources) }
+            is IsNullExpression -> requireGrouped(expression.operand, groupBy, groupColumns, sources)
+            is InExpression -> {
+                requireGrouped(expression.operand, groupBy, groupColumns, sources)
+                expression.values.forEach { requireGrouped(it, groupBy, groupColumns, sources) }
+            }
+            is BetweenExpression -> {
+                requireGrouped(expression.operand, groupBy, groupColumns, sources)
+                requireGrouped(expression.low, groupBy, groupColumns, sources)
+                requireGrouped(expression.high, groupBy, groupColumns, sources)
+            }
+            is LikeExpression -> {
+                requireGrouped(expression.operand, groupBy, groupColumns, sources)
+                requireGrouped(expression.pattern, groupBy, groupColumns, sources)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { requireGrouped(it, groupBy, groupColumns, sources) }
+                expression.branches.forEach {
+                    requireGrouped(it.condition, groupBy, groupColumns, sources)
+                    requireGrouped(it.result, groupBy, groupColumns, sources)
+                }
+                expression.elseExpression?.let { requireGrouped(it, groupBy, groupColumns, sources) }
+            }
+            is CastExpression -> requireGrouped(expression.operand, groupBy, groupColumns, sources)
+            is CollateExpression -> requireGrouped(expression.operand, groupBy, groupColumns, sources)
+            is ScalarSubqueryExpression -> Unit
+            is ExistsExpression -> Unit
+            is InSubqueryExpression -> requireGrouped(expression.operand, groupBy, groupColumns, sources)
+            else -> Unit
+        }
+    }
+
+    /** Window functions are only legal in the SELECT list and ORDER BY - never WHERE/GROUP BY/HAVING/ON. */
+    private fun containsWindowFunction(expression: Expression): Boolean = when (expression) {
+        is WindowExpression -> true
+        is BinaryExpression -> containsWindowFunction(expression.left) || containsWindowFunction(expression.right)
+        is UnaryExpression -> containsWindowFunction(expression.operand)
+        is CallExpression -> expression.arguments.any { containsWindowFunction(it) }
+        is IsNullExpression -> containsWindowFunction(expression.operand)
+        is InExpression -> containsWindowFunction(expression.operand) || expression.values.any { containsWindowFunction(it) }
+        is BetweenExpression ->
+            containsWindowFunction(expression.operand) || containsWindowFunction(expression.low) || containsWindowFunction(expression.high)
+        is LikeExpression -> containsWindowFunction(expression.operand) || containsWindowFunction(expression.pattern)
+        is CaseExpression ->
+            (expression.operand?.let { containsWindowFunction(it) } ?: false) ||
+                expression.branches.any { containsWindowFunction(it.condition) || containsWindowFunction(it.result) } ||
+                (expression.elseExpression?.let { containsWindowFunction(it) } ?: false)
+        is CastExpression -> containsWindowFunction(expression.operand)
+        is CollateExpression -> containsWindowFunction(expression.operand)
+        else -> false
+    }
+
+    private fun rejectWindowFunction(expression: Expression, clause: String) {
+        if (containsWindowFunction(expression)) throw DiskExecutorException("window functions are not allowed in $clause")
+    }
+
+    /** Every distinct window-function call reachable from [expression] (nested inside arithmetic, CASE, ...). */
+    private fun collectWindowExpressions(expression: Expression): List<WindowExpression> = when (expression) {
+        is WindowExpression -> listOf(expression)
+        is BinaryExpression -> collectWindowExpressions(expression.left) + collectWindowExpressions(expression.right)
+        is UnaryExpression -> collectWindowExpressions(expression.operand)
+        is CallExpression -> expression.arguments.flatMap { collectWindowExpressions(it) }
+        is IsNullExpression -> collectWindowExpressions(expression.operand)
+        is InExpression -> collectWindowExpressions(expression.operand) + expression.values.flatMap { collectWindowExpressions(it) }
+        is BetweenExpression ->
+            collectWindowExpressions(expression.operand) + collectWindowExpressions(expression.low) + collectWindowExpressions(expression.high)
+        is LikeExpression -> collectWindowExpressions(expression.operand) + collectWindowExpressions(expression.pattern)
+        is CaseExpression ->
+            (expression.operand?.let { collectWindowExpressions(it) } ?: emptyList()) +
+                expression.branches.flatMap { collectWindowExpressions(it.condition) + collectWindowExpressions(it.result) } +
+                (expression.elseExpression?.let { collectWindowExpressions(it) } ?: emptyList())
+        is CastExpression -> collectWindowExpressions(expression.operand)
+        is CollateExpression -> collectWindowExpressions(expression.operand)
+        else -> emptyList()
+    }
+
+    /**
+     * Every distinct window-function call in the SELECT list or (post alias-resolution) ORDER BY -
+     * the only two clauses where one is allowed, mirroring [kestrel.engine.SelectRunner]'s own
+     * `windowExpressions` property.
+     */
+    private fun collectWindowExpressions(projection: Projection, orderKeys: List<OrderKey>): List<WindowExpression> {
+        val projectionWindows = (projection as? ExpressionProjection)?.items?.flatMap { collectWindowExpressions(it.expression) } ?: emptyList()
+        val orderWindows = orderKeys.flatMap { collectWindowExpressions(it.expression) }
+        return (projectionWindows + orderWindows).distinct()
+    }
+
+    /**
+     * Window functions are rejected outright alongside GROUP BY/aggregates ([aggregated]) -
+     * windowing over an already-grouped result is valid SQL but requires running
+     * [GroupAggregation] first and then a second pass over its output rows, which this executor
+     * does not implement (same scope cut as [kestrel.engine.SelectRunner]). RANK/DENSE_RANK need an
+     * explicit tie-break (unlike ROW_NUMBER, which falls back to partition arrival order when OVER
+     * has no ORDER BY) and nesting one window function inside another's argument/PARTITION BY/
+     * ORDER BY/frame offset is invalid SQL in the first place.
+     */
+    private fun validateWindows(windowExpressions: List<WindowExpression>, aggregated: Boolean) {
+        if (aggregated) {
+            throw DiskExecutorException("window functions cannot be combined with GROUP BY or aggregate functions in the same query")
+        }
+        for (window in windowExpressions) {
+            if ((window.kind == WindowFunctionKind.Rank || window.kind == WindowFunctionKind.DenseRank) && window.orderBy.isEmpty()) {
+                throw DiskExecutorException("${window.name}() OVER (...) requires an ORDER BY clause")
+            }
+            if (window.frame != null && window.kind !in FRAME_CAPABLE_KINDS) {
+                throw DiskExecutorException("${window.name}() cannot be used with a ROWS/RANGE/GROUPS frame clause")
+            }
+            val nested = listOfNotNull(
+                window.argument, window.offset, window.defaultValue,
+                window.frame?.start?.offset, window.frame?.end?.offset
+            ) + window.partitionBy + window.orderBy.map { it.expression }
+            if (nested.any { containsWindowFunction(it) }) {
+                throw DiskExecutorException("window functions cannot be nested")
+            }
+        }
+    }
+
+    private fun computeWindowValues(
+        window: WindowExpression,
+        combined: List<List<Value>>,
+        evaluateRow: (Expression, List<Value>) -> Value,
+        declaredCollationOf: (ColumnExpression) -> Collation? = { null }
+    ): List<Value> {
+        val values = arrayOfNulls<Value>(combined.size)
+        val partitions = combined.indices.groupBy { index -> window.partitionBy.map { evaluateRow(it, combined[index]) } }
+        for (memberIndices in partitions.values) {
+            val ordered = if (window.orderBy.isEmpty()) {
+                memberIndices
+            } else {
+                memberIndices.sortedWith(Comparator { first, second ->
+                    var result = 0
+                    for (key in window.orderBy) {
+                        val comparison = compareOrderKeyValues(
+                            evaluateRow(key.expression, combined[first]),
+                            evaluateRow(key.expression, combined[second]),
+                            key,
+                            declaredCollationOf
+                        )
+                        if (comparison != 0) {
+                            result = comparison
+                            break
+                        }
+                    }
+                    result
+                })
+            }
+            assignWindowValues(window, ordered, combined, values, evaluateRow)
+        }
+        return values.map { it ?: error("window value not computed for every row") }
+    }
+
+    private fun assignWindowValues(
+        window: WindowExpression,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        out: Array<Value?>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ) {
+        when (window.kind) {
+            WindowFunctionKind.RowNumber ->
+                ordered.forEachIndexed { position, index -> out[index] = Value.IntegerValue((position + 1).toLong()) }
+            WindowFunctionKind.Rank, WindowFunctionKind.DenseRank -> {
+                var rank = 0
+                var denseRank = 0
+                var previousKey: List<Value>? = null
+                ordered.forEachIndexed { position, index ->
+                    val key = window.orderBy.map { evaluateRow(it.expression, combined[index]) }
+                    if (previousKey == null || key != previousKey) {
+                        rank = position + 1
+                        denseRank++
+                        previousKey = key
+                    }
+                    out[index] = Value.IntegerValue((if (window.kind == WindowFunctionKind.Rank) rank else denseRank).toLong())
+                }
+            }
+            WindowFunctionKind.Aggregate -> assignAggregateWindowValues(window, ordered, combined, out, evaluateRow)
+            WindowFunctionKind.Lag -> assignOffsetWindowValues(window, ordered, combined, out, direction = -1, evaluateRow)
+            WindowFunctionKind.Lead -> assignOffsetWindowValues(window, ordered, combined, out, direction = 1, evaluateRow)
+            WindowFunctionKind.FirstValue -> {
+                val frame = window.frame
+                if (frame == null) {
+                    val firstValue = evaluateRow(window.argument!!, combined[ordered.first()])
+                    ordered.forEach { index -> out[index] = firstValue }
+                } else {
+                    ordered.indices.forEach { position ->
+                        val members = frameMembers(window, position, ordered, combined, evaluateRow)
+                        out[ordered[position]] =
+                            if (members.isEmpty()) Value.NullValue else evaluateRow(window.argument!!, combined[ordered[members.first()]])
+                    }
+                }
+            }
+            WindowFunctionKind.LastValue -> {
+                val frame = window.frame
+                if (frame == null) {
+                    for (range in peerGroupRanges(window.orderBy, ordered, combined, evaluateRow)) {
+                        val value = evaluateRow(window.argument!!, combined[ordered[range.last]])
+                        for (position in range) out[ordered[position]] = value
+                    }
+                } else {
+                    ordered.indices.forEach { position ->
+                        val members = frameMembers(window, position, ordered, combined, evaluateRow)
+                        out[ordered[position]] =
+                            if (members.isEmpty()) Value.NullValue else evaluateRow(window.argument!!, combined[ordered[members.last()]])
+                    }
+                }
+            }
+            WindowFunctionKind.Ntile -> assignNtileWindowValues(window, ordered, combined, out, evaluateRow)
+        }
+    }
+
+    /**
+     * With no ORDER BY in OVER, the whole partition is one frame (every row gets the same value).
+     * With an ORDER BY, the default SQL frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+     * ROW`: a running aggregate where rows tied on the order key (a "peer group") share one value -
+     * mirroring [kestrel.engine.SelectRunner]'s own `assignAggregateWindowValues` exactly.
+     */
+    private fun assignAggregateWindowValues(
+        window: WindowExpression,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        out: Array<Value?>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ) {
+        val frame = window.frame
+        if (frame == null) {
+            for (range in peerGroupRanges(window.orderBy, ordered, combined, evaluateRow)) {
+                val value = aggregateWindowValue(window, (0..range.last).map { combined[ordered[it]] }, evaluateRow)
+                for (position in range) out[ordered[position]] = value
+            }
+        } else {
+            ordered.indices.forEach { position ->
+                val members = frameMembers(window, position, ordered, combined, evaluateRow)
+                out[ordered[position]] = aggregateWindowValue(window, members.map { combined[ordered[it]] }, evaluateRow)
+            }
+        }
+    }
+
+    /**
+     * The frame's base [frameRange], narrowed by its [FrameExclude] mode (default
+     * [FrameExclude.NoOthers], which leaves the range untouched) - mirrors
+     * [kestrel.engine.SelectRunner]'s own `frameMembers` exactly.
+     */
+    private fun frameMembers(
+        window: WindowExpression,
+        position: Int,
+        ordered: List<Int>,
+        combined: List<List<Value>>,
+        evaluateRow: (Expression, List<Value>) -> Value
+    ): List<Int> {
+        val range = frameRange(window, position, ordered, combined, evaluateRow)
+        if (range.isEmpty()) return emptyList()
+        return when (window.frame!!.exclude) {
+            FrameExclude.NoOthers -> range.toList()
+            FrameExclude.CurrentRow -> range.filter { it != position }
+            FrameExclude.Group -> {
+                val peer = peerBoundary(window.orderBy, position, ordered, combined, isStart = true, evaluateRow)..
+                    peerBoundary(window.orderBy, position, ordered, combined, isStart = false, evaluateRow)
+                range.filter { it !in peer }
+            }
+            FrameExclude.Ties -> {
+                val peer = peerBoundary(window.orderBy, position, ordered, combined, isStart = true, evaluateRow)..
+                    peerBoundary(window.orderBy, position, ordered, combined, isStart = false, evaluateRow)
+                range.filter { it == position || it !in peer }
+            }
+        }
+    }
+
