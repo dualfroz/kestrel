@@ -3831,3 +3831,601 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
                 table.rangeBySecondary(txn, plan.indexName, plan.prefix, plan.lower, plan.lowerInclusive, plan.upper, plan.upperInclusive)
         }
 
+    private fun executeUpdate(statement: UpdateStatement, triggerContext: TriggerRowContext? = null): StatementResult {
+        catalog.temporaryTableOrNull(statement.tableName)?.let { return executeTemporaryUpdate(statement, it) }
+        val table = catalog.table(statement.tableName)
+        val schema = table.schema
+        val assignments = buildAssignments(schema, statement)
+        return withStatementTransaction { txn ->
+            withTriggerAtomicity(schema.name, txn, triggerContext) {
+                executeUpdateInTxn(statement, assignments, table, schema, txn, triggerContext)
+            }
+        }
+    }
+
+    /**
+     * UPDATE on a temp table's plain [Table.rows] list - ported from the same whole-batch-then-swap
+     * shape as [executeUpdateInTxn]/[kestrel.engine.Executor.executeUpdateInner]: every row is
+     * planned into [newRows] first (evaluating SET/DEFAULT/GENERATED and validating NOT NULL) before
+     * [table.rows] is ever mutated, so a CHECK/UNIQUE/PRIMARY KEY failure on any one row leaves the
+     * table completely untouched rather than half-updated - the in-memory list equivalent of
+     * [DiskTable.update]'s own per-row validate-before-write ordering, just batched like the
+     * in-memory engine does instead of row-by-row like [DiskTable].
+     */
+    private fun executeTemporaryUpdate(statement: UpdateStatement, table: Table): StatementResult {
+        val schema = table.schema
+        val assignments = buildAssignments(schema, statement)
+        return withStatementTransaction { txn ->
+            val subqueries = subqueryRunnerFor(txn)
+            val oldRows = table.rows.toList()
+            val touchedRows = mutableListOf<Pair<Row, Row>>()
+            val newRows = oldRows.map { row ->
+                val matches = statement.where == null ||
+                    isTrue(Evaluator(composeResolver(rowResolver(schema, row), null), subqueries).evaluate(statement.where))
+                if (!matches) return@map row
+                val values = row.values.toMutableList()
+                val evaluator = Evaluator(composeResolver(rowResolver(schema, row), null), subqueries, this)
+                for ((index, expression) in assignments) {
+                    val column = schema.columns[index]
+                    values[index] = if (expression != null) {
+                        coerceForColumn(evaluator.evaluate(expression), column)
+                    } else {
+                        column.default?.let { coerceForColumn(evaluator.evaluate(it), column) } ?: Value.NullValue
+                    }
+                }
+                applyGeneratedColumns(schema, values, subqueries)
+                validateTemporaryNotNull(schema, values)
+                val newRow = Row(values)
+                touchedRows.add(row to newRow)
+                newRow
+            }
+            for (row in newRows) enforceChecks(schema, row, subqueries)
+            enforceTemporaryPrimaryKeyUniqueness(schema, newRows)
+            enforceTemporaryUniqueConstraints(schema, newRows)
+            table.rows.clear()
+            table.rows.addAll(newRows)
+            val returning = statement.returning?.let { evaluateReturning(schema, touchedRows.map { it.second }, it, subqueries) }
+            UpdateResult(touchedRows.size, returning)
+        }
+    }
+
+    private fun executeUpdateInTxn(
+        statement: UpdateStatement,
+        assignments: List<Pair<Int, Expression?>>,
+        table: DiskTable,
+        schema: TableSchema,
+        txn: Long,
+        triggerContext: TriggerRowContext?
+    ): StatementResult {
+        val subqueries = subqueryRunnerFor(txn)
+        val matches = candidateRows(table, txn, statement.where, alias = null).filter { (_, row) ->
+            statement.where == null ||
+                isTrue(Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueries).evaluate(statement.where))
+        }
+        // Built as a whole batch first (not applied inline) for the same reason as executeInsert:
+        // a self-referencing FK must see every row's final value for this statement, not just
+        // rows already committed to the table.
+        val planned = matches.map { (rid, row) ->
+            val evaluator = Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueries, this)
+            val values = row.values.toMutableList()
+            for ((index, expression) in assignments) {
+                val column = schema.columns[index]
+                values[index] = if (expression != null) {
+                    coerceForColumn(evaluator.evaluate(expression), column)
+                } else {
+                    column.default?.let { coerceForColumn(evaluator.evaluate(it), column) } ?: Value.NullValue
+                }
+            }
+            applyGeneratedColumns(schema, values, subqueries)
+            Triple(rid, row, Row(values))
+        }
+        val newRows = planned.map { it.third }
+        // Fires before any constraint below is checked, same as executeInsert's BEFORE trigger - a
+        // BEFORE UPDATE trigger's body can reject the whole statement before this executor's own
+        // validation ever runs.
+        fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, planned.map { it.second to it.third }, txn)
+        for ((_, _, newRow) in planned) {
+            DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, newRow.values, uncommittedSiblings = newRows)
+            enforceChecks(schema, newRow, subqueries)
+        }
+        // Every enforced-unique key group (the PRIMARY KEY, single-column or composite, plus each
+        // UNIQUE constraint) is a valid FOREIGN KEY target, so each group needs its own
+        // cascade/RESTRICT pass on UPDATE - not just the PRIMARY KEY. Run before the parent's own
+        // rows are rewritten below, mirroring kestrel.engine.Executor.executeUpdate's own order.
+        for (group in schema.enforcedUniqueKeyGroups()) {
+            val columnIndices = group.map { schema.columnIndex(it)!! }
+            val changedPairs = planned.map { (_, oldRow, newRow) ->
+                columnIndices.map { oldRow.values[it] } to columnIndices.map { newRow.values[it] }
+            }
+            DiskForeignKeyEnforcer.cascadeUpdate(catalog, txn, schema.name, group, changedPairs)
+        }
+        for ((rid, _, newRow) in planned) table.update(txn, rid, newRow)
+        fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Update, planned.map { it.second to it.third }, txn)
+        val returning = statement.returning?.let { evaluateReturning(schema, planned.map { triple -> triple.third }, it, subqueries) }
+        return UpdateResult(planned.size, returning)
+    }
+
+    private fun executeDelete(statement: DeleteStatement, triggerContext: TriggerRowContext? = null): StatementResult {
+        catalog.temporaryTableOrNull(statement.tableName)?.let { return executeTemporaryDelete(statement, it) }
+        val table = catalog.table(statement.tableName)
+        val schema = table.schema
+        return withStatementTransaction { txn ->
+            withTriggerAtomicity(schema.name, txn, triggerContext) {
+                executeDeleteInTxn(statement, table, schema, txn, triggerContext)
+            }
+        }
+    }
+
+    private fun executeDeleteInTxn(
+        statement: DeleteStatement, table: DiskTable, schema: TableSchema, txn: Long, triggerContext: TriggerRowContext?
+    ): StatementResult {
+        val subqueries = subqueryRunnerFor(txn)
+        val matches = candidateRows(table, txn, statement.where, alias = null).filter { (_, row) ->
+            statement.where == null ||
+                isTrue(Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueries).evaluate(statement.where))
+        }
+        fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Delete, matches.map { it.second to null }, txn)
+        DiskForeignKeyEnforcer.cascadeDelete(catalog, txn, schema.name, matches.map { it.second })
+        for ((rid, _) in matches) table.delete(txn, rid)
+        fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Delete, matches.map { it.second to null }, txn)
+        val returning = statement.returning?.let { evaluateReturning(schema, matches.map { it.second }, it, subqueries) }
+        return DeleteResult(matches.size, returning)
+    }
+
+    /** DELETE on a temp table's plain [Table.rows] list - ported from the same shape as [executeDeleteInTxn]/[kestrel.engine.Executor.executeDeleteInner], minus trigger firing/[DiskForeignKeyEnforcer] cascade (both rejected outright at `CREATE TEMP TABLE` time). */
+    private fun executeTemporaryDelete(statement: DeleteStatement, table: Table): StatementResult {
+        val schema = table.schema
+        return withStatementTransaction { txn ->
+            val subqueries = subqueryRunnerFor(txn)
+            val deletedRows = if (statement.where == null) {
+                table.rows.toList()
+            } else {
+                table.rows.filter { row ->
+                    isTrue(Evaluator(composeResolver(rowResolver(schema, row), null), subqueries).evaluate(statement.where))
+                }
+            }
+            table.rows.removeAll(deletedRows)
+            val returning = statement.returning?.let { evaluateReturning(schema, deletedRows, it, subqueries) }
+            DeleteResult(deletedRows.size, returning)
+        }
+    }
+
+    private fun executeMerge(statement: MergeStatement): StatementResult {
+        val table = catalog.table(statement.targetTable)
+        val schema = table.schema
+        return withStatementTransaction { txn ->
+            withTriggerAtomicity(schema.name, txn, null) {
+                executeMergeInner(statement, table, schema, txn)
+            }
+        }
+    }
+
+    /**
+     * Ported 1:1 from [kestrel.engine.Executor.executeMergeInner] - see that method's own doc for
+     * why [MergeStatement.onCondition] is matched against [originalTargetRows] (a snapshot of the
+     * target table taken once, before any mutation) rather than the live table, and for the "MERGE
+     * command cannot affect a target row a second time" guarantee. The one difference: "already
+     * affected" and "this pair's target row" are tracked by [RecordId] here rather than [Row]
+     * object identity (`===`) - a disk row is decoded fresh from its page on every read, so no two
+     * reads of "the same" row are ever the same object, but each row in [originalTargetRows] keeps
+     * the one [RecordId] it had at snapshot time for the rest of this statement (this MERGE is the
+     * only writer touching [table] during its own execution, and every [RecordId] this MERGE itself
+     * mutates is used at most once, guarded by [affectedRids] below, so it is never looked up again
+     * afterward under a since-changed identity).
+     */
+    private fun executeMergeInner(statement: MergeStatement, table: DiskTable, schema: TableSchema, txn: Long): StatementResult {
+        val targetLabel = statement.targetAlias ?: statement.targetTable
+        val (sourceSchema, sourceRows) = resolveMergeSource(statement.source, txn)
+        val sourceLabel = sourceLabel(statement.source)
+        if (targetLabel.equals(sourceLabel, ignoreCase = true)) {
+            throw DiskExecutorException("MERGE target and source cannot share the same name or alias: $targetLabel")
+        }
+        checkMergeColumns(statement, schema, targetLabel, sourceSchema, sourceLabel)
+
+        val subqueries = subqueryRunnerFor(txn)
+        val originalTargetRows = table.scan(txn)
+        val affectedRids = mutableSetOf<RecordId>()
+        val returnedRows = mutableListOf<Pair<Row, String>>()
+        var inserted = 0
+        var updated = 0
+        var deleted = 0
+
+        for (sourceRow in sourceRows) {
+            val matchedTargets = originalTargetRows.filter { (_, targetRow) ->
+                val resolver = mergeResolver(schema, targetLabel, targetRow, sourceSchema, sourceLabel, sourceRow)
+                isTrue(Evaluator(resolver, subqueries).evaluate(statement.onCondition))
+            }
+            if (matchedTargets.isNotEmpty()) {
+                for ((targetRid, targetRow) in matchedTargets) {
+                    val resolver = mergeResolver(schema, targetLabel, targetRow, sourceSchema, sourceLabel, sourceRow)
+                    val clause = statement.whenClauses.firstOrNull { candidate ->
+                        (candidate is MergeMatchedUpdate || candidate is MergeMatchedDelete) &&
+                            (candidate.condition == null || isTrue(Evaluator(resolver, subqueries).evaluate(candidate.condition!!)))
+                    } ?: continue
+                    if (!affectedRids.add(targetRid)) {
+                        throw DiskExecutorException("MERGE command cannot affect a target row a second time")
+                    }
+                    when (clause) {
+                        is MergeMatchedUpdate -> {
+                            val updatedRow = applyMergeUpdate(schema, table, txn, targetRid, targetRow, clause, resolver, subqueries)
+                            returnedRows.add(updatedRow to "UPDATE")
+                            updated++
+                        }
+                        is MergeMatchedDelete -> {
+                            val deletedRow = applyMergeDelete(schema, table, txn, targetRid, targetRow)
+                            returnedRows.add(deletedRow to "DELETE")
+                            deleted++
+                        }
+                        else -> error("unreachable: filtered to MATCHED clauses above")
+                    }
+                }
+                continue
+            }
+            val resolver = notMatchedResolver(sourceSchema, sourceLabel, sourceRow, targetLabel)
+            val clause = statement.whenClauses.firstOrNull { candidate ->
+                candidate is MergeNotMatchedInsert &&
+                    (candidate.condition == null || isTrue(Evaluator(resolver, subqueries).evaluate(candidate.condition!!)))
+            } as? MergeNotMatchedInsert ?: continue
+            val insertedRow = applyMergeInsert(schema, table, txn, clause, resolver, subqueries)
+            returnedRows.add(insertedRow to "INSERT")
+            inserted++
+        }
+        val returning = statement.returning?.let { evaluateMergeReturning(schema, returnedRows, it, subqueries) }
+        return MergeResult(inserted, updated, deleted, returning)
+    }
+
+    /** Ported 1:1 from [kestrel.engine.Executor.evaluateMergeReturning] - see that method's own doc. */
+    private fun evaluateMergeReturning(
+        schema: TableSchema,
+        actionedRows: List<Pair<Row, String>>,
+        projection: Projection,
+        subqueries: SubqueryRunner
+    ): SelectResult {
+        val columns = when (projection) {
+            is StarProjection -> schema.columns.map { it.name }
+            is ExpressionProjection -> projection.items.mapIndexed { index, item ->
+                checkReturningColumns(item.expression, schema)
+                columnLabel(item, index)
+            }
+        }
+        val resultRows = actionedRows.map { (row, action) ->
+            when (projection) {
+                is StarProjection -> row.values.toList()
+                is ExpressionProjection -> {
+                    val evaluator = Evaluator(rowResolver(schema, row), subqueries, mergeAction = action)
+                    projection.items.map { evaluator.evaluate(it.expression) }
+                }
+            }
+        }
+        return SelectResult(columns, resultRows)
+    }
+
+    private fun applyMergeUpdate(
+        schema: TableSchema,
+        table: DiskTable,
+        txn: Long,
+        targetRid: RecordId,
+        targetRow: Row,
+        clause: MergeMatchedUpdate,
+        resolver: ColumnResolver,
+        subqueries: SubqueryRunner
+    ): Row {
+        val assignmentEvaluator = Evaluator(resolver, subqueries, this)
+        val values = targetRow.values.toMutableList()
+        for (assignment in clause.assignments) {
+            val index = schema.columnIndex(assignment.columnName)
+                ?: throw DiskExecutorException("no such column: ${assignment.columnName}")
+            val column = schema.columns[index]
+            rejectGeneratedAssignment(column, explicitValueGiven = assignment.value != null)
+            values[index] = if (assignment.value != null) {
+                coerceForColumn(assignmentEvaluator.evaluate(assignment.value), column)
+            } else {
+                column.default?.let { coerceForColumn(assignmentEvaluator.evaluate(it), column) } ?: Value.NullValue
+            }
+        }
+        applyGeneratedColumns(schema, values, subqueries)
+        val updatedRow = Row(values)
+        fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, listOf(targetRow to updatedRow), txn)
+        DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, updatedRow.values, uncommittedSiblings = emptyList())
+        enforceChecks(schema, updatedRow, subqueries)
+        for (group in schema.enforcedUniqueKeyGroups()) {
+            val columnIndices = group.map { schema.columnIndex(it)!! }
+            val oldKey = columnIndices.map { targetRow.values[it] }
+            val newKey = columnIndices.map { updatedRow.values[it] }
+            DiskForeignKeyEnforcer.cascadeUpdate(catalog, txn, schema.name, group, listOf(oldKey to newKey))
+        }
+        table.update(txn, targetRid, updatedRow)
+        fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Update, listOf(targetRow to updatedRow), txn)
+        return updatedRow
+    }
+
+    /** Returns [targetRow] itself - the pre-deletion image, matching [applyMergeDelete]'s in-memory counterpart. */
+    private fun applyMergeDelete(schema: TableSchema, table: DiskTable, txn: Long, targetRid: RecordId, targetRow: Row): Row {
+        fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Delete, listOf(targetRow to null), txn)
+        DiskForeignKeyEnforcer.cascadeDelete(catalog, txn, schema.name, listOf(targetRow))
+        table.delete(txn, targetRid)
+        fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Delete, listOf(targetRow to null), txn)
+        return targetRow
+    }
+
+    private fun applyMergeInsert(
+        schema: TableSchema,
+        table: DiskTable,
+        txn: Long,
+        clause: MergeNotMatchedInsert,
+        resolver: ColumnResolver,
+        subqueries: SubqueryRunner
+    ): Row {
+        val targetIndices = resolveInsertTargets(schema, clause.columns)
+        val evaluator = Evaluator(resolver, subqueries, this)
+        val values = MutableList<Value>(schema.columns.size) { Value.NullValue }
+        val touched = BooleanArray(schema.columns.size)
+        for ((position, expression) in clause.values.withIndex()) {
+            val columnIndex = targetIndices[position]
+            if (expression != null) {
+                rejectGeneratedAssignment(schema.columns[columnIndex], explicitValueGiven = true)
+                values[columnIndex] = coerceForColumn(evaluator.evaluate(expression), schema.columns[columnIndex])
+                touched[columnIndex] = true
+            }
+        }
+        for ((index, column) in schema.columns.withIndex()) {
+            val default = column.default
+            if (!touched[index] && default != null) {
+                values[index] = coerceForColumn(evaluator.evaluate(default), column)
+            }
+        }
+        applyGeneratedColumns(schema, values, subqueries)
+        val row = Row(values)
+        fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Insert, listOf(null to row), txn)
+        DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, row.values, uncommittedSiblings = emptyList())
+        enforceChecks(schema, row, subqueries)
+        table.insert(txn, row)
+        fireRowTriggers(schema, TriggerTiming.After, TriggerEvent.Insert, listOf(null to row), txn)
+        return row
+    }
+
+    /** A snapshot (schema, rows) for a MERGE `USING` source - ported 1:1 from [kestrel.engine.SelectRunner.resolveMergeSource], just via [resolveFromItem] rather than a separate in-memory `resolveSource`. */
+    private fun resolveMergeSource(item: FromItem, txn: Long): Pair<TableSchema, List<Row>> {
+        val source = resolveFromItem(item, txn)
+        return source.schema to source.scan(txn).map { Row(it) }
+    }
+
+    /**
+     * Resolves a MERGE `ON`/`WHEN MATCHED` column reference against whichever of [targetRow]/
+     * [sourceRow] its qualifier names ([targetLabel]/[sourceLabel] - alias if given, bare name
+     * otherwise); an unqualified reference must exist on exactly one side. Ported 1:1 from
+     * [kestrel.engine.Executor.mergeResolver].
+     */
+    private fun mergeResolver(
+        targetSchema: TableSchema,
+        targetLabel: String,
+        targetRow: Row,
+        sourceSchema: TableSchema,
+        sourceLabel: String,
+        sourceRow: Row
+    ): ColumnResolver = object : ColumnResolver {
+        override fun resolve(expression: ColumnExpression): Value {
+            val qualifier = expression.qualifier
+            if (qualifier != null) {
+                return when {
+                    qualifier.equals(sourceLabel, ignoreCase = true) ->
+                        sourceRow.values[sourceSchema.columnIndex(expression.name) ?: throw DiskExecutorException("no such column: ${expression.name}")]
+                    qualifier.equals(targetLabel, ignoreCase = true) ->
+                        targetRow.values[targetSchema.columnIndex(expression.name) ?: throw DiskExecutorException("no such column: ${expression.name}")]
+                    else -> throw DiskExecutorException("no such table or alias: $qualifier")
+                }
+            }
+            val targetIndex = targetSchema.columnIndex(expression.name)
+            val sourceIndex = sourceSchema.columnIndex(expression.name)
+            if (targetIndex != null && sourceIndex != null) {
+                throw DiskExecutorException("column reference '${expression.name}' is ambiguous between $targetLabel and $sourceLabel")
+            }
+            targetIndex?.let { return targetRow.values[it] }
+            sourceIndex?.let { return sourceRow.values[it] }
+            throw DiskExecutorException("no such column: ${expression.name}")
+        }
+
+        override fun declaredCollation(expression: ColumnExpression): Collation? {
+            val qualifier = expression.qualifier
+            if (qualifier != null) {
+                return when {
+                    qualifier.equals(sourceLabel, ignoreCase = true) -> sourceSchema.column(expression.name)?.collation
+                    qualifier.equals(targetLabel, ignoreCase = true) -> targetSchema.column(expression.name)?.collation
+                    else -> null
+                }
+            }
+            val targetColumn = targetSchema.column(expression.name)
+            val sourceColumn = sourceSchema.column(expression.name)
+            return if (targetColumn != null && sourceColumn == null) targetColumn.collation
+            else if (sourceColumn != null && targetColumn == null) sourceColumn.collation
+            else null
+        }
+    }
+
+    /** A `WHEN NOT MATCHED` clause has no target row to read - a qualifier naming the target throws rather than silently resolving to nothing. Ported 1:1 from [kestrel.engine.Executor.notMatchedResolver]. */
+    private fun notMatchedResolver(
+        sourceSchema: TableSchema,
+        sourceLabel: String,
+        sourceRow: Row,
+        targetLabel: String
+    ): ColumnResolver = object : ColumnResolver {
+        override fun resolve(expression: ColumnExpression): Value {
+            val qualifier = expression.qualifier
+            if (qualifier != null && qualifier.equals(targetLabel, ignoreCase = true)) {
+                throw DiskExecutorException("no target row is available in a WHEN NOT MATCHED clause: $targetLabel.${expression.name}")
+            }
+            if (qualifier != null && !qualifier.equals(sourceLabel, ignoreCase = true)) {
+                throw DiskExecutorException("no such table or alias: $qualifier")
+            }
+            val index = sourceSchema.columnIndex(expression.name) ?: throw DiskExecutorException("no such column: ${expression.name}")
+            return sourceRow.values[index]
+        }
+
+        override fun declaredCollation(expression: ColumnExpression): Collation? = sourceSchema.column(expression.name)?.collation
+    }
+
+    /** Upfront validation for every clause of a MERGE statement, run even when the source produces zero rows. Ported 1:1 from [kestrel.engine.Executor.checkMergeColumns]. */
+    private fun checkMergeColumns(
+        statement: MergeStatement,
+        targetSchema: TableSchema,
+        targetLabel: String,
+        sourceSchema: TableSchema,
+        sourceLabel: String
+    ) {
+        checkMergeExpressionColumns(statement.onCondition, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = true)
+        for (clause in statement.whenClauses) {
+            when (clause) {
+                is MergeMatchedUpdate -> {
+                    clause.condition?.let { checkMergeExpressionColumns(it, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = true) }
+                    for (assignment in clause.assignments) {
+                        if (targetSchema.columnIndex(assignment.columnName) == null) {
+                            throw DiskExecutorException("no such column: ${assignment.columnName}")
+                        }
+                        assignment.value?.let { checkMergeExpressionColumns(it, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = true) }
+                    }
+                }
+                is MergeMatchedDelete ->
+                    clause.condition?.let { checkMergeExpressionColumns(it, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = true) }
+                is MergeNotMatchedInsert -> {
+                    clause.condition?.let { checkMergeExpressionColumns(it, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = false) }
+                    val targetIndices = resolveInsertTargets(targetSchema, clause.columns)
+                    if (clause.values.size != targetIndices.size) {
+                        throw DiskExecutorException(
+                            "table ${targetSchema.name} expects ${targetIndices.size} values but ${clause.values.size} were supplied"
+                        )
+                    }
+                    clause.values.forEach { value ->
+                        value?.let { checkMergeExpressionColumns(it, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget = false) }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Fifth near-parallel recursive [Expression] walker in this file (alongside [requireNoSubquery]/[checkColumns]/[checkReturningColumns]/[validateTriggerRowReferences]) - same deliberate non-abstraction as [kestrel.engine.Executor.checkMergeExpressionColumns], since this one needs two relations plus ambiguity detection none of the others do. */
+    private fun checkMergeExpressionColumns(
+        expression: Expression,
+        targetSchema: TableSchema,
+        targetLabel: String,
+        sourceSchema: TableSchema,
+        sourceLabel: String,
+        allowTarget: Boolean
+    ) {
+        fun recurse(inner: Expression) =
+            checkMergeExpressionColumns(inner, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget)
+        when (expression) {
+            is ColumnExpression -> checkMergeColumnReference(expression, targetSchema, targetLabel, sourceSchema, sourceLabel, allowTarget)
+            is BinaryExpression -> { recurse(expression.left); recurse(expression.right) }
+            is UnaryExpression -> recurse(expression.operand)
+            is FunctionExpression -> throw DiskExecutorException("aggregate functions are not allowed here")
+            is WindowExpression -> throw DiskExecutorException("window functions are not allowed here")
+            is LiteralExpression -> Unit
+            is CallExpression -> expression.arguments.forEach { recurse(it) }
+            is IsNullExpression -> recurse(expression.operand)
+            is InExpression -> {
+                recurse(expression.operand)
+                expression.values.forEach { recurse(it) }
+            }
+            is BetweenExpression -> {
+                recurse(expression.operand)
+                recurse(expression.low)
+                recurse(expression.high)
+            }
+            is LikeExpression -> {
+                recurse(expression.operand)
+                recurse(expression.pattern)
+            }
+            is CaseExpression -> {
+                expression.operand?.let { recurse(it) }
+                expression.branches.forEach { recurse(it.condition); recurse(it.result) }
+                expression.elseExpression?.let { recurse(it) }
+            }
+            is ScalarSubqueryExpression -> Unit
+            is ExistsExpression -> Unit
+            is InSubqueryExpression -> recurse(expression.operand)
+            is CastExpression -> recurse(expression.operand)
+            is CollateExpression -> recurse(expression.operand)
+            // Structurally harmless here too - see checkReturningColumns's own MERGE_ACTION() branch.
+            is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
+        }
+    }
+
+    private fun checkMergeColumnReference(
+        expression: ColumnExpression,
+        targetSchema: TableSchema,
+        targetLabel: String,
+        sourceSchema: TableSchema,
+        sourceLabel: String,
+        allowTarget: Boolean
+    ) {
+        val qualifier = expression.qualifier
+        if (qualifier != null) {
+            val matchesSource = qualifier.equals(sourceLabel, ignoreCase = true)
+            val matchesTargetLabel = qualifier.equals(targetLabel, ignoreCase = true)
+            if (matchesTargetLabel && !allowTarget) {
+                throw DiskExecutorException("no target row is available in a WHEN NOT MATCHED clause: $targetLabel.${expression.name}")
+            }
+            if (!matchesSource && !matchesTargetLabel) {
+                throw DiskExecutorException("no such table or alias: $qualifier")
+            }
+            val schema = if (matchesSource) sourceSchema else targetSchema
+            if (schema.columnIndex(expression.name) == null) throw DiskExecutorException("no such column: ${expression.name}")
+            return
+        }
+        val inTarget = allowTarget && targetSchema.columnIndex(expression.name) != null
+        val inSource = sourceSchema.columnIndex(expression.name) != null
+        if (inTarget && inSource) {
+            throw DiskExecutorException("column reference '${expression.name}' is ambiguous between $targetLabel and $sourceLabel")
+        }
+        if (!inTarget && !inSource) throw DiskExecutorException("no such column: ${expression.name}")
+    }
+
+    /** Commits [txnId] if [block] returns normally, aborts it (then rethrows) if [block] throws. */
+    private inline fun <T> runInTransaction(txnId: Long, block: () -> T): T {
+        val result = try {
+            block()
+        } catch (failure: Exception) {
+            catalog.abort(txnId)
+            throw failure
+        }
+        catalog.commit(txnId)
+        return result
+    }
+
+    private fun isTrue(value: Value): Boolean = value is Value.BooleanValue && value.value
+
+    private fun coerceForColumn(value: Value, column: Column): Value {
+        if (value is Value.NullValue) return value
+        return when (column.type) {
+            ColumnType.Integer -> value as? Value.IntegerValue ?: throw typeMismatch(column, value)
+            ColumnType.Text -> value as? Value.TextValue ?: throw typeMismatch(column, value)
+            ColumnType.Boolean -> value as? Value.BooleanValue ?: throw typeMismatch(column, value)
+            ColumnType.Real -> when (value) {
+                is Value.RealValue -> value
+                is Value.IntegerValue -> Value.RealValue(value.value.toDouble())
+                else -> throw typeMismatch(column, value)
+            }
+            ColumnType.Decimal -> {
+                val raw = when (value) {
+                    is Value.DecimalValue -> value.value
+                    is Value.IntegerValue -> BigDecimal(value.value)
+                    is Value.RealValue -> BigDecimal.valueOf(value.value)
+                    else -> throw typeMismatch(column, value)
+                }
+                Value.DecimalValue(DecimalColumns.normalize(raw, column.precision, column.scale, "column ${column.name}"))
+            }
+            ColumnType.Date -> value as? Value.DateValue ?: throw typeMismatch(column, value)
+        }
+    }
+
+    private fun typeMismatch(column: Column, value: Value): DiskExecutorException =
+        DiskExecutorException("type mismatch: column ${column.name} expects ${column.type.displayName} but got ${value.typeName}")
+
+    companion object {
+        private const val MAX_RECURSION_ITERATIONS = 10_000
+        private const val MAX_TRIGGER_DEPTH = 100
+
+        /** Kinds whose result actually depends on which rows fall inside the frame. */
+        private val FRAME_CAPABLE_KINDS = setOf(WindowFunctionKind.Aggregate, WindowFunctionKind.FirstValue, WindowFunctionKind.LastValue)
+    }
+}
