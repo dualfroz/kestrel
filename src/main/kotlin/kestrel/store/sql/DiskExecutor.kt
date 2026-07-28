@@ -2735,3 +2735,306 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             }
         }
 
+    private fun structuralSourceColumnNames(item: FromItem, localCtes: Map<String, List<String>>): List<String> =
+        when (item) {
+            is TableSource -> {
+                val key = item.name.lowercase()
+                localCtes[key]
+                    ?: activeCtes.lastOrNull { it.name.equals(item.name, ignoreCase = true) }?.schema?.columnNames
+                    ?: catalog.temporaryTableOrNull(item.name)?.schema?.columnNames
+                    ?: catalog.tableOrNull(item.name)?.schema?.columnNames
+                    ?: catalog.viewOrNull(item.name)?.let { structuralColumnNames(it, localCtes) }
+                    ?: throw DiskExecutorException("no such table: ${item.name}")
+            }
+            is SubquerySource -> structuralColumnNames(item.select, localCtes)
+        }
+
+    /**
+     * Runs [statement] against the disk backend inside the already-open [txn]. [outer] is
+     * non-null exactly when this call is itself a scalar/EXISTS/IN subquery nested inside another
+     * statement's expression, reached through [Evaluator]'s [SubqueryRunner] hook - it lets a
+     * column [statement]'s own FROM/JOIN sources cannot resolve fall back to the row of whichever
+     * statement contains it, mirroring [kestrel.engine.SelectRunner.run]'s own `outer` parameter.
+     * A subquery therefore runs inside the same disk transaction as its containing statement
+     * rather than opening (and committing/aborting) one of its own.
+     */
+    private fun runSelect(statement: SelectStatement, txn: Long, outer: ColumnResolver?): SelectResult {
+        val fromItems = listOf(statement.from) + statement.joins.map { it.from }
+        val fromSources = fromItems.map { item -> resolveFromItem(item, txn) }
+        val sources = buildJoinSources(fromItems, fromSources.map { it.schema })
+        val subqueries = subqueryRunnerFor(txn)
+        var combined = initialRows(statement, txn, statement.from, fromSources.first())
+        statement.joins.forEachIndexed { position, join ->
+            join.on?.let { rejectWindowFunction(it, "an ON condition") }
+            val rightSource = sources[position + 1]
+            val lateralSelect = lateralSelectOf(join.from)
+            combined = if (lateralSelect != null) {
+                executeLateralJoin(join, combined, lateralSelect, sources.subList(0, position + 1), rightSource, outer, subqueries, txn)
+            } else {
+                val rightRows = fromSources[position + 1].scan(txn)
+                applyJoin(join, combined, rightRows, sources.subList(0, position + 2), outer, subqueries, rightSource)
+            }
+        }
+        statement.where?.let { where ->
+            rejectWindowFunction(where, "WHERE")
+            combined = combined.filter { row -> isTrue(evaluateCombinedRow(sources, outer, subqueries, where, row)) }
+        }
+        statement.groupBy.forEach { rejectWindowFunction(it, "GROUP BY") }
+        statement.having?.let { rejectWindowFunction(it, "HAVING") }
+        statement.distinctOn.forEach { rejectWindowFunction(it, "DISTINCT ON") }
+        val orderKeys = resolvedOrderKeys(statement)
+        val aggregated = statement.groupBy.isNotEmpty() || statement.groupingSpec != null ||
+            containsAggregate(statement.projection) ||
+            (statement.having != null && containsAggregate(statement.having))
+        if (statement.distinctOn.isNotEmpty()) validateDistinctOn(statement, orderKeys, aggregated)
+        val windowExpressions = collectWindowExpressions(statement.projection, orderKeys)
+        if (windowExpressions.isNotEmpty()) validateWindows(windowExpressions, aggregated)
+        if (aggregated) {
+            if (statement.projection is StarProjection) {
+                throw DiskExecutorException("cannot use * with GROUP BY or aggregate functions")
+            }
+            validateAggregation(statement, orderKeys, sources)
+            return GroupAggregation(
+                { expression -> resolveIndex(sources, expression) },
+                { expression, row -> evaluateCombinedRow(sources, outer, subqueries, expression, row) },
+                ::columnLabel,
+                subqueries,
+                { expression -> declaredCollationOrNull(sources, expression) }
+            ).aggregate(statement, orderKeys, combined)
+        }
+        val baseColumnCount = sources.sumOf { it.schema.columns.size }
+        if (windowExpressions.isNotEmpty()) {
+            val evaluateRow: (Expression, List<Value>) -> Value = { expression, row -> evaluateCombinedRow(sources, outer, subqueries, expression, row) }
+            val perExpression = windowExpressions.map { window ->
+                computeWindowValues(window, combined, evaluateRow) { expression -> declaredCollationOrNull(sources, expression) }
+            }
+            combined = combined.mapIndexed { rowIndex, row -> row + windowExpressions.indices.map { perExpression[it][rowIndex] } }
+        }
+        if (orderKeys.isNotEmpty()) {
+            combined = sortCombinedRows(sources, outer, subqueries, combined, orderKeys, windowExpressions, baseColumnCount)
+        }
+        if (statement.distinctOn.isNotEmpty()) {
+            val kept = LinkedHashMap<List<Value>, List<Value>>()
+            for (row in combined) {
+                val key = statement.distinctOn.map { evaluateWindowAware(sources, outer, subqueries, windowExpressions, baseColumnCount, it, row) }
+                val bucketKey = collationFoldedKey(key, statement.distinctOn) { expression -> declaredCollationOrNull(sources, expression) }
+                kept.putIfAbsent(bucketKey, row)
+            }
+            combined = kept.values.toList()
+        }
+        statement.offset?.let { if (it < 0) throw DiskExecutorException("OFFSET must not be negative") }
+        statement.limit?.let { if (it < 0) throw DiskExecutorException("LIMIT must not be negative") }
+        if (!statement.distinct) {
+            if (statement.offset != null || statement.limit != null) {
+                combined = combined.drop(statement.offset ?: 0)
+                statement.limit?.let { combined = combined.take(it) }
+            }
+        }
+        val (columns, projected) = projectCombined(statement.projection, sources, outer, subqueries, combined, windowExpressions, baseColumnCount)
+        var resultRows = projected
+        if (statement.distinct) {
+            if (statement.distinctOn.isEmpty()) {
+                val itemExpressions = when (statement.projection) {
+                    is ExpressionProjection -> statement.projection.items.map { it.expression }
+                    is StarProjection -> columns.map { ColumnExpression(it) }
+                }
+                resultRows = resultRows.distinctBy { row -> collationFoldedKey(row, itemExpressions) { expression -> declaredCollationOrNull(sources, expression) } }
+            }
+            if (statement.offset != null || statement.limit != null) {
+                resultRows = resultRows.drop(statement.offset ?: 0)
+                statement.limit?.let { resultRows = resultRows.take(it) }
+            }
+        }
+        return SelectResult(columns, resultRows)
+    }
+
+    /**
+     * `ORDER BY` may name a `SELECT`-list alias instead of repeating its expression (e.g.
+     * `SELECT SUM(amount) AS total ... ORDER BY total`) - resolved here, once, before either
+     * [GroupAggregation] or [sortCombinedRows] ever sees the order keys, mirroring
+     * [kestrel.engine.SelectRunner]'s own `resolveOrderAlias`. A qualified column
+     * (`ORDER BY t.total`) can never be an alias reference, so it is left untouched.
+     */
+    private fun resolvedOrderKeys(statement: SelectStatement): List<OrderKey> =
+        statement.orderBy?.keys.orEmpty().map { key -> OrderKey(resolveOrderAlias(statement.projection, key.expression), key.descending, key.nullsFirst) }
+
+    private fun resolveOrderAlias(projection: Projection, expression: Expression): Expression {
+        if (expression is ColumnExpression && expression.qualifier == null && projection is ExpressionProjection) {
+            val aliased = projection.items.firstOrNull { it.alias?.equals(expression.name, ignoreCase = true) == true }
+            if (aliased != null) return aliased.expression
+        }
+        return expression
+    }
+
+    /** One joined table's schema plus the offset of its first column within a combined `List<Value>` row. */
+    private class JoinSource(val alias: String, val schema: TableSchema, val offset: Int)
+
+    private fun buildJoinSources(fromItems: List<FromItem>, schemas: List<TableSchema>): List<JoinSource> {
+        val sources = mutableListOf<JoinSource>()
+        var offset = 0
+        for ((item, schema) in fromItems.zip(schemas)) {
+            val alias = sourceLabel(item)
+            if (sources.any { it.alias.equals(alias, ignoreCase = true) }) {
+                throw DiskExecutorException("duplicate table alias: $alias")
+            }
+            sources.add(JoinSource(alias, schema, offset))
+            offset += schema.columns.size
+        }
+        return sources
+    }
+
+    private fun sourceLabel(item: FromItem): String = when (item) {
+        is TableSource -> item.alias ?: item.name
+        is SubquerySource -> item.alias
+    }
+
+    /**
+     * The candidate rows a query's FIRST source starts from: an indexed lookup narrowed by WHERE
+     * via [candidateRows] when there is no JOIN and the source is a real disk table (preserving the
+     * same pushdown a plain single-table SELECT already gets), or a full scan otherwise - mirroring
+     * [kestrel.engine.SelectRunner]'s own choice to fall back to a full scan for the driving table
+     * as soon as more than one source is involved, since WHERE may combine columns from sources
+     * that are not open yet at this point in the plan. A CTE-backed source has no index to push
+     * down into regardless of JOIN, so it always scans its already-materialized rows; either way
+     * [statement.where] is re-applied in full immediately after by the caller, so skipping pushdown
+     * here only costs performance, never correctness.
+     */
+    private fun initialRows(statement: SelectStatement, txn: Long, item: FromItem, fromSource: DiskFromSource): List<List<Value>> =
+        if (statement.joins.isEmpty() && fromSource is DiskTableSource) {
+            candidateRows(fromSource.table, txn, statement.where, (item as TableSource).alias).map { it.second.values }
+        } else {
+            fromSource.scan(txn)
+        }
+
+    /**
+     * Nested-loop join: for every row already combined from earlier sources, scans the whole of
+     * [rightRows] evaluating [JoinClause.on] against each pairing. A LEFT/FULL JOIN row left
+     * unmatched still contributes one row, padded with NULLs for [rightSource]'s columns; a RIGHT/
+     * FULL JOIN additionally emits every [rightRows] entry that never matched any [left] row, padded
+     * with NULLs for everything [rightSource.offset] counts as coming before it. Deliberately no
+     * hash-join optimization for an equality condition (unlike [kestrel.engine.SelectRunner]'s
+     * `hashJoinKeys`) - a documented scope cut: this JOIN exists to be correct first, in a solo
+     * session without peer review, and every disk-backed table already pays a full heap scan for
+     * any predicate an index cannot serve, so nested loop is not a new order-of-magnitude cost here.
+     */
+    private fun applyJoin(
+        join: JoinClause,
+        left: List<List<Value>>,
+        rightRows: List<List<Value>>,
+        sourcesSoFar: List<JoinSource>,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        rightSource: JoinSource
+    ): List<List<Value>> {
+        val nullRight = List(rightSource.schema.columns.size) { Value.NullValue }
+        val nullLeft = List(rightSource.offset) { Value.NullValue }
+        val outerLeft = join.type == JoinType.Left || join.type == JoinType.Full
+        val outerRight = join.type == JoinType.Right || join.type == JoinType.Full
+        val condition = join.on
+        val result = mutableListOf<List<Value>>()
+        val matchedRight = BooleanArray(rightRows.size)
+        for (leftRow in left) {
+            var matched = false
+            rightRows.forEachIndexed { index, rightRow ->
+                val candidate = leftRow + rightRow
+                if (condition == null || isTrue(evaluateCombinedRow(sourcesSoFar, outer, subqueries, condition, candidate))) {
+                    result.add(candidate)
+                    matched = true
+                    matchedRight[index] = true
+                }
+            }
+            if (!matched && outerLeft) result.add(leftRow + nullRight)
+        }
+        if (outerRight) {
+            rightRows.forEachIndexed { index, rightRow -> if (!matchedRight[index]) result.add(nullLeft + rightRow) }
+        }
+        return result
+    }
+
+    private fun lateralSelectOf(item: FromItem): QueryStatement? = (item as? SubquerySource)?.takeIf { it.lateral }?.select
+
+    /**
+     * Unlike every other join, a LATERAL derived table has no fixed row set: it is re-evaluated
+     * once per row already accumulated on the left, correlated to that row via [lateralOuterResolver]
+     * exactly like a correlated subquery in WHERE/SELECT (same [SubqueryRunner]/[Evaluator] plumbing,
+     * just invoked from FROM instead) - mirrors [kestrel.engine.SelectRunner.executeLateralJoin] 1:1.
+     * Hash-joining is meaningless here (there is no static right-hand row set to build buckets from),
+     * so this is always a nested loop, matching how real engines execute LATERAL.
+     */
+    private fun executeLateralJoin(
+        join: JoinClause,
+        left: List<List<Value>>,
+        lateralSelect: QueryStatement,
+        sourcesSoFar: List<JoinSource>,
+        rightSource: JoinSource,
+        outer: ColumnResolver?,
+        subqueries: SubqueryRunner,
+        txn: Long
+    ): List<List<Value>> {
+        val nullRight = List(rightSource.schema.columns.size) { Value.NullValue }
+        val allSources = sourcesSoFar + rightSource
+        val condition = join.on
+        val result = mutableListOf<List<Value>>()
+        for (leftRow in left) {
+            val rightRows = runQuery(lateralSelect, txn, lateralOuterResolver(sourcesSoFar, leftRow)).rows
+            var matched = false
+            for (rightRow in rightRows) {
+                val candidate = leftRow + rightRow
+                if (condition == null || isTrue(evaluateCombinedRow(allSources, outer, subqueries, condition, candidate))) {
+                    result.add(candidate)
+                    matched = true
+                }
+            }
+            if (!matched && join.type == JoinType.Left) result.add(leftRow + nullRight)
+        }
+        return result
+    }
+
+    /**
+     * Resolves a column against [sourcesSoFar] - everything to the left of a LATERAL subquery in the
+     * FROM clause - and nothing else: a name that does not resolve there means the expression names a
+     * source not joined yet (or the LATERAL item itself), which SQL forbids, reported with a clear
+     * LATERAL-specific message rather than the generic "no such column".
+     */
+    private fun lateralOuterResolver(sourcesSoFar: List<JoinSource>, leftRow: List<Value>): ColumnResolver = object : ColumnResolver {
+        override fun resolve(expression: ColumnExpression): Value =
+            resolveIndexOrNull(sourcesSoFar, expression)?.let { leftRow[it] }
+                ?: throw DiskExecutorException(
+                    "LATERAL subquery cannot reference ${expression.name}: not joined yet at this point in the FROM clause"
+                )
+
+        override fun declaredCollation(expression: ColumnExpression): Collation? =
+            resolveIndexOrNull(sourcesSoFar, expression)?.let { declaredCollationOrNull(sourcesSoFar, expression) }
+    }
+
+    private fun resolveIndexOrNull(sources: List<JoinSource>, expression: ColumnExpression): Int? {
+        val qualifier = expression.qualifier
+        val matches = mutableListOf<Int>()
+        for (source in sources) {
+            if (qualifier != null && !source.alias.equals(qualifier, ignoreCase = true)) continue
+            val local = source.schema.columnIndex(expression.name) ?: continue
+            matches.add(source.offset + local)
+        }
+        return when {
+            matches.isEmpty() -> null
+            matches.size > 1 -> throw DiskExecutorException("ambiguous column reference: ${expression.name}")
+            else -> matches.single()
+        }
+    }
+
+    private fun resolveIndex(sources: List<JoinSource>, expression: ColumnExpression): Int =
+        resolveIndexOrNull(sources, expression)
+            ?: throw DiskExecutorException("no such column: ${expression.name}")
+
+    /** [expression]'s declared `COLLATE` from whichever [sources] entry it resolves against - mirrors [resolveIndexOrNull]'s own matching, `null` on no match or an ambiguous one. */
+    private fun declaredCollationOrNull(sources: List<JoinSource>, expression: ColumnExpression): Collation? {
+        val qualifier = expression.qualifier
+        val matches = mutableListOf<Collation>()
+        for (source in sources) {
+            if (qualifier != null && !source.alias.equals(qualifier, ignoreCase = true)) continue
+            val column = source.schema.column(expression.name) ?: continue
+            matches.add(column.collation)
+        }
+        return matches.singleOrNull()
+    }
+
