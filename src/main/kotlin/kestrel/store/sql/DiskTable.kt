@@ -163,3 +163,177 @@ class DiskTable internal constructor(
         for ((rid, row) in existing) update(txnId, rid, transform(row))
     }
 
+    fun insert(txnId: Long, row: Row): RecordId {
+        requireArity(row)
+        val pkValues = primaryKeyValuesOf(row)
+        rejectDuplicatePrimaryKey(txnId, pkValues)
+        rejectDuplicateUniqueSecondary(txnId, row, excludeRid = null)
+        rejectDuplicateUniqueConstraints(txnId, row, excludeRid = null)
+        val roots = currentRoots()
+        val rid = heap.insert(txnId, TupleCodec.encode(row.values))
+        indexRow(txnId, rid, row, pkValues)
+        persistIfRootsChanged(txnId, roots)
+        return rid
+    }
+
+    fun get(txnId: Long, rid: RecordId): Row = Row(TupleCodec.decode(heap.get(txnId, rid)))
+
+    fun scan(txnId: Long): List<Pair<RecordId, Row>> {
+        scanCount++
+        return rawScan(txnId)
+    }
+
+    private fun rawScan(txnId: Long): List<Pair<RecordId, Row>> =
+        heap.scan(txnId).map { (rid, bytes) -> rid to Row(TupleCodec.decode(bytes)) }
+
+    fun delete(txnId: Long, rid: RecordId) {
+        val row = get(txnId, rid)
+        val roots = currentRoots()
+        unindexRow(txnId, rid, row)
+        heap.delete(txnId, rid)
+        persistIfRootsChanged(txnId, roots)
+    }
+
+    fun update(txnId: Long, rid: RecordId, newRow: Row): RecordId {
+        requireArity(newRow)
+        val oldRow = get(txnId, rid)
+        val newPk = primaryKeyValuesOf(newRow)
+        val oldPk = primaryKeyValuesOf(oldRow)
+        if (newPk != oldPk) rejectDuplicatePrimaryKey(txnId, newPk)
+        rejectDuplicateUniqueSecondary(txnId, newRow, excludeRid = rid)
+        rejectDuplicateUniqueConstraints(txnId, newRow, excludeRid = rid)
+        val roots = currentRoots()
+        unindexRow(txnId, rid, oldRow)
+        val newRid = heap.update(txnId, rid, TupleCodec.encode(newRow.values))
+        indexRow(txnId, newRid, newRow, newPk)
+        persistIfRootsChanged(txnId, roots)
+        return newRid
+    }
+
+    /** Convenience for a single-column PRIMARY KEY; delegates to the general, composite-capable overload below. */
+    fun findByPrimaryKey(txnId: Long, key: Value): Pair<RecordId, Row>? = findByPrimaryKey(txnId, listOf(key))
+
+    /**
+     * Point lookup by the table's PRIMARY KEY, whether inline-single-column or table-level
+     * composite - [keys] must be given in [TableSchema.primaryKeyColumns] order. [KeyCodec.encodeKey]
+     * concatenates each value's own order-preserving encoding, so a single-element list here
+     * produces byte-identical output to [KeyCodec.encode] on that same value, keeping this the
+     * one lookup path both PRIMARY KEY shapes share. [keys] is folded through
+     * [encodePrimaryKey] first, so a search literal on a `COLLATE NOCASE`/`RTRIM`-declared PRIMARY
+     * KEY column finds a case-/trailing-space-variant row the same way a plain `=` comparison does.
+     */
+    fun findByPrimaryKey(txnId: Long, keys: List<Value>): Pair<RecordId, Row>? {
+        pointLookupCount++
+        val index = primaryIndex ?: throw DiskTableException("table ${schema.name} has no primary key index")
+        val ridBits = index.search(txnId, encodePrimaryKey(keys)) ?: return null
+        val rid = RecordId.decode(ridBits)
+        return rid to get(txnId, rid)
+    }
+
+    /**
+     * [DiskIndexAccessPlanner] plans a range against either a single-column PRIMARY KEY ([prefix]
+     * empty, see [DiskAccessPlan.PrimaryKeyRange]'s own doc) or the LAST column of a table-level
+     * composite one, after an equality prefix on every column before it ([prefix] non-empty, see
+     * [DiskAccessPlan.CompositePrimaryKeyRange]'s own doc) - either way, [prefix] plus [lower]/
+     * [upper] always names every PRIMARY KEY column, so [encodePrimaryKey]'s own per-position
+     * collation folding ([kestrel.engine.collationFoldedUniquenessKey]) applies directly and always
+     * produces a COMPLETE, full-arity key: unlike [rangeBySecondary], no RID-suffix bracketing
+     * trick is needed here, since a PRIMARY KEY entry is a bare `encodeKey(values)` with nothing
+     * after it to disambiguate.
+     */
+    fun rangeByPrimaryKey(
+        txnId: Long,
+        lower: Value? = null,
+        lowerInclusive: Boolean = true,
+        upper: Value? = null,
+        upperInclusive: Boolean = true,
+        prefix: List<Value> = emptyList()
+    ): List<Pair<RecordId, Row>> {
+        rangeScanCount++
+        val index = primaryIndex ?: throw DiskTableException("table ${schema.name} has no primary key index")
+        fun encodeBound(value: Value): ByteArray =
+            KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, schema.primaryKeyIndices, prefix + value))
+        val lowerBytes = lower?.let(::encodeBound)?.let { if (lowerInclusive) it else strictlyAfter(it) }
+        val upperBytes = upper?.let(::encodeBound)
+        return index.rangeScan(txnId, lowerBytes, upperBytes, toInclusive = upperInclusive).map { (_, ridBits) ->
+            val rid = RecordId.decode(ridBits)
+            rid to get(txnId, rid)
+        }
+    }
+
+    /** Convenience for a single-column secondary index; delegates to the general, composite-capable overload below. */
+    fun findBySecondary(txnId: Long, indexName: String, key: Value): List<Pair<RecordId, Row>> =
+        findBySecondary(txnId, indexName, listOf(key))
+
+    /**
+     * Equality lookup on a secondary index, whether single-column or composite - [keys] must be
+     * given in [SecondaryIndexHandle.columnNames] order. A single-element list here produces a
+     * byte-identical prefix to the single-[Value] overload, keeping this the one lookup path both
+     * shapes share (mirrors [findByPrimaryKey]). [keys] is folded per-column through
+     * [equalRangeFor], so equality against a declared-collation column finds a case-/trailing-
+     * space-variant row instead of missing it.
+     */
+    fun findBySecondary(txnId: Long, indexName: String, keys: List<Value>): List<Pair<RecordId, Row>> {
+        secondaryLookupCount++
+        val handle = secondaryIndexHandles.firstOrNull { it.name.equals(indexName, ignoreCase = true) }
+            ?: throw DiskTableException("no such index: $indexName on table ${schema.name}")
+        val (lower, upper) = equalRangeFor(handle.columnIndices, keys)
+        return handle.index.rangeScan(txnId, lower, upper, toInclusive = true).map { (_, ridBits) ->
+            val rid = RecordId.decode(ridBits)
+            rid to get(txnId, rid)
+        }
+    }
+
+    /**
+     * [DiskIndexAccessPlanner] plans a range against a secondary index's column right after
+     * [prefix]'s equality run (see [kestrel.store.sql.DiskAccessPlan.SecondaryRange]'s own doc) -
+     * [prefix] is empty for a single-column index or a composite one ranged on its very first
+     * column. Unlike [rangeByPrimaryKey] (whose B+Tree entries are bare `encodeKey(values)`, no RID
+     * suffix, since a PRIMARY KEY is unique), a secondary index entry is `encodeKey(values) ++ rid`
+     * (see the class doc), so a bound naming just [lower]/[upper]'s own encoded bytes would sit
+     * strictly *before* every real entry sharing that value (any real key, being longer, sorts
+     * after its own prefix) - reusing [equalRangeFor]'s (all-zero-suffix, all-one-suffix) pair for
+     * `prefix + value` sidesteps this: the all-zero-suffix bound is a valid inclusive lower
+     * bound for "this value or greater" (it sits at or before every RID-suffixed entry of that
+     * exact value), and the all-one-suffix bound is a valid inclusive upper bound for "this value
+     * or less" (it sits at or after every RID-suffixed entry of that exact value) - swapped for the
+     * opposite (exclusive) side of each bound, so e.g. `> X` starts scanning right after the last
+     * possible entry of exactly `X`. When [prefix] is non-empty and one side has no explicit bound
+     * (e.g. `WHERE a = 5 AND b < 10`, no lower bound on `b`), that side falls back to
+     * [equalRangeFor]'s own bound for [prefix] alone, so the scan still stays within the `a = 5`
+     * group instead of running off into rows from a smaller/larger `a` - [prefix]'s own encoding is
+     * a byte-string prefix of every real entry sharing it (each value's encoding is self-delimited),
+     * so this bound is exact regardless of how many values [prefix] holds relative to the index's
+     * full column count.
+     */
+    fun rangeBySecondary(
+        txnId: Long,
+        indexName: String,
+        prefix: List<Value> = emptyList(),
+        lower: Value? = null,
+        lowerInclusive: Boolean = true,
+        upper: Value? = null,
+        upperInclusive: Boolean = true
+    ): List<Pair<RecordId, Row>> {
+        rangeScanCount++
+        val handle = secondaryIndexHandles.firstOrNull { it.name.equals(indexName, ignoreCase = true) }
+            ?: throw DiskTableException("no such index: $indexName on table ${schema.name}")
+        val prefixBounds = if (prefix.isNotEmpty()) equalRangeFor(handle.columnIndices, prefix) else null
+        val lowerBytes = if (lower != null) {
+            val (inclusiveBound, exclusiveBound) = equalRangeFor(handle.columnIndices, prefix + lower)
+            if (lowerInclusive) inclusiveBound else exclusiveBound
+        } else {
+            prefixBounds?.first
+        }
+        val upperBytes = if (upper != null) {
+            val (exclusiveBound, inclusiveBound) = equalRangeFor(handle.columnIndices, prefix + upper)
+            if (upperInclusive) inclusiveBound else exclusiveBound
+        } else {
+            prefixBounds?.second
+        }
+        return handle.index.rangeScan(txnId, lowerBytes, upperBytes, toInclusive = true).map { (_, ridBits) ->
+            val rid = RecordId.decode(ridBits)
+            rid to get(txnId, rid)
+        }
+    }
+
