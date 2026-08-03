@@ -947,3 +947,143 @@ class AlterTableTest {
         assertEquals(listOf(listOf(int(30))), select("SELECT price FROM t").rows)
     }
 
+    @Test
+    fun changeColumnTypeRejectsImplicitCoercionWhenTypesAreIncompatibleAndNoUsingIsGiven() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT)")
+        run("INSERT INTO t VALUES (1, 'abc')")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN code TYPE INTEGER") }
+        assertTrue(error.message!!.contains("type mismatch"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsUnknownColumn() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN missing TYPE TEXT") }
+        assertTrue(error.message!!.contains("no such column"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsGeneratedColumn() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, price INTEGER, doubled INTEGER GENERATED ALWAYS AS (price * 2) STORED)")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN doubled TYPE REAL") }
+        assertTrue(error.message!!.contains("GENERATED"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsPrimaryKeyColumn() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN id TYPE TEXT") }
+        assertTrue(error.message!!.contains("PRIMARY KEY"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsColumnUsedByItsOwnForeignKey() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER, FOREIGN KEY (dept_id) REFERENCES departments (id))")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE employees ALTER COLUMN dept_id TYPE TEXT") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsColumnReferencedByAnotherTablesForeignKey() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, code TEXT, CONSTRAINT uq_code UNIQUE (code))")
+        run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_code TEXT, " +
+                "FOREIGN KEY (dept_code) REFERENCES departments (code))"
+        )
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE departments ALTER COLUMN code TYPE INTEGER") }
+        assertTrue(error.message!!.contains("employees"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsColumnUsedByAUniqueConstraint() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, CONSTRAINT uq_email UNIQUE (email))")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN email TYPE TEXT") }
+        assertTrue(error.message!!.contains("UNIQUE"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsColumnWithASecondaryIndex() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        run("CREATE INDEX idx_name ON t (name)")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN name TYPE TEXT") }
+        assertTrue(error.message!!.contains("idx_name"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsWhenUsingProducesNullForANotNullColumnAndLeavesTheTableUnchanged() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT NOT NULL)")
+        run("INSERT INTO t VALUES (1, '100'), (2, '')")
+        val error = assertFailsWith<KestrelException> {
+            run("ALTER TABLE t ALTER COLUMN code TYPE INTEGER USING CASE WHEN code = '' THEN NULL ELSE CAST(code AS INTEGER) END")
+        }
+        assertTrue(error.message!!.contains("NOT NULL"), error.message!!)
+        assertEquals(listOf(listOf(text("100")), listOf(text(""))), select("SELECT code FROM t ORDER BY id ASC").rows)
+    }
+
+    @Test
+    fun changeColumnTypeRevalidatesACheckConstraintAgainstTheNewValuesAndLeavesTheTableUnchangedOnFailure() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER, CHECK (amount <= 100))")
+        run("INSERT INTO t VALUES (1, 10), (2, 60)")
+        val error = assertFailsWith<KestrelException> {
+            run("ALTER TABLE t ALTER COLUMN amount TYPE INTEGER USING amount * 2")
+        }
+        assertTrue(error.message!!.contains("CHECK constraint"), error.message!!)
+        assertEquals(
+            listOf(listOf(int(1), int(10)), listOf(int(2), int(60))),
+            select("SELECT id, amount FROM t ORDER BY id ASC").rows
+        )
+    }
+
+    @Test
+    fun changeColumnTypeSucceedsAndAppliesUsingToEveryRowWhenAllSatisfyAnExistingCheckConstraint() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER, CHECK (amount <= 100))")
+        run("INSERT INTO t VALUES (1, 10), (2, 20)")
+        exec("ALTER TABLE t ALTER COLUMN amount TYPE INTEGER USING amount * 2")
+        assertEquals(listOf(listOf(int(20)), listOf(int(40))), select("SELECT amount FROM t ORDER BY id ASC").rows)
+    }
+
+    @Test
+    fun changeColumnTypeRejectsAnIncompatibleDefaultExpressionUpFront() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending')")
+        val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ALTER COLUMN status TYPE INTEGER USING 0") }
+        assertTrue(error.message!!.contains("DEFAULT"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypePreservesNotNullAndStillEnforcesItGoingForward() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)")
+        run("INSERT INTO t VALUES (1, 10)")
+        exec("ALTER TABLE t ALTER COLUMN amount TYPE REAL")
+        val error = assertFailsWith<KestrelException> { run("INSERT INTO t VALUES (2, NULL)") }
+        assertTrue(error.message!!.contains("NOT NULL"), error.message!!)
+    }
+
+    @Test
+    fun changeColumnTypeAcceptsAnOptionalColumnKeyword() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO t VALUES (1, 5)")
+        exec("ALTER TABLE t ALTER amount TYPE REAL")
+        assertEquals(listOf(listOf(real(5.0))), select("SELECT amount FROM t").rows)
+    }
+
+    @Test
+    fun changeColumnTypeDumpReflectsTheNewDeclaredType() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO t VALUES (1, 5)")
+        exec("ALTER TABLE t ALTER COLUMN amount TYPE DECIMAL(10, 2)")
+        val dumped = SqlWriter.dump(catalog)
+        assertTrue(dumped.contains("amount DECIMAL(10, 2)"), dumped)
+    }
+
+    @Test
+    fun changeColumnTypeRedoLogTextRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO t VALUES (1, 5)")
+        val statement = Parser(Lexer("ALTER TABLE t ALTER COLUMN amount TYPE REAL USING amount").tokenize()).parseProgram().single()
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ALTER COLUMN amount TYPE REAL USING amount"), rendered)
+        run(rendered)
+        assertEquals(listOf(listOf(real(5.0))), select("SELECT amount FROM t").rows)
+    }
+}
