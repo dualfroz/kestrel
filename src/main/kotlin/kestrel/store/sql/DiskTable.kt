@@ -337,3 +337,175 @@ class DiskTable internal constructor(
         }
     }
 
+    /**
+     * When [handle] is [SecondaryIndexHandle.unique], a table with pre-existing duplicate values
+     * in that column must fail cleanly (like `CREATE UNIQUE INDEX` does in the in-memory engine)
+     * rather than silently building an index that lies about uniqueness - [seen] catches that
+     * before any B+Tree entry is written, folded through each column's declared `COLLATE` (see
+     * [collationFoldedUniquenessKey]) so e.g. two pre-existing rows `'Bob'`/`'bob'` under a
+     * `NOCASE`-declared column are caught here just like [rejectDuplicateUniqueConstraints]
+     * already catches them for a declarative `UNIQUE`. The B+Tree entry itself ([compositeKey])
+     * is ALSO folded per-column through the same declared collation, so a value inserted *after*
+     * this backfill is caught too, by [rejectDuplicateUniqueSecondary]'s own range scan.
+     */
+    internal fun backfillSecondaryIndex(txnId: Long, handle: SecondaryIndexHandle) {
+        val seen = if (handle.unique) HashSet<List<Value>>() else null
+        for ((rid, row) in scan(txnId)) {
+            val values = handle.columnIndices.map { row.values[it] }
+            if (values.any { it.isNull }) continue
+            if (seen != null && !seen.add(collationFoldedUniquenessKey(schema, handle.columnIndices, values))) {
+                throw DiskTableException("UNIQUE constraint failed: ${schema.name}.${handle.columnNames.joinToString(", ")}")
+            }
+            handle.index.insert(txnId, compositeKey(handle.columnIndices, values, rid), rid.encode())
+        }
+    }
+
+    fun snapshotDirectoryEntry(): TableDirectoryEntry = TableDirectoryEntry(
+        tableName = schema.name,
+        columns = schema.columns,
+        dataHeaderPageId = heap.headerPageId,
+        primaryKeyIndexRootPageId = primaryIndex?.rootPageId,
+        secondaryIndexes = secondaryIndexHandles.map { SecondaryIndexEntry(it.name, it.columnNames, it.index.rootPageId, it.unique) },
+        compositePrimaryKey = schema.compositePrimaryKey,
+        uniqueConstraints = schema.uniqueConstraints,
+        checks = schema.checks.map { CheckConstraintEntry.from(it) }
+    )
+
+    private fun indexRow(txnId: Long, rid: RecordId, row: Row, pkValues: List<Value>?) {
+        primaryIndex?.let { index -> if (pkValues != null && pkValues.none { it.isNull }) index.insert(txnId, encodePrimaryKey(pkValues), rid.encode()) }
+        for (handle in secondaryIndexHandles) {
+            val values = handle.columnIndices.map { row.values[it] }
+            if (values.none { it.isNull }) handle.index.insert(txnId, compositeKey(handle.columnIndices, values, rid), rid.encode())
+        }
+    }
+
+    private fun unindexRow(txnId: Long, rid: RecordId, row: Row) {
+        primaryIndex?.let { index ->
+            val pkValues = primaryKeyValuesOf(row)
+            if (pkValues != null && pkValues.none { it.isNull }) index.delete(txnId, encodePrimaryKey(pkValues))
+        }
+        for (handle in secondaryIndexHandles) {
+            val values = handle.columnIndices.map { row.values[it] }
+            if (values.none { it.isNull }) handle.index.delete(txnId, compositeKey(handle.columnIndices, values, rid))
+        }
+    }
+
+    private fun rejectDuplicatePrimaryKey(txnId: Long, pkValues: List<Value>?) {
+        val index = primaryIndex ?: return
+        if (pkValues == null || pkValues.any { it.isNull }) return
+        if (index.search(txnId, encodePrimaryKey(pkValues)) != null) {
+            throw DiskTableException("UNIQUE constraint failed: ${schema.name}.${schema.primaryKeyColumns.joinToString(", ")}")
+        }
+    }
+
+    /**
+     * Rejects [row] if any [SecondaryIndexHandle.unique] index would end up with two rows sharing
+     * a non-null tuple of values across its column(s). Searches the index directly (like
+     * [rejectDuplicatePrimaryKey]) rather than through [findBySecondary], so this internal check
+     * never inflates [secondaryLookupCount]. [excludeRid] is the row being updated (so it does not
+     * collide with its own prior entry); `null` on insert. [equalRangeFor] folds [values] per
+     * column through its declared collation, so this range scan is collation-aware exactly like
+     * the B+Tree entries [compositeKey] wrote in the first place.
+     */
+    private fun rejectDuplicateUniqueSecondary(txnId: Long, row: Row, excludeRid: RecordId?) {
+        for (handle in secondaryIndexHandles) {
+            if (!handle.unique) continue
+            val values = handle.columnIndices.map { row.values[it] }
+            if (values.any { it.isNull }) continue
+            val (lower, upper) = equalRangeFor(handle.columnIndices, values)
+            val conflict = handle.index.rangeScan(txnId, lower, upper, toInclusive = true).any { (_, ridBits) ->
+                RecordId.decode(ridBits) != excludeRid
+            }
+            if (conflict) throw DiskTableException("UNIQUE constraint failed: ${schema.name}.${handle.columnNames.joinToString(", ")}")
+        }
+    }
+
+    /**
+     * [TableSchema.uniqueConstraints] have no backing index (unlike a `CREATE UNIQUE INDEX`), so
+     * they are checked with a full heap scan per write - the same approach [kestrel.engine.Executor]
+     * uses for the in-memory engine, and the only one that generalizes to a constraint spanning more
+     * than one column without inventing a composite-key index format. A row where any constrained
+     * column is NULL is exempt, per standard SQL (NULLs never collide with each other). Every
+     * comparison is folded through [collationFoldedUniquenessKey], so this scan - unlike
+     * [rejectDuplicateUniqueSecondary]'s B+Tree range scan - is fully collation-correct on every
+     * call, not just at index-creation time: there is no backing structure whose physical byte
+     * order would need to change to keep up.
+     */
+    private fun rejectDuplicateUniqueConstraints(txnId: Long, row: Row, excludeRid: RecordId?) {
+        if (schema.uniqueConstraints.isEmpty()) return
+        val rows = rawScan(txnId)
+        for (unique in schema.uniqueConstraints) {
+            val indices = unique.columns.map { schema.columnIndex(it)!! }
+            val rawKey = indices.map { row.values[it] }
+            if (rawKey.any { it.isNull }) continue
+            val key = collationFoldedUniquenessKey(schema, indices, rawKey)
+            val conflict = rows.any { (candidateRid, candidateRow) ->
+                candidateRid != excludeRid && collationFoldedUniquenessKey(schema, indices, indices.map { candidateRow.values[it] }) == key
+            }
+            if (conflict) {
+                val label = unique.name?.let { " $it" } ?: ""
+                throw DiskTableException("UNIQUE constraint$label failed: ${schema.name}(${unique.columns.joinToString(", ")})")
+            }
+        }
+    }
+
+    /** `null` when the table has no PRIMARY KEY at all; one value per [TableSchema.primaryKeyColumns] otherwise. */
+    private fun primaryKeyValuesOf(row: Row): List<Value>? {
+        val indices = schema.primaryKeyIndices
+        if (indices.isEmpty()) return null
+        return indices.map { row.values[it] }
+    }
+
+    private fun requireArity(row: Row) {
+        if (row.values.size != schema.columns.size) {
+            throw DiskTableException("table ${schema.name} expects ${schema.columns.size} values but got ${row.values.size}")
+        }
+        for ((index, column) in schema.columns.withIndex()) {
+            if (column.notNull && row.values[index].isNull) {
+                throw DiskTableException("NOT NULL constraint failed: ${schema.name}.${column.name}")
+            }
+        }
+    }
+
+    private fun currentRoots(): List<Long> =
+        listOfNotNull(primaryIndex?.rootPageId) + secondaryIndexHandles.map { it.index.rootPageId }
+
+    private fun persistIfRootsChanged(txnId: Long, before: List<Long>) {
+        if (before != currentRoots()) onRootsChanged(txnId)
+    }
+
+    /**
+     * A secondary index's B+Tree key is `encodeKey(values) ++ rid` (see the class doc) - [values]
+     * is folded per-position through [columnIndices]' own declared collation first (mirrors
+     * [encodePrimaryKey]), so a `NOCASE`/`RTRIM`-declared column's index physically groups
+     * case-/trailing-space-variant values together instead of ordering/comparing them by raw bytes.
+     */
+    private fun compositeKey(columnIndices: List<Int>, values: List<Value>, rid: RecordId): ByteArray =
+        ByteWriter().writeBytes(KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, columnIndices, values)))
+            .writeFixedLong(rid.encode()).toByteArray()
+
+    private fun equalRangeFor(columnIndices: List<Int>, values: List<Value>): Pair<ByteArray, ByteArray> {
+        val prefix = KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, columnIndices, values))
+        val lower = ByteWriter().writeBytes(prefix).writeFixedLong(0L).toByteArray()
+        val upper = ByteWriter().writeBytes(prefix).writeFixedLong(-1L).toByteArray()
+        return lower to upper
+    }
+
+    /**
+     * [KeyCodec.encodeKey] on [values] (in [TableSchema.primaryKeyColumns] order) after folding
+     * each position through that column's own declared collation - shared by every PRIMARY KEY
+     * B+Tree operation ([indexRow]/[unindexRow]/[findByPrimaryKey]/[rejectDuplicatePrimaryKey]) so
+     * insertion and lookup always agree on what bytes a given value encodes to.
+     */
+    private fun encodePrimaryKey(values: List<Value>): ByteArray =
+        KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, schema.primaryKeyIndices, values))
+
+    /**
+     * Smallest key ordered strictly after [bytes]. Correct for the fixed-width
+     * encodings (INTEGER, REAL, BOOLEAN): appending a byte cannot be
+     * overtaken by another same-type key, since two distinct fixed-width
+     * encodings always differ within their common, unextended length. TEXT
+     * range queries should prefer an inclusive lower bound instead.
+     */
+    private fun strictlyAfter(bytes: ByteArray): ByteArray = bytes + byteArrayOf(0)
+}
