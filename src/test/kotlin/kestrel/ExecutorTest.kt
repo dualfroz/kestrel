@@ -78,6 +78,72 @@ class ExecutorTest {
     }
 
     @Test
+    fun offsetSkipsLeadingRowsWithoutALimit() {
+        seedUsers()
+        val result = select("SELECT name FROM users ORDER BY age ASC OFFSET 1")
+        assertEquals(listOf(listOf(text("linus")), listOf(text("grace"))), result.rows)
+    }
+
+    @Test
+    fun limitAndOffsetTogetherPageThroughTheOrderedResult() {
+        seedUsers()
+        val result = select("SELECT name FROM users ORDER BY age ASC LIMIT 1 OFFSET 1")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun offsetPastTheEndOfTheResultReturnsNoRows() {
+        seedUsers()
+        val result = select("SELECT name FROM users ORDER BY age ASC OFFSET 100")
+        assertEquals(emptyList<List<Value>>(), result.rows)
+    }
+
+    @Test
+    fun offsetWrittenBeforeLimitStillAppliesLimitAfterTheSkip() {
+        seedUsers()
+        val result = select("SELECT name FROM users ORDER BY age ASC OFFSET 1 LIMIT 1")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun orderByMultipleColumnsBreaksTiesWithTheSecondKey() {
+        run("CREATE TABLE staff (id INTEGER PRIMARY KEY, dept TEXT NOT NULL, name TEXT NOT NULL)")
+        run(
+            "INSERT INTO staff VALUES " +
+                "(1, 'eng', 'guido'), (2, 'eng', 'ada'), (3, 'ops', 'grace'), (4, 'eng', 'linus')"
+        )
+        val result = select("SELECT dept, name FROM staff ORDER BY dept ASC, name ASC")
+        assertEquals(
+            listOf(
+                listOf(text("eng"), text("ada")),
+                listOf(text("eng"), text("guido")),
+                listOf(text("eng"), text("linus")),
+                listOf(text("ops"), text("grace"))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun orderByMultipleColumnsCanMixAscendingAndDescending() {
+        run("CREATE TABLE staff (id INTEGER PRIMARY KEY, dept TEXT NOT NULL, name TEXT NOT NULL)")
+        run(
+            "INSERT INTO staff VALUES " +
+                "(1, 'eng', 'guido'), (2, 'eng', 'ada'), (3, 'ops', 'grace'), (4, 'eng', 'linus')"
+        )
+        val result = select("SELECT dept, name FROM staff ORDER BY dept ASC, name DESC")
+        assertEquals(
+            listOf(
+                listOf(text("eng"), text("linus")),
+                listOf(text("eng"), text("guido")),
+                listOf(text("eng"), text("ada")),
+                listOf(text("ops"), text("grace"))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
     fun projectionSupportsExpressionsAndAliases() {
         seedUsers()
         val result = select("SELECT name AS who, age + 1 AS nextYear FROM users WHERE id = 1")
@@ -196,5 +262,23 @@ class ExecutorTest {
         seedUsers()
         val result = select("SELECT name FROM users WHERE age > 40 AND age < 80")
         assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun temporaryTableSupportsFullCrudJustLikeARegularTable() {
+        run("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, note TEXT NOT NULL)")
+        run("INSERT INTO scratch VALUES (1, 'first'), (2, 'second')")
+        run("UPDATE scratch SET note = 'updated' WHERE id = 1")
+        run("DELETE FROM scratch WHERE id = 2")
+        val result = select("SELECT id, note FROM scratch")
+        assertEquals(listOf(listOf(int(1), text("updated"))), result.rows)
+    }
+
+    @Test
+    fun temporaryTableEnforcesItsOwnPrimaryKeyAndCanBeIndexed() {
+        run("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, tag TEXT)")
+        run("CREATE INDEX scratchTag ON scratch (tag)")
+        run("INSERT INTO scratch VALUES (1, 'a')")
+        assertFailsWith<KestrelException> { run("INSERT INTO scratch VALUES (1, 'b')") }
     }
 }

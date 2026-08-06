@@ -462,4 +462,102 @@ class EvaluatorTest {
 
     private fun cast(operand: Expression, type: ColumnType, precision: Int? = null, scale: Int? = null): Expression =
         CastExpression(operand, type, precision, scale)
+
+    @Test
+    fun castTextToIntegerRealAndBoolean() {
+        assertEquals(Value.IntegerValue(42), evalConstant(cast(textLit("42"), ColumnType.Integer)))
+        assertEquals(Value.RealValue(3.5), evalConstant(cast(textLit("3.5"), ColumnType.Real)))
+        assertEquals(Value.BooleanValue(true), evalConstant(cast(textLit("true"), ColumnType.Boolean)))
+        assertEquals(Value.BooleanValue(false), evalConstant(cast(textLit("FALSE"), ColumnType.Boolean)))
+    }
+
+    @Test
+    fun castTextToDecimalAppliesScale() {
+        val result = evalConstant(cast(textLit("19.999"), ColumnType.Decimal, 10, 2)) as Value.DecimalValue
+        assertEquals("20.00", result.value.toPlainString())
+    }
+
+    @Test
+    fun castTextToDateParsesIsoFormat() {
+        val result = evalConstant(cast(textLit("2024-01-15"), ColumnType.Date))
+        assertEquals(Value.DateValue(LocalDate.of(2024, 1, 15)), result)
+    }
+
+    @Test
+    fun castNumbersAndDatesToText() {
+        assertEquals(Value.TextValue("42"), evalConstant(cast(intLit(42), ColumnType.Text)))
+        assertEquals(
+            Value.TextValue("2024-01-15"),
+            evalConstant(cast(LiteralExpression(Value.DateValue(LocalDate.of(2024, 1, 15))), ColumnType.Text))
+        )
+    }
+
+    @Test
+    fun castOfNullIsAlwaysNull() {
+        assertEquals(Value.NullValue, evalConstant(cast(nullLit, ColumnType.Integer)))
+        assertEquals(Value.NullValue, evalConstant(cast(nullLit, ColumnType.Decimal)))
+    }
+
+    @Test
+    fun castRejectsUnparseableText() {
+        assertFailsWith<KestrelException> { evalConstant(cast(textLit("not a number"), ColumnType.Integer)) }
+        assertFailsWith<KestrelException> { evalConstant(cast(textLit("not a date"), ColumnType.Date)) }
+        assertFailsWith<KestrelException> { evalConstant(cast(textLit("nope"), ColumnType.Boolean)) }
+    }
+
+    @Test
+    fun decimalOverflowBeyondDeclaredPrecisionFails() {
+        assertFailsWith<KestrelException> { evalConstant(cast(textLit("123456"), ColumnType.Decimal, 5, 0)) }
+    }
+
+    @Test
+    fun decimalArithmeticIsExactUnlikeDoubles() {
+        val a = cast(textLit("0.1"), ColumnType.Decimal, 10, 2)
+        val b = cast(textLit("0.2"), ColumnType.Decimal, 10, 2)
+        val sum = evalConstant(bin(BinaryOperator.Add, a, b)) as Value.DecimalValue
+        assertEquals("0.30", sum.value.toPlainString())
+    }
+
+    @Test
+    fun decimalEqualityIgnoresTrailingZeroScale() {
+        val fifteenTenths = LiteralExpression(Value.DecimalValue(BigDecimal("1.50")))
+        val fifteen = LiteralExpression(Value.DecimalValue(BigDecimal("1.5")))
+        assertEquals(Value.BooleanValue(true), evalConstant(bin(BinaryOperator.Equal, fifteenTenths, fifteen)))
+    }
+
+    @Test
+    fun decimalDivisionByZeroFails() {
+        val a = cast(textLit("1"), ColumnType.Decimal, 10, 2)
+        val zero = cast(textLit("0"), ColumnType.Decimal, 10, 2)
+        assertFailsWith<KestrelException> { evalConstant(bin(BinaryOperator.Divide, a, zero)) }
+    }
+
+    @Test
+    fun decimalComparesCorrectlyAgainstIntegerAndReal() {
+        val decimal = LiteralExpression(Value.DecimalValue(BigDecimal("19.99")))
+        assertEquals(Value.BooleanValue(true), evalConstant(bin(BinaryOperator.Less, decimal, intLit(20))))
+        assertEquals(Value.BooleanValue(true), evalConstant(bin(BinaryOperator.Greater, decimal, realLit(19.98))))
+    }
+
+    private fun dateLit(value: LocalDate): Expression = LiteralExpression(Value.DateValue(value))
+
+    @Test
+    fun addingAndSubtractingIntegerDaysFromADate() {
+        val start = dateLit(LocalDate.of(2024, 1, 1))
+        assertEquals(Value.DateValue(LocalDate.of(2024, 1, 6)), evalConstant(bin(BinaryOperator.Add, start, intLit(5))))
+        assertEquals(Value.DateValue(LocalDate.of(2023, 12, 27)), evalConstant(bin(BinaryOperator.Subtract, start, intLit(5))))
+    }
+
+    @Test
+    fun subtractingTwoDatesYieldsIntegerDayDifference() {
+        val later = dateLit(LocalDate.of(2024, 1, 10))
+        val earlier = dateLit(LocalDate.of(2024, 1, 1))
+        assertEquals(Value.IntegerValue(9), evalConstant(bin(BinaryOperator.Subtract, later, earlier)))
+    }
+
+    @Test
+    fun multiplyingADateFails() {
+        val start = dateLit(LocalDate.of(2024, 1, 1))
+        assertFailsWith<KestrelException> { evalConstant(bin(BinaryOperator.Multiply, start, intLit(2))) }
+    }
 }
