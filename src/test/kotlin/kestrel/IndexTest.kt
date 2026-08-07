@@ -112,4 +112,54 @@ class IndexTest {
     fun droppingUnknownIndexIsRejected() {
         assertFailsWith<KestrelException> { run("DROP INDEX ghost") }
     }
+
+    @Test
+    fun createUniqueIndexRejectsADuplicateOnInsert() {
+        seed()
+        run("CREATE UNIQUE INDEX idxName ON users (name)")
+        assertFailsWith<KestrelException> { run("INSERT INTO users VALUES (6, 'ada', 21)") }
+    }
+
+    @Test
+    fun createUniqueIndexRejectsADuplicateOnUpdate() {
+        seed()
+        run("CREATE UNIQUE INDEX idxName ON users (name)")
+        assertFailsWith<KestrelException> { run("UPDATE users SET name = 'ada' WHERE name = 'linus'") }
+    }
+
+    @Test
+    fun createUniqueIndexAllowsMultipleNulls() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT)")
+        run("CREATE UNIQUE INDEX idxTag ON t (tag)")
+        run("INSERT INTO t VALUES (1, NULL), (2, NULL)")
+        assertEquals(2, select("SELECT id FROM t").rows.size)
+    }
+
+    @Test
+    fun creatingAUniqueIndexOverExistingDuplicatesFails() {
+        seed()
+        run("INSERT INTO users VALUES (6, 'ada', 21)")
+        assertFailsWith<KestrelException> { run("CREATE UNIQUE INDEX idxName ON users (name)") }
+        // A failed creation must not leave a half-built index registered under the name.
+        run("CREATE INDEX idxName ON users (name)")
+    }
+
+    @Test
+    fun uniqueIndexStillAcceleratesEqualityLookups() {
+        seed()
+        run("CREATE UNIQUE INDEX idxName ON users (name)")
+        val plan = explain("EXPLAIN SELECT id FROM users WHERE name = 'ada'")
+        assertTrue(plan.any { it.contains("Index Scan using idxName") }, "expected index scan, got $plan")
+    }
+
+    @Test
+    fun rollbackAfterAFailedInsertLeavesTheUniqueIndexUsable() {
+        seed()
+        run("CREATE UNIQUE INDEX idxName ON users (name)")
+        run("BEGIN")
+        assertFailsWith<KestrelException> { run("INSERT INTO users VALUES (6, 'ada', 21)") }
+        run("ROLLBACK")
+        run("INSERT INTO users VALUES (6, 'zoe', 21)")
+        assertEquals(6, select("SELECT id FROM users").rows.size)
+    }
 }

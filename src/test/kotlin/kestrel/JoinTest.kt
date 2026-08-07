@@ -59,6 +59,110 @@ class JoinTest {
         assertEquals(listOf(text("ada"), int(100)), result.rows[3])
     }
 
+    private fun seedWithOrphanOrder() {
+        seed()
+        // References a userId that does not exist, giving RIGHT/FULL JOIN an unmatched right row.
+        run("INSERT INTO orders VALUES (13, 99, 999)")
+    }
+
+    @Test
+    fun rightJoinKeepsUnmatchedRightRowsWithNulls() {
+        seedWithOrphanOrder()
+        val result = select(
+            "SELECT u.name, o.total FROM users u RIGHT JOIN orders o ON u.id = o.userId ORDER BY o.id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("ada"), int(100)),
+                listOf(text("ada"), int(40)),
+                listOf(text("linus"), int(70)),
+                listOf(Value.NullValue, int(999))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rightJoinDropsUnmatchedLeftRows() {
+        seedWithOrphanOrder()
+        val result = select("SELECT u.name FROM users u RIGHT JOIN orders o ON u.id = o.userId")
+        assertTrue(result.rows.none { it == listOf(text("grace")) }, "got ${result.rows}")
+    }
+
+    @Test
+    fun fullJoinKeepsBothUnmatchedSides() {
+        seedWithOrphanOrder()
+        val result = select("SELECT u.name, o.total FROM users u FULL JOIN orders o ON u.id = o.userId")
+        assertEquals(
+            setOf(
+                listOf(text("ada"), int(100)),
+                listOf(text("ada"), int(40)),
+                listOf(text("linus"), int(70)),
+                listOf(text("grace"), Value.NullValue),
+                listOf(Value.NullValue, int(999))
+            ),
+            result.rows.toSet()
+        )
+        assertEquals(5, result.rows.size)
+    }
+
+    @Test
+    fun fullJoinHashAndNestedLoopProduceSameResult() {
+        seedWithOrphanOrder()
+        val hashed = select(
+            "SELECT u.name, o.total FROM users u FULL JOIN orders o ON u.id = o.userId"
+        ).rows.toSet()
+        val nested = select(
+            "SELECT u.name, o.total FROM users u FULL JOIN orders o ON u.id >= o.userId AND u.id <= o.userId"
+        ).rows.toSet()
+        assertEquals(hashed, nested)
+    }
+
+    @Test
+    fun rightJoinPadsWithFullWidthOfAllPrecedingTablesInAChain() {
+        seed()
+        run("CREATE TABLE items (orderId INTEGER, label TEXT)")
+        // orderId 99 matches no `orders` row, so it can only survive via the RIGHT JOIN's own
+        // unmatched-right padding - proving that padding spans BOTH preceding tables (users AND
+        // orders), not just orders (the immediate left side of this particular JOIN).
+        run("INSERT INTO items VALUES (10, 'book'), (99, 'orphanItem')")
+        val result = select(
+            "SELECT u.name, o.total, i.label FROM users u " +
+                "JOIN orders o ON u.id = o.userId " +
+                "RIGHT JOIN items i ON o.id = i.orderId"
+        )
+        assertEquals(
+            setOf(
+                listOf(text("ada"), int(100), text("book")),
+                listOf(Value.NullValue, Value.NullValue, text("orphanItem"))
+            ),
+            result.rows.toSet()
+        )
+        assertEquals(2, result.rows.size)
+    }
+
+    @Test
+    fun rightAndFullJoinAcceptOptionalOuterKeyword() {
+        seed()
+        assertEquals(
+            select("SELECT u.name FROM users u RIGHT JOIN orders o ON u.id = o.userId").rows.toSet(),
+            select("SELECT u.name FROM users u RIGHT OUTER JOIN orders o ON u.id = o.userId").rows.toSet()
+        )
+        assertEquals(
+            select("SELECT u.name FROM users u FULL JOIN orders o ON u.id = o.userId").rows.toSet(),
+            select("SELECT u.name FROM users u FULL OUTER JOIN orders o ON u.id = o.userId").rows.toSet()
+        )
+    }
+
+    @Test
+    fun plannerDescribesRightAndFullJoinLabels() {
+        seed()
+        val rightNested = explain("EXPLAIN SELECT u.name FROM users u RIGHT JOIN orders o ON u.id < o.userId")
+        assertTrue(rightNested.any { it.contains("Nested Loop Right") }, "got $rightNested")
+        val fullHash = explain("EXPLAIN SELECT u.name FROM users u FULL JOIN orders o ON u.id = o.userId")
+        assertTrue(fullHash.any { it.contains("Hash Join") }, "got $fullHash")
+    }
+
     @Test
     fun hashJoinAndNestedLoopProduceSameResult() {
         seed()
@@ -114,5 +218,42 @@ class JoinTest {
         assertFailsWith<KestrelException> {
             select("SELECT id FROM users u JOIN orders o ON u.id = o.userId")
         }
+    }
+
+    @Test
+    fun crossJoinProducesTheFullCartesianProduct() {
+        run("CREATE TABLE colors (name TEXT)")
+        run("CREATE TABLE sizes (label TEXT)")
+        run("INSERT INTO colors VALUES ('red'), ('blue')")
+        run("INSERT INTO sizes VALUES ('s'), ('m'), ('l')")
+        val result = select("SELECT colors.name, sizes.label FROM colors CROSS JOIN sizes ORDER BY colors.name, sizes.label")
+        assertEquals(
+            listOf(
+                listOf(text("blue"), text("l")), listOf(text("blue"), text("m")), listOf(text("blue"), text("s")),
+                listOf(text("red"), text("l")), listOf(text("red"), text("m")), listOf(text("red"), text("s"))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun crossJoinNeverUsesHashJoinAndIsDescribedAsCrossInExplain() {
+        run("CREATE TABLE colors (name TEXT)")
+        run("CREATE TABLE sizes (label TEXT)")
+        val plan = explain("EXPLAIN SELECT colors.name FROM colors CROSS JOIN sizes")
+        assertTrue(plan.any { it.contains("Nested Loop Cross") }, "got $plan")
+        assertTrue(plan.none { it.contains("Hash Join") }, "got $plan")
+    }
+
+    @Test
+    fun crossJoinChainedWithAFilterActsLikeAnExplicitCartesianJoin() {
+        seed()
+        val cross = select(
+            "SELECT u.name, o.total FROM users u CROSS JOIN orders o WHERE u.id = o.userId ORDER BY o.total ASC"
+        ).rows
+        val inner = select(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.userId ORDER BY o.total ASC"
+        ).rows
+        assertEquals(inner, cross)
     }
 }
