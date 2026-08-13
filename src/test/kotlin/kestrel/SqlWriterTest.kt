@@ -643,3 +643,321 @@ class SqlWriterTest {
         // (not just the value 10 already sitting in the dump's INSERT statement).
         freshExecutor.execute(Parser(Lexer("INSERT INTO t (a) VALUES (7)").tokenize()).parseProgram().single())
 
+        val result = freshExecutor.execute(
+            Parser(Lexer("SELECT b FROM t ORDER BY a ASC").tokenize()).parseProgram().single()
+        ) as SelectResult
+        assertEquals(listOf(listOf(Value.IntegerValue(10)), listOf(Value.IntegerValue(14))), result.rows)
+    }
+
+    @Test
+    fun dumpAfterAlterTableAddColumnReflectsTheNewShape() {
+        seed()
+        run("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'new'")
+        val dump = SqlWriter.dump(catalog)
+        assertTrue(dump.contains("status TEXT DEFAULT 'new'"))
+
+        val freshCatalog = Catalog()
+        val freshExecutor = Executor(freshCatalog)
+        Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
+        val result = freshExecutor.execute(
+            Parser(Lexer("SELECT status FROM t WHERE id = 1").tokenize()).parseProgram().single()
+        ) as SelectResult
+        assertEquals(listOf(listOf(text("new"))), result.rows)
+    }
+
+    @Test
+    fun dumpAndReplayAfterAlterTableAddColumnGeneratedPreservesTheExpressionAndBackfilledValues() {
+        run("CREATE TABLE t (a INTEGER)")
+        run("INSERT INTO t (a) VALUES (5)")
+        run("ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a * 2) STORED")
+        val dump = SqlWriter.dump(catalog)
+        assertTrue(dump.contains("GENERATED ALWAYS AS"), dump)
+
+        val freshCatalog = Catalog()
+        val freshExecutor = Executor(freshCatalog)
+        Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
+        // A row inserted only AFTER replay proves the GENERATED expression itself round-tripped,
+        // not just the value backfilled into row a=5 before the dump was taken.
+        freshExecutor.execute(Parser(Lexer("INSERT INTO t (a) VALUES (7)").tokenize()).parseProgram().single())
+
+        val result = freshExecutor.execute(
+            Parser(Lexer("SELECT b FROM t ORDER BY a ASC").tokenize()).parseProgram().single()
+        ) as SelectResult
+        assertEquals(listOf(listOf(Value.IntegerValue(10)), listOf(Value.IntegerValue(14))), result.rows)
+    }
+
+    @Test
+    fun createCompositeUniqueIndexRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+        writeThenReplay("CREATE UNIQUE INDEX idx_ab ON t (a, b)")
+        run("INSERT INTO t VALUES (1, 1, 1)")
+        assertFailsWith<KestrelException> { run("INSERT INTO t VALUES (2, 1, 1)") }
+        run("INSERT INTO t VALUES (3, 1, 2)")
+    }
+
+    @Test
+    fun dumpAndReplayPreservesACompositeUniqueIndex() {
+        run("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+        run("CREATE UNIQUE INDEX idx_ab ON t (a, b)")
+        run("INSERT INTO t VALUES (1, 1, 1)")
+        val dump = SqlWriter.dump(catalog)
+        assertTrue(dump.contains("CREATE UNIQUE INDEX idx_ab ON t (a, b);"))
+
+        val freshCatalog = Catalog()
+        val freshExecutor = Executor(freshCatalog)
+        Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
+
+        assertFailsWith<KestrelException> {
+            Parser(Lexer("INSERT INTO t VALUES (2, 1, 1)").tokenize()).parseProgram()
+                .forEach { freshExecutor.execute(it) }
+        }
+    }
+
+    @Test
+    fun createViewOverAWindowFunctionRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)")
+        run(
+            "INSERT INTO employees VALUES (1, 'eng', 300), (2, 'eng', 400), (3, 'sales', 150)"
+        )
+        val statement = parseOne(
+            "CREATE VIEW ranked AS SELECT id, dept, " +
+                "RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS r FROM employees"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("OVER (PARTITION BY dept ORDER BY salary DESC)"), rendered)
+        run(rendered)
+        val result = select("SELECT id, r FROM ranked ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(Value.IntegerValue(1), Value.IntegerValue(2)),
+                listOf(Value.IntegerValue(2), Value.IntegerValue(1)),
+                listOf(Value.IntegerValue(3), Value.IntegerValue(1))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun dumpAndReplayOfAWindowFunctionViewPreservesTheOverClause() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)")
+        run("INSERT INTO employees VALUES (1, 'eng', 300), (2, 'eng', 400)")
+        run(
+            "CREATE VIEW totals AS SELECT id, SUM(salary) OVER (PARTITION BY dept) AS deptTotal FROM employees"
+        )
+        val dump = SqlWriter.dump(catalog)
+        assertTrue(dump.contains("OVER (PARTITION BY dept)"), dump)
+
+        val freshCatalog = Catalog()
+        val freshExecutor = Executor(freshCatalog)
+        Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
+        val result = Parser(Lexer("SELECT deptTotal FROM totals ORDER BY id ASC").tokenize()).parseProgram().single()
+            .let { freshExecutor.execute(it) } as SelectResult
+        assertEquals(listOf(listOf(Value.IntegerValue(700)), listOf(Value.IntegerValue(700))), result.rows)
+    }
+
+    @Test
+    fun createViewOverLagWithOffsetAndDefaultRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)")
+        run("INSERT INTO employees VALUES (1, 'eng', 400), (2, 'eng', 300)")
+        val statement = parseOne(
+            "CREATE VIEW withPrev AS SELECT id, dept, " +
+                "LAG(salary, 1, 0) OVER (PARTITION BY dept ORDER BY salary DESC) AS prevSalary FROM employees"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("LAG(salary, 1, 0) OVER (PARTITION BY dept ORDER BY salary DESC)"), rendered)
+        run(rendered)
+        val result = select("SELECT id, prevSalary FROM withPrev ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(Value.IntegerValue(1), Value.IntegerValue(0)),
+                listOf(Value.IntegerValue(2), Value.IntegerValue(400))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun createViewOverAnExplicitRowsFrameRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept TEXT, salary INTEGER)")
+        run("INSERT INTO employees VALUES (1, 'eng', 300), (2, 'eng', 400), (3, 'eng', 100)")
+        val statement = parseOne(
+            "CREATE VIEW moving AS SELECT id, dept, " +
+                "SUM(salary) OVER (PARTITION BY dept ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(
+            rendered.contains("OVER (PARTITION BY dept ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"),
+            rendered
+        )
+        run(rendered)
+        val result = select("SELECT id, s FROM moving ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(Value.IntegerValue(1), Value.IntegerValue(300)),
+                listOf(Value.IntegerValue(2), Value.IntegerValue(700)),
+                listOf(Value.IntegerValue(3), Value.IntegerValue(500))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rowsFrameShorthandIsWrittenBackOutInCanonicalBetweenForm() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, salary INTEGER)")
+        run("INSERT INTO employees VALUES (1, 400), (2, 300)")
+        val statement = parseOne(
+            "CREATE VIEW shorthand AS SELECT id, SUM(salary) OVER (ORDER BY id ROWS 1 PRECEDING) AS s FROM employees"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"), rendered)
+    }
+
+    @Test
+    fun unboundedFrameBoundsRoundTripThroughSqlWriter() {
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, salary INTEGER)")
+        run("INSERT INTO employees VALUES (1, 400), (2, 300)")
+        val statement = parseOne(
+            "CREATE VIEW wholePartition AS SELECT id, " +
+                "SUM(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM employees"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"), rendered)
+    }
+
+    @Test
+    fun createViewOverAnExplicitRangeFrameRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
+        val statement = parseOne(
+            "CREATE VIEW valueTotals AS SELECT id, " +
+                "SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s FROM sales"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("OVER (ORDER BY amount RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)"), rendered)
+        run(rendered)
+        val result = select("SELECT id, s FROM valueTotals ORDER BY id ASC")
+        assertEquals(
+            listOf(50L, 80L, 80L, 70L, 50L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun createViewOverAnExcludeCurrentRowFrameRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
+        val statement = parseOne(
+            "CREATE VIEW excludingSelf AS SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW" +
+                ") AS s FROM sales"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(
+            rendered.contains("ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW"),
+            rendered
+        )
+        run(rendered)
+        val result = select("SELECT id, s FROM excludingSelf ORDER BY id ASC")
+        assertEquals(
+            listOf(120L, 110L, 110L, 100L, 80L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun createViewOverAnExplicitGroupsFrameRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
+        val statement = parseOne(
+            "CREATE VIEW groupTotals AS SELECT id, " +
+                "SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM sales"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"), rendered)
+        run(rendered)
+        val result = select("SELECT id, s FROM groupTotals ORDER BY id ASC")
+        assertEquals(
+            listOf(50L, 80L, 80L, 120L, 80L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun excludeNoOthersIsOmittedFromRenderedSqlSinceItIsTheDefault() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20)")
+        val statement = parseOne(
+            "CREATE VIEW totals AS SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS" +
+                ") AS s FROM sales"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(!rendered.contains("EXCLUDE"), rendered)
+    }
+
+    @Test
+    fun insertOnConflictDoNothingRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        run("INSERT INTO accounts VALUES (1, 100)")
+        val statement = parseOne("INSERT INTO accounts VALUES (1, 999) ON CONFLICT (id) DO NOTHING")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ON CONFLICT (id) DO NOTHING"), rendered)
+        run(rendered)
+        assertEquals(listOf(listOf(Value.IntegerValue(100))), select("SELECT balance FROM accounts WHERE id = 1").rows)
+    }
+
+    @Test
+    fun insertOnConflictDoUpdateWithExcludedAndWhereRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        run("INSERT INTO accounts VALUES (1, 100)")
+        val statement = parseOne(
+            "INSERT INTO accounts VALUES (1, 50) ON CONFLICT (id) DO UPDATE SET balance = accounts.balance + excluded.balance WHERE excluded.balance > 0"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ON CONFLICT (id) DO UPDATE SET balance = (accounts.balance + excluded.balance) WHERE (excluded.balance > 0)"), rendered)
+        run(rendered)
+        assertEquals(listOf(listOf(Value.IntegerValue(150))), select("SELECT balance FROM accounts WHERE id = 1").rows)
+    }
+
+    @Test
+    fun createTriggerRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("CREATE TABLE audit (order_id INTEGER)")
+        val statement = parseOne(
+            "CREATE TRIGGER log_insert AFTER INSERT ON orders FOR EACH ROW WHEN NEW.amount > 0 " +
+                "BEGIN INSERT INTO audit VALUES (NEW.id); END"
+        )
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("CREATE TRIGGER log_insert AFTER INSERT ON orders FOR EACH ROW WHEN"), rendered)
+        assertTrue(rendered.contains("INSERT INTO audit VALUES (NEW.id)"), rendered)
+        run(rendered)
+        run("INSERT INTO orders VALUES (1, 50)")
+        assertEquals(listOf(listOf(Value.IntegerValue(1))), select("SELECT order_id FROM audit").rows)
+    }
+
+    @Test
+    fun dropTriggerRoundTripsThroughSqlWriter() {
+        run("CREATE TABLE t (id INTEGER)")
+        run("CREATE TRIGGER log AFTER INSERT ON t FOR EACH ROW BEGIN DELETE FROM t WHERE 1 = 0; END")
+        val rendered = SqlWriter.write(parseOne("DROP TRIGGER log"))
+        assertEquals("DROP TRIGGER log;", rendered)
+        run(rendered)
+        assertFailsWith<KestrelException> { run("DROP TRIGGER log") }
+    }
+
+    @Test
+    fun createSequenceRoundTripsThroughSqlWriter() {
+        val statement = parseOne("CREATE SEQUENCE seq START WITH 5 INCREMENT BY 2 MAXVALUE 100 CYCLE")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("CREATE SEQUENCE seq"), rendered)
+        assertTrue(rendered.contains("INCREMENT BY 2"), rendered)
+        assertTrue(rendered.contains("MAXVALUE 100"), rendered)
+        assertTrue(rendered.contains("START WITH 5"), rendered)
+        assertTrue(rendered.contains("CYCLE"), rendered)
+        run(rendered)
+        run("CREATE TABLE t (id INTEGER)")
+        run("INSERT INTO t VALUES (NEXTVAL('seq'))")
+        assertEquals(listOf(listOf(Value.IntegerValue(5))), select("SELECT id FROM t").rows)
+    }
+
