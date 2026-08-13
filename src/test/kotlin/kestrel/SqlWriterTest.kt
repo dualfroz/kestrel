@@ -961,3 +961,129 @@ class SqlWriterTest {
         assertEquals(listOf(listOf(Value.IntegerValue(5))), select("SELECT id FROM t").rows)
     }
 
+    @Test
+    fun dropSequenceRoundTripsThroughSqlWriter() {
+        run("CREATE SEQUENCE seq")
+        val rendered = SqlWriter.write(parseOne("DROP SEQUENCE seq"))
+        assertEquals("DROP SEQUENCE seq;", rendered)
+        run(rendered)
+        assertFailsWith<KestrelException> { run("DROP SEQUENCE seq") }
+    }
+
+    @Test
+    fun alterSequenceRoundTripsThroughSqlWriter() {
+        run("CREATE SEQUENCE seq")
+        val statement = parseOne("ALTER SEQUENCE seq INCREMENT BY 5 RESTART WITH 20")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("ALTER SEQUENCE seq"), rendered)
+        assertTrue(rendered.contains("INCREMENT BY 5"), rendered)
+        assertTrue(rendered.contains("RESTART WITH 20"), rendered)
+        run(rendered)
+        run("CREATE TABLE t (id INTEGER)")
+        run("INSERT INTO t VALUES (NEXTVAL('seq'))")
+        assertEquals(listOf(listOf(Value.IntegerValue(20))), select("SELECT id FROM t").rows)
+    }
+
+    @Test
+    fun nextvalDefaultRoundTripsThroughSqlWriter() {
+        run("CREATE SEQUENCE seq")
+        val statement = parseOne("CREATE TABLE orders (id INTEGER DEFAULT NEXTVAL('seq'))")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("DEFAULT NEXTVAL('seq')"), rendered)
+        run(rendered)
+        run("INSERT INTO orders (id) VALUES (DEFAULT)")
+        assertEquals(listOf(listOf(Value.IntegerValue(1))), select("SELECT id FROM orders").rows)
+    }
+
+    @Test
+    fun currvalRoundTripsThroughSqlWriter() {
+        run("CREATE SEQUENCE seq")
+        run("CREATE TABLE t (id INTEGER)")
+        run("INSERT INTO t VALUES (NEXTVAL('seq'))")
+        val statement = parseOne("UPDATE t SET id = CURRVAL('seq')")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.contains("CURRVAL('seq')"), rendered)
+        run(rendered)
+        assertEquals(listOf(listOf(Value.IntegerValue(1))), select("SELECT id FROM t").rows)
+    }
+
+    /**
+     * `RETURNING` is a statement-level, query-time-only clause: its output was already consumed by
+     * whoever issued the statement (the REPL printed it, or a caller read the [StatementResult]), so
+     * replaying the write on reopen has no reason to recompute or re-print it - only the write itself
+     * needs to survive. [SqlWriter] therefore never round-trips it, matching that a persisted dump
+     * replayed on reopen is a silent process ([kestrel.cli.Repl]'s own `replaying` flag suppresses
+     * [kestrel.cli.Repl.printResult] during it) with nothing to print RETURNING's rows to anyway.
+     */
+    @Test
+    fun returningClauseIsDroppedFromThePersistedSql() {
+        seed()
+        val insert = parseOne("INSERT INTO t VALUES (4, 'd', 'baroness') RETURNING id")
+        val renderedInsert = SqlWriter.write(insert)
+        assertTrue(!renderedInsert.contains("RETURNING"), renderedInsert)
+        run(renderedInsert)
+        assertEquals(listOf(listOf(text("d"))), select("SELECT category FROM t WHERE id = 4").rows)
+
+        val update = parseOne("UPDATE t SET category = 'z' WHERE id = 4 RETURNING category")
+        assertTrue(!SqlWriter.write(update).contains("RETURNING"))
+
+        val delete = parseOne("DELETE FROM t WHERE id = 4 RETURNING id")
+        assertTrue(!SqlWriter.write(delete).contains("RETURNING"))
+    }
+
+    /** Same reasoning as [returningClauseIsDroppedFromThePersistedSql], now for MERGE's own RETURNING. */
+    @Test
+    fun mergeReturningClauseIsDroppedFromThePersistedSqlButTheMutationStillReplays() {
+        run("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        run("CREATE TABLE staging (id INTEGER, amount INTEGER)")
+        run("INSERT INTO accounts VALUES (1, 100)")
+        run("INSERT INTO staging VALUES (1, 10)")
+        val merge = parseOne(
+            "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                "WHEN MATCHED THEN UPDATE SET balance = accounts.balance + staging.amount " +
+                "RETURNING id, MERGE_ACTION()"
+        )
+        val rendered = SqlWriter.write(merge)
+        assertTrue(!rendered.contains("RETURNING"), rendered)
+        assertTrue(!rendered.contains("MERGE_ACTION"), rendered)
+        run(rendered)
+        assertEquals(listOf(listOf(Value.IntegerValue(110))), select("SELECT balance FROM accounts").rows)
+    }
+
+    @Test
+    fun writeOfATemporaryCreateTableIncludesTheTemporaryKeyword() {
+        val statement = parseOne("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY)")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.startsWith("CREATE TEMPORARY TABLE scratch ("), rendered)
+    }
+
+    @Test
+    fun writeOfARegularCreateTableOmitsTheTemporaryKeyword() {
+        val statement = parseOne("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        val rendered = SqlWriter.write(statement)
+        assertTrue(rendered.startsWith("CREATE TABLE t ("), rendered)
+    }
+
+    /**
+     * The direct, single-function counterpart to [kestrel.PersistenceTest]'s full
+     * checkpoint-reopen tests: proves [SqlWriter.dump] itself never mentions a TEMP table (or its
+     * rows, or an index/trigger defined on it), rather than relying on the round trip through
+     * [kestrel.persistence.Persistence]/[kestrel.cli.Repl] to demonstrate the same thing indirectly.
+     */
+    @Test
+    fun dumpOmitsATemporaryTableItsRowsItsIndexAndItsTriggerEntirely() {
+        run("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, tag TEXT)")
+        run("CREATE INDEX scratchTag ON scratch (tag)")
+        run("CREATE TRIGGER scratchGuard BEFORE INSERT ON scratch FOR EACH ROW BEGIN DELETE FROM scratch WHERE id = -1; END")
+        run("INSERT INTO scratch VALUES (1, 'x')")
+        run("CREATE TABLE regular (id INTEGER PRIMARY KEY)")
+        run("INSERT INTO regular VALUES (9)")
+
+        val dump = SqlWriter.dump(catalog)
+        assertTrue(!dump.contains("scratch", ignoreCase = true), dump)
+        assertTrue(dump.contains("CREATE TABLE regular ("), dump)
+        assertTrue(dump.contains("INSERT INTO regular VALUES (9)"), dump)
+    }
+
+    private fun exec(sql: String): StatementResult = run(sql).single()
+}
