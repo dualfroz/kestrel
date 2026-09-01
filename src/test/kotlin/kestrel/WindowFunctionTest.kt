@@ -151,3 +151,156 @@ class WindowFunctionTest {
         )
     }
 
+    @Test
+    fun countStarOverPartitionCountsRowsRegardlessOfNulls() {
+        seed()
+        run("INSERT INTO employees VALUES (7, 3, 'unpaid', NULL)")
+        val result = select(
+            "SELECT COUNT(*) OVER (PARTITION BY deptId) AS n, COUNT(salary) OVER (PARTITION BY deptId) AS paid " +
+                "FROM employees WHERE deptId = 3"
+        )
+        assertEquals(listOf(listOf(int(1), int(0))), result.rows)
+    }
+
+    @Test
+    fun windowFunctionOverAJoinPartitionsByTheJoinedColumn() {
+        seed()
+        val result = select(
+            "SELECT e.name, d.name AS dept, " +
+                "ROW_NUMBER() OVER (PARTITION BY d.name ORDER BY e.salary DESC) AS rn " +
+                "FROM employees e JOIN departments d ON e.deptId = d.id " +
+                "WHERE d.name = 'eng' ORDER BY rn ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("ada"), text("eng"), int(1)),
+                listOf(text("linus"), text("eng"), int(2)),
+                listOf(text("grace"), text("eng"), int(3))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun orderByCanReferenceAWindowFunctionByItsProjectionAlias() {
+        seed()
+        val result = select(
+            "SELECT id, RANK() OVER (ORDER BY salary DESC) AS r FROM employees ORDER BY r ASC, id ASC"
+        )
+        assertEquals((1..6).map { it.toLong() }, result.rows.map { (it[0] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInWhere() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT id FROM employees WHERE ROW_NUMBER() OVER (ORDER BY id) = 1")
+        }
+        assertTrue(error.message!!.contains("WHERE"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInGroupBy() {
+        seed()
+        assertFailsWith<KestrelException> {
+            run("SELECT COUNT(*) FROM employees GROUP BY ROW_NUMBER() OVER (ORDER BY id)")
+        }
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInHaving() {
+        seed()
+        assertFailsWith<KestrelException> {
+            run("SELECT deptId, COUNT(*) FROM employees GROUP BY deptId HAVING ROW_NUMBER() OVER (ORDER BY deptId) > 1")
+        }
+    }
+
+    @Test
+    fun windowFunctionCannotBeCombinedWithGroupByInTheSameQuery() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT deptId, COUNT(*), ROW_NUMBER() OVER (ORDER BY deptId) FROM employees GROUP BY deptId")
+        }
+        assertTrue(error.message!!.contains("combined"), error.message!!)
+    }
+
+    @Test
+    fun rankRequiresAnOrderByInsideOver() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT RANK() OVER (PARTITION BY deptId) FROM employees")
+        }
+        assertTrue(error.message!!.contains("ORDER BY"), error.message!!)
+    }
+
+    @Test
+    fun denseRankRequiresAnOrderByInsideOver() {
+        seed()
+        assertFailsWith<KestrelException> {
+            run("SELECT DENSE_RANK() OVER (PARTITION BY deptId) FROM employees")
+        }
+    }
+
+    @Test
+    fun nestedWindowFunctionsAreRejected() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(salary) OVER (ORDER BY ROW_NUMBER() OVER (ORDER BY id)) FROM employees")
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun explainDoesNotFailOnAQueryWithAWindowFunction() {
+        seed()
+        val plan = explain("EXPLAIN SELECT id, ROW_NUMBER() OVER (PARTITION BY deptId ORDER BY salary DESC) FROM employees")
+        assertTrue(plan.isNotEmpty())
+    }
+
+    @Test
+    fun selectStarWithAWindowFunctionOnlyInOrderByDoesNotLeakTheExtraColumn() {
+        seed()
+        val result = select("SELECT * FROM departments ORDER BY ROW_NUMBER() OVER (ORDER BY id) DESC")
+        assertEquals(listOf("id", "name"), result.columns)
+        assertEquals(listOf(listOf(int(2), text("sales")), listOf(int(1), text("eng"))), result.rows)
+    }
+
+    @Test
+    fun lagReturnsThePreviousRowsValueWithinEachPartitionAndNullAtTheEdge() {
+        seed()
+        val result = select(
+            "SELECT id, LAG(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS prev " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(null, 400L, 400L, null, 200L, 200L),
+            result.rows.map { (it[1] as? Value.IntegerValue)?.value }
+        )
+    }
+
+    @Test
+    fun leadReturnsTheNextRowsValueWithinEachPartitionAndNullAtTheEdge() {
+        seed()
+        val result = select(
+            "SELECT id, LEAD(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS next " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(400L, 300L, null, 200L, 100L, null),
+            result.rows.map { (it[1] as? Value.IntegerValue)?.value }
+        )
+    }
+
+    @Test
+    fun lagWithAnExplicitOffsetSkipsMultipleRows() {
+        seed()
+        val result = select(
+            "SELECT id, LAG(salary, 2) OVER (PARTITION BY deptId ORDER BY salary DESC) AS prev2 " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(null, null, 400L, null, null, 200L),
+            result.rows.map { (it[1] as? Value.IntegerValue)?.value }
+        )
+    }
+
