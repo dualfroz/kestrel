@@ -304,3 +304,634 @@ class WindowFunctionTest {
         )
     }
 
+    @Test
+    fun lagPastThePartitionEdgeFallsBackToTheDefaultExpressionInsteadOfNull() {
+        seed()
+        val result = select(
+            "SELECT id, LAG(salary, 1, 0) OVER (PARTITION BY deptId ORDER BY salary DESC) AS prev " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(0L, 400L, 400L, 0L, 200L, 200L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun lagOffsetMustNotBeNegative() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT LAG(salary, -1) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun lagOffsetMustBeAnInteger() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT LAG(salary, 1.5) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun firstValueReturnsTheFirstRowsValueForEveryRowInThePartition() {
+        seed()
+        val result = select(
+            "SELECT id, FIRST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS top " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(400L, 400L, 400L, 200L, 200L, 200L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun lastValueSharesOneValuePerPeerGroupRatherThanTheWholePartition() {
+        seed()
+        val result = select(
+            "SELECT id, LAST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS lv " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(400L, 400L, 300L, 200L, 200L, 100L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun lastValueWithoutOverOrderByUsesTheWholePartitionsLastRow() {
+        seed()
+        val result = select(
+            "SELECT id, LAST_VALUE(salary) OVER (PARTITION BY deptId) AS lv FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(300L, 300L, 300L, 100L, 100L, 100L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileSplitsEachPartitionIntoAsEvenBucketsAsPossible() {
+        seed()
+        val result = select(
+            "SELECT id, NTILE(2) OVER (PARTITION BY deptId ORDER BY salary DESC) AS bucket " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(1L, 1L, 2L, 1L, 1L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileWithMoreBucketsThanRowsLeavesTheHighestBucketsUnused() {
+        seed()
+        val result = select(
+            "SELECT id, NTILE(5) OVER (PARTITION BY deptId ORDER BY salary DESC) AS bucket " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(1L, 2L, 3L, 1L, 2L, 3L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileBucketCountMustBePositive() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT NTILE(0) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("positive"), error.message!!)
+    }
+
+    @Test
+    fun ntileBucketCountMustBeAnInteger() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT NTILE(1.5) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionNestedInsideLagsOffsetIsRejected() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT LAG(salary, ROW_NUMBER() OVER (ORDER BY id)) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun explicitRowsFrameProducesAMovingAverageInsteadOfARunningTotal() {
+        seed()
+        val result = select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(400L, 800L, 700L, 200L, 400L, 300L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun rowsBetweenCurrentRowAndFollowingLooksForward() {
+        seed()
+        val result = select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(800L, 700L, 300L, 400L, 300L, 100L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    @Test
+    fun rowsBetweenUnboundedPrecedingAndCurrentRowMatchesTheImplicitDefaultOnAUniqueOrderKey() {
+        seed()
+        val explicit = select(
+            "SELECT id, SUM(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        val implicit = select("SELECT id, SUM(salary) OVER (ORDER BY id) AS s FROM employees ORDER BY id ASC")
+        assertEquals(implicit.rows, explicit.rows)
+    }
+
+    @Test
+    fun frameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        seed()
+        val result = select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS c " +
+                "FROM employees WHERE deptId = 1 ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(listOf(int(1), Value.NullValue, int(0)), listOf(int(2), Value.NullValue, int(0)), listOf(int(3), Value.NullValue, int(0))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun firstValueAndLastValueRespectAnExplicitFrameInsteadOfThePeerGroupDefault() {
+        seed()
+        val result = select(
+            "SELECT id, " +
+                "FIRST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS f, " +
+                "LAST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS l " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(400), int(400)),
+                listOf(int(2), int(400), int(300)),
+                listOf(int(3), int(400), int(300)),
+                listOf(int(4), int(200), int(200)),
+                listOf(int(5), int(200), int(100)),
+                listOf(int(6), int(200), int(100))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rowsFrameShorthandWithoutBetweenEndsAtCurrentRow() {
+        seed()
+        val explicit = select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS 1 PRECEDING) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        val spelledOut = select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(spelledOut.rows, explicit.rows)
+    }
+
+    @Test
+    fun rowsFrameOffsetMustNotBeNegative() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun rowsFrameOffsetMustBeAnInteger() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun rowsFrameIsRejectedOnRankingAndOffsetWindowFunctions() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT ROW_NUMBER() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("frame"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionNestedInsideAFrameOffsetIsRejected() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run(
+                "SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN ROW_NUMBER() OVER (ORDER BY id) PRECEDING AND CURRENT ROW) " +
+                    "FROM employees"
+            )
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun explicitFrameSurvivesViewDefinitionRoundTrip() {
+        seed()
+        run(
+            "CREATE VIEW movingTotals AS SELECT id, " +
+                "SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees"
+        )
+        val result = select("SELECT id, s FROM movingTotals ORDER BY id ASC")
+        assertEquals(
+            listOf(400L, 800L, 700L, 200L, 400L, 300L),
+            result.rows.map { (it[1] as Value.IntegerValue).value }
+        )
+    }
+
+    /** amount is monotonic in id (10, 20, 20, 30, 50) so `ORDER BY id` and `ORDER BY amount` agree, with a tie at 20. */
+    private fun seedSales() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
+    }
+
+    @Test
+    fun rangeBetweenPrecedingAndFollowingIncludesRowsWithinValueDistanceRegardlessOfPhysicalRowCount() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(50L, 80L, 80L, 70L, 50L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameGivesTheSameRowSetRegardlessOfOrderDirectionForASymmetricWindow() {
+        seedSales()
+        val ascending = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ASC RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        val descending = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount DESC RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(ascending.rows, descending.rows)
+    }
+
+    @Test
+    fun rangeBetweenPrecedingAndFollowingOnADescendingOrderByFlipsWhichDirectionIsPreceding() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount DESC RANGE BETWEEN 15 PRECEDING AND 5 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(50L, 70L, 70L, 30L, 50L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeCurrentRowExpandsToTheWholePeerGroupUnlikeRowsCurrentRow() {
+        seedSales()
+        val range = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        val rows = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(10L, 50L, 50L, 80L, 130L), range.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(listOf(10L, 30L, 50L, 80L, 130L), rows.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameMeasuresDistanceOnADecimalColumn() {
+        run("CREATE TABLE prices (id INTEGER PRIMARY KEY, price DECIMAL(10, 2))")
+        run("INSERT INTO prices VALUES (1, 1.00), (2, 1.40), (3, 1.50), (4, 2.00)")
+        val result = select(
+            "SELECT id, COUNT(*) OVER (ORDER BY price RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) AS c " +
+                "FROM prices ORDER BY id ASC"
+        )
+        assertEquals(listOf(3L, 3L, 4L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameMeasuresDistanceInDaysOnADateColumn() {
+        run("CREATE TABLE events (id INTEGER PRIMARY KEY, day DATE)")
+        run(
+            "INSERT INTO events VALUES " +
+                "(1, CAST('2024-01-01' AS DATE)), (2, CAST('2024-01-02' AS DATE)), " +
+                "(3, CAST('2024-01-05' AS DATE)), (4, CAST('2024-01-06' AS DATE)), (5, CAST('2024-01-10' AS DATE))"
+        )
+        val result = select(
+            "SELECT id, COUNT(*) OVER (ORDER BY day RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c " +
+                "FROM events ORDER BY id ASC"
+        )
+        assertEquals(listOf(2L, 2L, 2L, 2L, 1L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (ORDER BY amount RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS c " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(
+            (1L..5L).map { listOf(int(it), Value.NullValue, int(0)) },
+            result.rows
+        )
+    }
+
+    @Test
+    fun rangeFrameWithAPrecedingBoundRequiresExactlyOneOrderByColumn() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run(
+                "SELECT SUM(amount) OVER (ORDER BY amount, id RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) " +
+                    "FROM sales"
+            )
+        }
+        assertTrue(error.message!!.contains("exactly one ORDER BY column"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameWithAPrecedingBoundRequiresANumericOrDateOrderColumn() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(salary) OVER (ORDER BY name RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("numeric or DATE"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameOffsetMustBeNumeric() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("numeric"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameOffsetMustNotBeNegative() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(amount) OVER (ORDER BY amount RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameSurvivesViewDefinitionRoundTrip() {
+        seedSales()
+        run(
+            "CREATE VIEW valueTotals AS SELECT id, " +
+                "SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s " +
+                "FROM sales"
+        )
+        val result = select("SELECT id, s FROM valueTotals ORDER BY id ASC")
+        assertEquals(listOf(50L, 80L, 80L, 70L, 50L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeCurrentRowRemovesOnlyTheCurrentRowFromTheWholePartitionFrame() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(120L, 110L, 110L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeGroupRemovesTheWholePeerGroupIncludingTheCurrentRow() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(120L, 90L, 90L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeTiesRemovesOnlyTheOtherTiedRowsAndKeepsTheCurrentRow() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(130L, 110L, 110L, 130L, 130L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeCurrentRowInteractsWithABoundedFrameInsteadOfOnlyTheWholePartition() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(20L, 30L, 50L, 70L, 30L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeNoOthersExplicitlyWrittenOutBehavesLikeNoExcludeClauseAtAll() {
+        seedSales()
+        val explicit = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        val implicit = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(implicit.rows, explicit.rows)
+    }
+
+    @Test
+    fun excludeGroupWithNoOrderByTreatsTheWholePartitionAsOnePeerGroup() {
+        seedSales()
+        val result = select(
+            "SELECT id, COUNT(*) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS c " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(0L, 0L, 0L, 0L, 0L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeClauseSurvivesViewDefinitionRoundTrip() {
+        seedSales()
+        run(
+            "CREATE VIEW excludingSelf AS SELECT id, " +
+                "SUM(amount) OVER (ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS s " +
+                "FROM sales"
+        )
+        val result = select("SELECT id, s FROM excludingSelf ORDER BY id ASC")
+        assertEquals(listOf(120L, 110L, 110L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    // ---- GROUPS frame unit ----
+    // sales (ordered by amount): id1=10, {id2=20, id3=20} tied, id4=30, id5=50 -> 4 distinct peer
+    // groups. GROUPS counts THESE groups, unlike ROWS (physical rows) or RANGE (value distance).
+
+    @Test
+    fun groupsBetweenPrecedingAndFollowingCountsPeerGroupsNotPhysicalRows() {
+        seedSales()
+        val groups = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        val rows = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        // id2/id3's tied peer group makes the GROUPS frame span more physical rows than ROWS for
+        // their neighbours (id1 and id4), even though both ask for "1 PRECEDING AND 1 FOLLOWING".
+        assertEquals(listOf(50L, 80L, 80L, 120L, 80L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(listOf(30L, 50L, 70L, 100L, 80L), rows.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsFrameBehavesExactlyLikeRowsFrameWhenNoRowsAreTied() {
+        run("CREATE TABLE prices (id INTEGER PRIMARY KEY, price DECIMAL(10, 2))")
+        run("INSERT INTO prices VALUES (1, 1.00), (2, 1.40), (3, 1.50), (4, 2.00)")
+        val groups = select(
+            "SELECT id, COUNT(*) OVER (ORDER BY price GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c " +
+                "FROM prices ORDER BY id ASC"
+        )
+        val rows = select(
+            "SELECT id, COUNT(*) OVER (ORDER BY price ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c " +
+                "FROM prices ORDER BY id ASC"
+        )
+        assertEquals(rows.rows, groups.rows)
+    }
+
+    @Test
+    fun groupsCurrentRowExpandsToTheWholePeerGroupJustLikeRangeCurrentRow() {
+        seedSales()
+        val groups = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        val range = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        val rows = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(10L, 50L, 50L, 80L, 130L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(groups.rows, range.rows)
+        assertEquals(listOf(10L, 30L, 50L, 80L, 130L), rows.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsFrameWorksWithAMultiColumnNonNumericOrderByUnlikeRange() {
+        seed()
+        val result = select(
+            "SELECT id, COUNT(*) OVER (ORDER BY deptId, name GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c " +
+                "FROM employees ORDER BY deptId ASC, name ASC"
+        )
+        // ada, grace, linus (dept 1) then kay, meg, sam (dept 2) - every row is its own peer group
+        // since no two rows share the same (deptId, name), so this is exactly the sliding-window-of-3
+        // pattern (2 at each edge, 3 in the middle).
+        assertEquals(
+            listOf(int(1), int(3), int(2), int(5), int(6), int(4)),
+            result.rows.map { it[0] }
+        )
+        assertEquals(listOf(2L, 3L, 3L, 3L, 3L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsFrameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        seedSales()
+        val result = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (ORDER BY amount GROUPS BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS c " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals((1L..5L).map { listOf(int(it), Value.NullValue, int(0)) }, result.rows)
+    }
+
+    @Test
+    fun groupsFrameOffsetMustBeAnInteger() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun groupsFrameOffsetMustNotBeNegative() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun groupsFrameWithUnboundedPrecedingAndFollowingCoversTheWholePartitionJustLikeRowsAndRange() {
+        seedSales()
+        val groups = select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(130L, 130L, 130L, 130L, 130L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsFrameIsRejectedOnRankingAndOffsetWindowFunctions() {
+        seed()
+        val error = assertFailsWith<KestrelException> {
+            run("SELECT ROW_NUMBER() OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("GROUPS"), error.message!!)
+    }
+
+    @Test
+    fun excludeGroupCombinesWithAGroupsFrameJustLikeItDoesWithRange() {
+        seedSales()
+        val groups = select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount GROUPS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(120L, 90L, 90L, 100L, 80L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun nestedWindowFunctionInAGroupsFrameOffsetIsRejected() {
+        seedSales()
+        val error = assertFailsWith<KestrelException> {
+            run(
+                "SELECT SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN ROW_NUMBER() OVER (ORDER BY amount) PRECEDING AND CURRENT ROW) " +
+                    "FROM sales"
+            )
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun groupsFrameSurvivesViewDefinitionRoundTrip() {
+        seedSales()
+        run(
+            "CREATE VIEW groupTotals AS SELECT id, " +
+                "SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s " +
+                "FROM sales"
+        )
+        val result = select("SELECT id, s FROM groupTotals ORDER BY id ASC")
+        assertEquals(listOf(50L, 80L, 80L, 120L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+}
