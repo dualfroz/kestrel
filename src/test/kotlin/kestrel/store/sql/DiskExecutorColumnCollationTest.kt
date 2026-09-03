@@ -462,3 +462,97 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
+    /**
+     * [DiskTable.rangeByPrimaryKey]'s counterpart of [primaryKeyPointLookupHonorsTheColumnsDeclaredCollation]
+     * for a range predicate instead of equality: [kestrel.engine.collationFoldedUniquenessKey] folds
+     * both the query's bound and every stored key through the same declared collation before the
+     * B+Tree ever compares bytes, so the ordering the index range-scans over agrees with what
+     * `Evaluator`'s own collation-aware `>`/`<` would decide row-by-row. The literal bound
+     * (`'ALICE'`, all-caps) is deliberately a different case than the stored `'Alice'` row it must
+     * exclude, proving the bound itself is folded too, not just the stored keys. `NoCase.canonicalize`
+     * uppercases, so the bound is deliberately given in lowercase (`'alice'`, not `'ALICE'`) - an
+     * unfolded lowercase bound would compare as bytewise *greater* than every uppercase-folded
+     * stored key (lowercase ASCII sorts after uppercase), wrongly excluding every row instead of
+     * just `'Alice'` itself.
+     */
+    @Test
+    fun rangeQueryOnAPrimaryKeyHonorsTheColumnsDeclaredCollation() {
+        val db = newDatabase()
+        db.run("CREATE TABLE pk2 (name TEXT COLLATE NOCASE PRIMARY KEY, hits INTEGER)")
+        db.run("INSERT INTO pk2 VALUES ('Alice', 1), ('Bob', 2), ('Zoe', 3)")
+        val plan = db.explain("EXPLAIN SELECT name FROM pk2 WHERE name > 'alice'")
+        assertTrue(plan.any { it.contains("Primary Key Range Scan") }, "expected primary key range scan, got $plan")
+        assertEquals(
+            listOf(listOf(Value.TextValue("Bob")), listOf(Value.TextValue("Zoe"))),
+            db.select("SELECT name FROM pk2 WHERE name > 'alice' ORDER BY name").rows
+        )
+    }
+
+    /**
+     * [DiskTable.rangeBySecondary]'s counterpart of [indexedEqualityHonorsTheColumnsDeclaredCollation]
+     * for a range predicate: a secondary index entry carries a RID suffix a primary key entry does
+     * not, so the fold has to reuse [kestrel.engine.collationFoldedUniquenessKey]'s
+     * (all-zero-suffix, all-one-suffix) bracketing trick rather than [DiskTable.rangeByPrimaryKey]'s
+     * bare bound - see [DiskTable.rangeBySecondary]'s own doc for why a bare bound would be wrong
+     * here. `>=` (inclusive) deliberately lands exactly on the folded value of an existing row
+     * (`'bob'` folds the same as the query's `'BOB'`) to prove the inclusive boundary itself is
+     * collation-aware, not just strictly-inside values. The bound is deliberately lowercase
+     * (`'bob'`), same reasoning as [rangeQueryOnAPrimaryKeyHonorsTheColumnsDeclaredCollation]: an
+     * unfolded lowercase bound would sort bytewise after every uppercase-folded stored key.
+     */
+    @Test
+    fun rangeQueryOnASecondaryIndexHonorsTheColumnsDeclaredCollation() {
+        val db = newDatabase()
+        db.run("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        db.run("INSERT INTO items VALUES (1, 'Alice'), (2, 'Bob'), (3, 'ZOE')")
+        db.run("CREATE INDEX idxItemName ON items (name)")
+        val plan = db.explain("EXPLAIN SELECT id FROM items WHERE name >= 'bob'")
+        assertTrue(plan.any { it.contains("Index Range Scan using idxItemName") }, "expected index range scan, got $plan")
+        assertEquals(
+            listOf(listOf(int(2)), listOf(int(3))),
+            db.select("SELECT id FROM items WHERE name >= 'bob' ORDER BY id").rows
+        )
+    }
+
+    /**
+     * [DiskTable.rangeBySecondary]'s prefix+range counterpart of [rangeQueryOnASecondaryIndexHonorsTheColumnsDeclaredCollation]
+     * and [compositeIndexEqualityHonorsPerColumnDeclaredCollationIndependently]: an equality-prefix
+     * (`order_id`, plain BINARY, irrelevant here) plus a range on the composite index's second column
+     * (`sku`, NOCASE) must fold BOTH the stored `sku` values AND the query's own bound through
+     * `sku`'s declared collation before the B+Tree ever compares bytes - `'Mango'` only survives
+     * `sku > 'lemon'` once both sides are canonicalized to `'MANGO' > 'LEMON'`; an unfolded lowercase
+     * bound would sort bytewise after every uppercase-folded stored value (lowercase ASCII sorts
+     * after uppercase), wrongly excluding every row instead of just `'Apple'`/`'kiwi'`.
+     */
+    @Test
+    fun rangeQueryOnASecondaryIndexAfterAnEqualityPrefixHonorsTheColumnsDeclaredCollation() {
+        val db = newDatabase()
+        db.run("CREATE TABLE order_lines2 (order_id INTEGER, sku TEXT COLLATE NOCASE)")
+        db.run("INSERT INTO order_lines2 VALUES (1, 'Apple'), (1, 'Mango'), (1, 'kiwi'), (2, 'Zebra')")
+        db.run("CREATE INDEX idxOrderSku2 ON order_lines2 (order_id, sku)")
+        val plan = db.explain("EXPLAIN SELECT sku FROM order_lines2 WHERE order_id = 1 AND sku > 'lemon'")
+        assertTrue(plan.any { it.contains("Index Range Scan using idxOrderSku2") }, "expected index range scan, got $plan")
+        assertEquals(
+            listOf(listOf(Value.TextValue("Mango"))),
+            db.select("SELECT sku FROM order_lines2 WHERE order_id = 1 AND sku > 'lemon'").rows
+        )
+    }
+
+    /**
+     * Now that [DiskTable]'s secondary-index B+Tree keys are folded through the column's declared
+     * `COLLATE`, ONGOING enforcement of an already-created `CREATE UNIQUE INDEX` catches a
+     * case-variant duplicate too - this test used to assert the opposite (see git history) as a
+     * documented scope-cut; [kestrel.engine.collationFoldedUniquenessKey]'s own doc comment
+     * previously named this exact gap as "the harder, still-open half" of the disk engine's
+     * COLLATE support.
+     */
+    @Test
+    fun uniqueIndexEnforcementAfterCreationHonorsTheColumnsDeclaredCollation() {
+        val db = newDatabase()
+        db.run("CREATE TABLE u4 (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        db.run("INSERT INTO u4 VALUES (1, 'Bob')")
+        db.run("CREATE UNIQUE INDEX idxU4 ON u4 (name)")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO u4 VALUES (2, 'bob')") }
+        assertEquals(listOf(listOf(int(1))), db.select("SELECT id FROM u4").rows)
+    }
+}
