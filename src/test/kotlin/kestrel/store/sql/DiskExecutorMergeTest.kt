@@ -155,3 +155,161 @@ class DiskExecutorMergeTest {
         assertEquals(listOf(listOf(int(100))), db.select("SELECT balance FROM accounts").rows)
     }
 
+    @Test
+    fun anUnmatchedSourceRowWithNoSatisfiedNotMatchedClauseInsertsNothing() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        db.run("INSERT INTO staging VALUES (1, 5)")
+        val result = db.exec(
+            "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                "WHEN NOT MATCHED AND staging.amount > 1000 THEN INSERT (id, balance) VALUES (staging.id, staging.amount)"
+        ) as MergeResult
+        assertEquals(MergeResult(0, 0, 0), result)
+        assertEquals(emptyList(), db.select("SELECT * FROM accounts").rows)
+    }
+
+    @Test
+    fun aTargetRowMatchedByTwoSourceRowsCannotBeAffectedTwice() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        db.run("INSERT INTO accounts VALUES (1, 100)")
+        db.run("INSERT INTO staging VALUES (1, 5), (1, 10)")
+        val error = assertFailsWith<KestrelException> {
+            db.run(
+                "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                    "WHEN MATCHED THEN UPDATE SET balance = accounts.balance + staging.amount"
+            )
+        }
+        assertTrue(error.message!!.contains("a second time"), error.message)
+    }
+
+    @Test
+    fun aTargetRowMatchedByTwoSourceRowsIsFineWhenOnlyOneClauseActuallyFires() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        db.run("INSERT INTO accounts VALUES (1, 100)")
+        db.run("INSERT INTO staging VALUES (1, 5), (1, 999)")
+        db.exec(
+            "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                "WHEN MATCHED AND staging.amount > 100 THEN UPDATE SET balance = accounts.balance + staging.amount"
+        )
+        assertEquals(listOf(listOf(int(1099))), db.select("SELECT balance FROM accounts").rows)
+    }
+
+    @Test
+    fun anUnqualifiedColumnPresentOnBothSidesIsAmbiguousInOnCondition() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        db.run("CREATE TABLE s (id INTEGER, v INTEGER)")
+        val error = assertFailsWith<KestrelException> {
+            db.run("MERGE INTO t USING s ON id = s.id WHEN MATCHED THEN UPDATE SET v = 1")
+        }
+        assertTrue(error.message!!.contains("ambiguous"), error.message)
+    }
+
+    @Test
+    fun aQualifierMatchingNeitherSideFails() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        val error = assertFailsWith<KestrelException> {
+            db.run("MERGE INTO accounts USING staging ON bogus.id = staging.id WHEN MATCHED THEN DELETE")
+        }
+        assertTrue(error.message!!.contains("no such table or alias"), error.message)
+    }
+
+    @Test
+    fun aWhenNotMatchedClauseCannotReferenceTheTargetTable() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        val error = assertFailsWith<KestrelException> {
+            db.run(
+                "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                    "WHEN NOT MATCHED AND accounts.balance > 0 THEN INSERT (id, balance) VALUES (staging.id, 1)"
+            )
+        }
+        assertTrue(error.message!!.contains("WHEN NOT MATCHED"), error.message)
+    }
+
+    @Test
+    fun columnValidationRunsUpFrontEvenWhenNoSourceRowEverReachesTheBadClause() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        val error = assertFailsWith<KestrelException> {
+            db.run(
+                "MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                    "WHEN NOT MATCHED THEN INSERT (id, nope) VALUES (staging.id, 1)"
+            )
+        }
+        assertTrue(error.message!!.contains("no such column"), error.message)
+    }
+
+    @Test
+    fun theTargetAndSourceCannotShareTheSameNameOrAlias() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE other (id INTEGER)")
+        val error = assertFailsWith<KestrelException> {
+            db.run("MERGE INTO t USING other AS t ON t.id = t.id WHEN MATCHED THEN DELETE")
+        }
+        assertTrue(error.message!!.contains("target and source"), error.message)
+    }
+
+    @Test
+    fun sourceCanBeADerivedTableSubquery() {
+        val db = newDatabase()
+        db.setUpAccountsAndStaging()
+        db.run("INSERT INTO staging VALUES (1, 10), (1, 20)")
+        db.exec(
+            "MERGE INTO accounts USING (SELECT id, SUM(amount) AS total FROM staging GROUP BY id) AS agg " +
+                "ON accounts.id = agg.id " +
+                "WHEN NOT MATCHED THEN INSERT (id, balance) VALUES (agg.id, agg.total)"
+        )
+        assertEquals(listOf(listOf(int(1), int(30))), db.select("SELECT id, balance FROM accounts").rows)
+    }
+
+    @Test
+    fun aDefaultKeywordInTheInsertValuesUsesTheColumnDefault() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT DEFAULT 'unlabeled')")
+        db.run("CREATE TABLE s (id INTEGER)")
+        db.run("INSERT INTO s VALUES (1)")
+        db.exec("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, label) VALUES (s.id, DEFAULT)")
+        assertEquals(listOf(listOf(int(1), text("unlabeled"))), db.select("SELECT id, label FROM t").rows)
+    }
+
+    @Test
+    fun anOmittedColumnListInsertsIntoEveryColumnInSchemaOrder() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+        db.run("CREATE TABLE s (id INTEGER, label TEXT)")
+        db.run("INSERT INTO s VALUES (1, 'a')")
+        db.exec("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.label)")
+        assertEquals(listOf(listOf(int(1), text("a"))), db.select("SELECT id, label FROM t").rows)
+    }
+
+    @Test
+    fun aNextvalDefaultStillAdvancesThroughAMergeInsert() {
+        val db = newDatabase()
+        db.run("CREATE SEQUENCE seq")
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq'), label TEXT)")
+        db.run("CREATE TABLE s (label TEXT)")
+        db.run("INSERT INTO s VALUES ('a'), ('b')")
+        db.exec("MERGE INTO t USING s ON t.label = s.label WHEN NOT MATCHED THEN INSERT (label) VALUES (s.label)")
+        assertEquals(
+            listOf(listOf(int(1), text("a")), listOf(int(2), text("b"))),
+            db.select("SELECT id, label FROM t ORDER BY id").rows
+        )
+    }
+
+    @Test
+    fun notNullViolationOnAMergeInsertFailsAndInsertsNothing() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+        db.run("CREATE TABLE s (id INTEGER)")
+        db.run("INSERT INTO s VALUES (1)")
+        assertFailsWith<KestrelException> {
+            db.run("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)")
+        }
+        assertEquals(emptyList(), db.select("SELECT * FROM t").rows)
+    }
+
