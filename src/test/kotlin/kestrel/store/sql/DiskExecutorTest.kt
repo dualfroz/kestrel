@@ -473,3 +473,1587 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(text("ada"))), result.rows)
     }
 
+    private fun Database.seedDerivedTableUsers() {
+        run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, dept TEXT)")
+        run(
+            "INSERT INTO users VALUES " +
+                "(1, 'ada', 36, 'eng'), (2, 'linus', 54, 'eng'), (3, 'grace', 85, 'navy'), (4, 'alan', 41, NULL)"
+        )
+    }
+
+    @Test
+    fun selectsFromASimpleDerivedTable() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        val result = db.select("SELECT s.name FROM (SELECT id, name FROM users WHERE age >= 40) AS s ORDER BY s.id ASC")
+        assertEquals(listOf(text("linus"), text("grace"), text("alan")), result.rows.map { it.single() })
+    }
+
+    @Test
+    fun derivedTableOverAnAggregateQueryWorks() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        val result = db.select(
+            "SELECT d.dept, d.n FROM (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept) AS d " +
+                "WHERE d.n > 1 ORDER BY d.dept ASC"
+        )
+        assertEquals(listOf(listOf(text("eng"), int(2))), result.rows)
+    }
+
+    @Test
+    fun twoDerivedTablesCanBeJoinedTogether() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        val result = db.select(
+            "SELECT a.dept, a.n FROM (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept) AS a " +
+                "JOIN (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept) AS b ON a.dept = b.dept " +
+                "WHERE a.n = b.n ORDER BY a.dept ASC"
+        )
+        assertEquals(listOf(listOf(text("eng"), int(2)), listOf(text("navy"), int(1))), result.rows)
+    }
+
+    @Test
+    fun derivedTableColumnsAreScopedToItsAliasNotTheUnderlyingTableName() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        assertFailsWith<DiskExecutorException> { db.run("SELECT users.name FROM (SELECT id, name FROM users) AS s") }
+    }
+
+    @Test
+    fun derivedTableIsReEvaluatedEachQueryReflectingLiveData() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        val before = db.select("SELECT COUNT(*) AS n FROM (SELECT id FROM users WHERE dept = 'eng') AS e")
+        assertEquals(listOf(listOf(int(2))), before.rows)
+        db.run("INSERT INTO users VALUES (5, 'margaret', 61, 'eng')")
+        val after = db.select("SELECT COUNT(*) AS n FROM (SELECT id FROM users WHERE dept = 'eng') AS e")
+        assertEquals(listOf(listOf(int(3))), after.rows)
+    }
+
+    @Test
+    fun derivedTableCanContainACorrelatedSubqueryOfItsOwn() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        val result = db.select(
+            "SELECT s.name FROM (SELECT id, name, dept FROM users u WHERE age > " +
+                "(SELECT AVG(age) FROM users u2 WHERE u2.dept = u.dept)) AS s ORDER BY s.id ASC"
+        )
+        assertEquals(listOf(text("linus")), result.rows.map { it.single() })
+    }
+
+    @Test
+    fun creatingAViewFromADerivedTableWorks() {
+        val db = newDatabase()
+        db.seedDerivedTableUsers()
+        db.run("CREATE VIEW dept_counts AS SELECT d.dept, d.n FROM (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept) AS d")
+        val result = db.select("SELECT dept, n FROM dept_counts WHERE n > 1")
+        assertEquals(listOf(listOf(text("eng"), int(2))), result.rows)
+    }
+
+    private fun Database.seedDepartmentsAndSalaries() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, deptId INTEGER, name TEXT, salary INTEGER)")
+        run("INSERT INTO departments VALUES (1, 'eng'), (2, 'sales')")
+        run(
+            "INSERT INTO employees VALUES " +
+                "(1, 1, 'ada', 300), (2, 1, 'linus', 250), (3, 1, 'grace', 400), " +
+                "(4, 2, 'sam', 150), (5, 2, 'kay', 200)"
+        )
+    }
+
+    @Test
+    fun lateralJoinComputesTopOnePerGroupWhichAPlainJoinCannotExpress() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        val result = db.select(
+            "SELECT d.name, top.name, top.salary FROM departments d " +
+                "JOIN LATERAL (SELECT e.name, e.salary FROM employees e WHERE e.deptId = d.id " +
+                "ORDER BY e.salary DESC LIMIT 1) AS top ON TRUE " +
+                "ORDER BY d.name ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("eng"), text("grace"), int(400)),
+                listOf(text("sales"), text("kay"), int(200))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun lateralJoinWithLimitGreaterThanOneReturnsMultipleRowsPerLeftRow() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        val result = db.select(
+            "SELECT d.name, top.name FROM departments d " +
+                "JOIN LATERAL (SELECT e.name FROM employees e WHERE e.deptId = d.id " +
+                "ORDER BY e.salary DESC LIMIT 2) AS top ON TRUE " +
+                "ORDER BY d.name ASC, top.name ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("eng"), text("ada")),
+                listOf(text("eng"), text("grace")),
+                listOf(text("sales"), text("kay")),
+                listOf(text("sales"), text("sam"))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun innerJoinLateralDropsGroupsWithNoMatchingRows() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        db.run("INSERT INTO departments VALUES (3, 'empty')")
+        val result = db.select(
+            "SELECT d.name FROM departments d " +
+                "JOIN LATERAL (SELECT e.name FROM employees e WHERE e.deptId = d.id LIMIT 1) AS top ON TRUE"
+        )
+        assertTrue(result.rows.none { it == listOf(text("empty")) })
+        assertEquals(2, result.rows.size)
+    }
+
+    @Test
+    fun leftJoinLateralKeepsGroupsWithNoMatchingRowsAsNull() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        db.run("INSERT INTO departments VALUES (3, 'empty')")
+        val result = db.select(
+            "SELECT d.name, top.name FROM departments d " +
+                "LEFT JOIN LATERAL (SELECT e.name FROM employees e WHERE e.deptId = d.id " +
+                "ORDER BY e.salary DESC LIMIT 1) AS top ON TRUE " +
+                "ORDER BY d.name ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("empty"), Value.NullValue),
+                listOf(text("eng"), text("grace")),
+                listOf(text("sales"), text("kay"))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun leftJoinLateralOverAnEmptyBaseTableProducesNoRowsWithoutRunningTheSubquery() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, deptId INTEGER, name TEXT)")
+        val result = db.select(
+            "SELECT d.name, top.name FROM departments d " +
+                "LEFT JOIN LATERAL (SELECT e.name FROM employees e WHERE e.deptId = d.id) AS top ON TRUE"
+        )
+        assertEquals(emptyList(), result.rows)
+    }
+
+    @Test
+    fun chainedLateralJoinsSeeEarlierLateralAliases() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        db.run("CREATE TABLE dual (x INTEGER)")
+        db.run("INSERT INTO dual VALUES (1)")
+        val result = db.select(
+            "SELECT d.name, bonus.amount FROM departments d " +
+                "JOIN LATERAL (SELECT e.salary FROM employees e WHERE e.deptId = d.id " +
+                "ORDER BY e.salary DESC LIMIT 1) AS top ON TRUE " +
+                "JOIN LATERAL (SELECT top.salary / 10 AS amount FROM dual) AS bonus ON TRUE " +
+                "ORDER BY d.name ASC"
+        )
+        assertEquals(listOf(listOf(text("eng"), int(40)), listOf(text("sales"), int(20))), result.rows)
+    }
+
+    @Test
+    fun lateralSubqueryCannotReferenceATableJoinedLater() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.select(
+                "SELECT * FROM departments d " +
+                    "JOIN LATERAL (SELECT e.name FROM employees e WHERE e.salary = later.salary) AS top ON TRUE " +
+                    "JOIN employees later ON later.deptId = d.id"
+            )
+        }
+        assertTrue(failure.message!!.contains("not joined yet"))
+    }
+
+    @Test
+    fun lateralSubqueryWithStarProjectionResolvesColumnsStructurallyFromItsBaseTable() {
+        val db = newDatabase()
+        db.seedDepartmentsAndSalaries()
+        val result = db.select(
+            "SELECT d.name, top.name, top.salary FROM departments d " +
+                "JOIN LATERAL (SELECT * FROM employees e WHERE e.deptId = d.id " +
+                "ORDER BY e.salary DESC LIMIT 1) AS top ON TRUE " +
+                "ORDER BY d.name ASC"
+        )
+        assertEquals(
+            listOf(listOf(text("eng"), text("grace"), int(400)), listOf(text("sales"), text("kay"), int(200))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun groupByComputesCountSumAvgMinMaxPerGroup() {
+        val db = newDatabase()
+        db.seedOrders()
+        val result = db.select(
+            "SELECT customer_id, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) " +
+                "FROM orders GROUP BY customer_id ORDER BY customer_id"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(2), int(150), Value.RealValue(75.0), int(50), int(100)),
+                listOf(int(2), int(1), int(200), Value.RealValue(200.0), int(200), int(200))
+            ),
+            result.rows
+        )
+    }
+
+    /**
+     * STRING_AGG's implementation lives entirely in the shared [kestrel.engine.GroupAggregation]/
+     * [kestrel.engine.AggregateFunctions] classes that this disk-backed executor already reuses for
+     * every other aggregate - this proves that reuse actually extends to STRING_AGG too, not just that
+     * the in-memory engine (AggregateTest) got it right.
+     */
+    @Test
+    fun stringAggGroupsAndOrdersPerGroupOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE tags (item TEXT, label TEXT)")
+        db.run("INSERT INTO tags VALUES ('widget', 'blue'), ('widget', 'small'), ('gadget', 'red')")
+        val result = db.select(
+            "SELECT item, STRING_AGG(label, ', ' ORDER BY label) FROM tags GROUP BY item ORDER BY item"
+        )
+        assertEquals(
+            listOf(listOf(text("gadget"), text("red")), listOf(text("widget"), text("blue, small"))),
+            result.rows
+        )
+    }
+
+    /**
+     * `COUNT/SUM/AVG/MIN/MAX(DISTINCT ...)` dedup lives in the same shared [kestrel.engine.
+     * AggregateFunctions.compute] this executor already reuses for every other aggregate - this
+     * proves the DISTINCT dedup path itself, not just plain aggregation, actually runs on the
+     * disk-backed engine too.
+     */
+    @Test
+    fun countAndSumDistinctDedupOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO t VALUES ('eng', 100), ('eng', 100), ('eng', 200), ('ops', 100), ('ops', NULL)")
+        assertEquals(listOf(listOf(int(4))), db.select("SELECT COUNT(amount) FROM t").rows)
+        assertEquals(listOf(listOf(int(2))), db.select("SELECT COUNT(DISTINCT amount) FROM t").rows)
+        assertEquals(listOf(listOf(int(500))), db.select("SELECT SUM(amount) FROM t").rows)
+        assertEquals(listOf(listOf(int(300))), db.select("SELECT SUM(DISTINCT amount) FROM t").rows)
+    }
+
+    @Test
+    fun countDistinctPerGroupOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO t VALUES ('eng', 100), ('eng', 100), ('eng', 200), ('ops', 100), ('ops', NULL)")
+        val result = db.select("SELECT dept, COUNT(DISTINCT amount) FROM t GROUP BY dept ORDER BY dept ASC")
+        assertEquals(listOf(listOf(text("eng"), int(2)), listOf(text("ops"), int(1))), result.rows)
+    }
+
+    /**
+     * `FILTER (WHERE ...)` narrows the rows an aggregate call itself sees before
+     * [kestrel.engine.AggregateFunctions.compute] runs - lives in the same shared
+     * [kestrel.engine.GroupAggregation.computeAggregate] this executor already reuses for every other
+     * aggregate, so this proves the filtering itself, not just plain/DISTINCT aggregation, runs here too.
+     */
+    @Test
+    fun filterRestrictsWhichRowsEachAggregateSeesOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO t VALUES ('eng', 100), ('eng', 100), ('eng', 200), ('ops', 100), ('ops', NULL)")
+        assertEquals(listOf(listOf(int(1))), db.select("SELECT COUNT(*) FILTER (WHERE amount > 100) FROM t").rows)
+        assertEquals(listOf(listOf(int(400))), db.select("SELECT SUM(amount) FILTER (WHERE dept = 'eng') FROM t").rows)
+        assertEquals(
+            listOf(listOf(int(0), Value.NullValue)),
+            db.select("SELECT COUNT(*) FILTER (WHERE dept = 'nope') AS c, SUM(amount) FILTER (WHERE dept = 'nope') AS s FROM t").rows
+        )
+    }
+
+    @Test
+    fun filterCombinesWithDistinctAndGroupByOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO t VALUES ('eng', 100), ('eng', 100), ('eng', 200), ('ops', 100), ('ops', NULL)")
+        val result = db.select(
+            "SELECT dept, COUNT(DISTINCT amount) FILTER (WHERE amount > 50) AS matching FROM t GROUP BY dept ORDER BY dept ASC"
+        )
+        assertEquals(listOf(listOf(text("eng"), int(2)), listOf(text("ops"), int(1))), result.rows)
+    }
+
+    @Test
+    fun offsetSkipsGroupsAfterOrderingAggregatedResultsOnTheDiskBackedEngine() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO t VALUES ('eng', 100), ('eng', 100), ('eng', 200), ('ops', 100), ('ops', NULL)")
+        val result = db.select("SELECT dept, COUNT(DISTINCT amount) FROM t GROUP BY dept ORDER BY dept ASC LIMIT 1 OFFSET 1")
+        assertEquals(listOf(listOf(text("ops"), int(1))), result.rows)
+    }
+
+    @Test
+    fun countStarWithNoGroupByAggregatesTheWholeTable() {
+        val db = newDatabase()
+        db.seedOrders()
+        assertEquals(listOf(listOf(int(3))), db.select("SELECT COUNT(*) FROM orders").rows)
+    }
+
+    @Test
+    fun countStarOverAnEmptyTableStillProducesOneRow() {
+        val db = newDatabase()
+        db.run("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL)")
+        assertEquals(listOf(listOf(int(0))), db.select("SELECT COUNT(*) FROM orders").rows)
+    }
+
+    @Test
+    fun groupByRollupAddsPerCustomerSubtotalsAndAGrandTotal() {
+        val db = newDatabase()
+        db.seedOrders()
+        val result = db.select(
+            "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY ROLLUP (customer_id) " +
+                "ORDER BY GROUPING(customer_id), customer_id"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(150)),
+                listOf(int(2), int(200)),
+                listOf(Value.NullValue, int(350))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun havingFiltersOutGroupsThatDoNotMatch() {
+        val db = newDatabase()
+        db.seedOrders()
+        val result = db.select("SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id HAVING SUM(amount) > 150")
+        assertEquals(listOf(listOf(int(2), int(200))), result.rows)
+    }
+
+    @Test
+    fun orderByOnAnAggregateSortsTheGroupedResult() {
+        val db = newDatabase()
+        db.seedOrders()
+        val result = db.select("SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id ORDER BY total DESC")
+        assertEquals(listOf(listOf(int(2), int(200)), listOf(int(1), int(150))), result.rows)
+    }
+
+    @Test
+    fun aProjectedColumnNotInGroupByOrAnAggregateIsRejected() {
+        val db = newDatabase()
+        db.seedOrders()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.select("SELECT customer_id, amount FROM orders GROUP BY customer_id")
+        }
+        assertTrue(failure.message!!.contains("must appear in GROUP BY"))
+    }
+
+    @Test
+    fun starProjectionCombinedWithGroupByIsRejected() {
+        val db = newDatabase()
+        db.seedOrders()
+        val failure = assertFailsWith<DiskExecutorException> { db.select("SELECT * FROM orders GROUP BY customer_id") }
+        assertTrue(failure.message!!.contains("cannot use *"))
+    }
+
+    @Test
+    fun groupByAggregatesOverAJoinedResult() {
+        val db = newDatabase()
+        db.seedOrders()
+        val result = db.select(
+            "SELECT customers.name, SUM(orders.amount) FROM customers JOIN orders ON customers.id = orders.customer_id " +
+                "GROUP BY customers.name ORDER BY customers.name"
+        )
+        assertEquals(listOf(listOf(text("ada"), int(150)), listOf(text("linus"), int(200))), result.rows)
+    }
+
+    @Test
+    fun dropTableCascadeWithNoDependentsBehavesLikeAPlainDrop() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        db.run("DROP TABLE users CASCADE")
+        assertTrue(db.catalog.tableNames.isEmpty())
+    }
+
+    @Test
+    fun createIndexBuildsANonUniqueSingleColumnSecondaryIndex() {
+        val db = newDatabase()
+        db.seedUsers()
+        val created = db.run("CREATE INDEX idx_age ON users(age)").single()
+        assertEquals(CreateIndexResult("idx_age"), created)
+        assertEquals(1, db.catalog.table("users").secondaryIndexes.size)
+    }
+
+    @Test
+    fun createUniqueIndexBuildsAUniqueSingleColumnSecondaryIndex() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER)")
+        val created = db.run("CREATE UNIQUE INDEX idx_age ON users(age)").single()
+        assertEquals(CreateIndexResult("idx_age"), created)
+        assertTrue(db.catalog.table("users").secondaryIndexes.single().unique)
+    }
+
+    @Test
+    fun createUniqueIndexRejectsAnInsertThatWouldDuplicateAnExistingValue() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO users VALUES (2, 'ada@example.com')") }
+        assertEquals(1, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun createUniqueIndexAllowsMultipleNullsSinceNullsAreNeverDuplicates() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, NULL), (2, NULL)")
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun createUniqueIndexOverExistingDuplicateValuesFailsAndLeavesNoTraceOfTheIndex() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("INSERT INTO users VALUES (1, 'dup@example.com'), (2, 'dup@example.com')")
+        assertFailsWith<DiskTableException> { db.run("CREATE UNIQUE INDEX idx_email ON users(email)") }
+        assertTrue(db.catalog.table("users").secondaryIndexes.isEmpty())
+    }
+
+    @Test
+    fun createUniqueIndexRejectsAnUpdateThatWouldDuplicateAnotherRowsValue() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com'), (2, 'grace@example.com')")
+        assertFailsWith<DiskTableException> { db.run("UPDATE users SET email = 'ada@example.com' WHERE id = 2") }
+        assertEquals(text("grace@example.com"), db.select("SELECT email FROM users WHERE id = 2").rows.single().single())
+    }
+
+    @Test
+    fun createUniqueIndexDataAndConstraintSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        db.reopen()
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO users VALUES (2, 'ada@example.com')") }
+        assertTrue(db.catalog.table("users").secondaryIndexes.single().unique)
+    }
+
+    @Test
+    fun dropIndexRemovesItFromTheCatalog() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        val dropped = db.run("DROP INDEX idx_age").single()
+        assertEquals(DropIndexResult("idx_age"), dropped)
+        assertTrue(db.catalog.table("users").secondaryIndexes.isEmpty())
+    }
+
+    @Test
+    fun dropIndexStopsThePlannerFromPushingDownAFormerlyIndexedEquality() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        db.run("DROP INDEX idx_age")
+        val table = db.catalog.table("users")
+        val scansBefore = table.scanCount
+        db.select("SELECT * FROM users WHERE age = 54")
+        assertEquals(0, table.secondaryLookupCount)
+        assertEquals(scansBefore + 1, table.scanCount)
+    }
+
+    @Test
+    fun droppingAUniqueIndexStopsItFromRejectingFurtherDuplicates() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        db.run("DROP INDEX idx_email")
+        db.run("INSERT INTO users VALUES (2, 'ada@example.com')")
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun dropIndexOnACompositeIndexRemovesTheWholeIndexNotJustOneColumn() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_both ON users(age, name)")
+        db.run("DROP INDEX idx_both")
+        assertTrue(db.catalog.table("users").secondaryIndexes.isEmpty())
+    }
+
+    @Test
+    fun droppingAnUnknownIndexFails() {
+        val db = newDatabase()
+        db.seedUsers()
+        assertFailsWith<DiskCatalogException> { db.run("DROP INDEX ghost") }
+    }
+
+    @Test
+    fun droppingAnAlreadyDroppedIndexFails() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        db.run("DROP INDEX idx_age")
+        assertFailsWith<DiskCatalogException> { db.run("DROP INDEX idx_age") }
+    }
+
+    @Test
+    fun dropIndexIsPersistedAcrossClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        db.run("CREATE UNIQUE INDEX idx_email ON users(email)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        db.run("DROP INDEX idx_email")
+        db.reopen()
+        assertTrue(db.catalog.table("users").secondaryIndexes.isEmpty())
+        db.run("INSERT INTO users VALUES (2, 'ada@example.com')")
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun dropIndexCannotRunInsideAnExplicitTransaction() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        db.run("BEGIN")
+        assertFailsWith<DiskExecutorException> { db.run("DROP INDEX idx_age") }
+        db.run("ROLLBACK")
+    }
+
+    // --- declarative UNIQUE constraints (inline `col TYPE UNIQUE` / table-level `UNIQUE (a, b, ...)`),
+    // enforced by a full heap scan per write rather than a backing index, mirroring
+    // kestrel.engine.Executor's own uniqueConstraints handling.
+
+    @Test
+    fun inlineUniqueColumnRejectsADuplicateValueOnInsert() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO users VALUES (2, 'ada@example.com')") }
+        assertEquals(1, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun inlineUniqueColumnAllowsMultipleNulls() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO users VALUES (1, NULL), (2, NULL)")
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun tableLevelCompositeUniqueConstraintRejectsADuplicateColumnCombination() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER, UNIQUE (event_id, user_id))")
+        db.run("INSERT INTO registrations VALUES (1, 100)")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO registrations VALUES (1, 100)") }
+        // Sharing only one of the two columns is fine: the constraint is on the pair, not either column alone.
+        db.run("INSERT INTO registrations VALUES (1, 200)")
+        assertEquals(2, db.select("SELECT * FROM registrations").rows.size)
+    }
+
+    @Test
+    fun uniqueConstraintRejectsAnUpdateThatWouldDuplicateAnotherRowsValue() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com'), (2, 'grace@example.com')")
+        assertFailsWith<DiskTableException> { db.run("UPDATE users SET email = 'ada@example.com' WHERE id = 2") }
+    }
+
+    @Test
+    fun uniqueConstraintReferencingAnUnknownColumnIsRejectedWithAClearError() {
+        val db = newDatabase()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.run("CREATE TABLE bad (id INTEGER PRIMARY KEY, UNIQUE (missing_column))")
+        }
+        assertTrue(failure.message!!.contains("missing_column"))
+    }
+
+    @Test
+    fun uniqueConstraintDataAndEnforcementSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO users VALUES (1, 'ada@example.com')")
+        db.reopen()
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO users VALUES (2, 'ada@example.com')") }
+        assertEquals(1, db.select("SELECT * FROM users").rows.size)
+    }
+
+    // --- composite (multi-column) CREATE [UNIQUE] INDEX
+
+    @Test
+    fun createIndexBuildsANonUniqueCompositeSecondaryIndex() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)")
+        val created = db.run("CREATE INDEX idx_both ON users(age, name)").single()
+        assertEquals(CreateIndexResult("idx_both"), created)
+        val handle = db.catalog.table("users").secondaryIndexes.single()
+        assertEquals(listOf("age", "name"), handle.columnNames)
+        assertEquals(false, handle.unique)
+    }
+
+    @Test
+    fun createUniqueCompositeIndexRejectsADuplicateColumnCombinationOnInsert() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER)")
+        db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)")
+        db.run("INSERT INTO registrations VALUES (1, 100)")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO registrations VALUES (1, 100)") }
+        // Sharing only one of the two columns is fine: the index is on the pair, not either column alone.
+        db.run("INSERT INTO registrations VALUES (1, 200)")
+        assertEquals(2, db.select("SELECT * FROM registrations").rows.size)
+    }
+
+    @Test
+    fun createUniqueCompositeIndexAllowsMultipleRowsWithANullInEitherColumn() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER)")
+        db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)")
+        db.run("INSERT INTO registrations VALUES (1, NULL), (1, NULL), (NULL, 100), (NULL, 100)")
+        assertEquals(4, db.select("SELECT * FROM registrations").rows.size)
+    }
+
+    @Test
+    fun createUniqueCompositeIndexOverExistingDuplicateCombinationsFailsAndLeavesNoTraceOfTheIndex() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER)")
+        db.run("INSERT INTO registrations VALUES (1, 100), (1, 100)")
+        assertFailsWith<DiskTableException> { db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)") }
+        assertTrue(db.catalog.table("registrations").secondaryIndexes.isEmpty())
+    }
+
+    @Test
+    fun createUniqueCompositeIndexRejectsAnUpdateThatWouldDuplicateAnotherRowsCombination() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (id INTEGER PRIMARY KEY, event_id INTEGER, user_id INTEGER)")
+        db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)")
+        db.run("INSERT INTO registrations VALUES (1, 1, 100), (2, 1, 200)")
+        assertFailsWith<DiskTableException> { db.run("UPDATE registrations SET user_id = 100 WHERE id = 2") }
+        assertEquals(int(200), db.select("SELECT user_id FROM registrations WHERE id = 2").rows.single().single())
+    }
+
+    @Test
+    fun createUniqueCompositeIndexDataAndConstraintSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER)")
+        db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)")
+        db.run("INSERT INTO registrations VALUES (1, 100)")
+        db.reopen()
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO registrations VALUES (1, 100)") }
+        val handle = db.catalog.table("registrations").secondaryIndexes.single()
+        assertEquals(listOf("event_id", "user_id"), handle.columnNames)
+        assertTrue(handle.unique)
+    }
+
+    // --- index pushdown: proven by DiskTable's access counters, not just by correct results,
+    // since a full scan and an index lookup return identical rows for these queries.
+
+    @Test
+    fun whereEqualityOnThePrimaryKeyUsesAPointLookupNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val result = db.select("SELECT name FROM users WHERE id = 2")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun aMissingPrimaryKeyPointLookupReturnsNoRowsWithoutScanning() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val result = db.select("SELECT name FROM users WHERE id = 999")
+        assertEquals(emptyList<List<Value>>(), result.rows)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnThePrimaryKeyUsesARangeScanNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val result = db.select("SELECT name FROM users WHERE id > 1 AND id <= 3 ORDER BY id")
+        assertEquals(listOf(listOf(text("linus")), listOf(text("grace"))), result.rows)
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun equalityOnAnUnindexedColumnStillFallsBackToAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val result = db.select("SELECT id FROM users WHERE name = 'linus'")
+        assertEquals(listOf(listOf(int(2))), result.rows)
+        assertEquals(1, table.scanCount)
+        assertEquals(0, table.pointLookupCount)
+    }
+
+    @Test
+    fun equalityOnASecondaryIndexedColumnUsesTheSecondaryIndexNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        val table = db.catalog.table("users")
+        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val result = db.select("SELECT name FROM users WHERE age = 54")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+        assertEquals(scansBeforeSelect, table.scanCount)
+    }
+
+    @Test
+    fun equalityOnAllColumnsOfACompositeSecondaryIndexUsesTheSecondaryIndexNotAFullScan() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)")
+        db.run("INSERT INTO users VALUES (1, 36, 'ada'), (2, 36, 'grace')")
+        db.run("CREATE INDEX idx_both ON users(age, name)")
+        val table = db.catalog.table("users")
+        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val result = db.select("SELECT id FROM users WHERE age = 36 AND name = 'grace'")
+        assertEquals(listOf(listOf(int(2))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+        assertEquals(scansBeforeSelect, table.scanCount)
+    }
+
+    @Test
+    fun equalityOnOnlyOneColumnOfACompositeSecondaryIndexFallsBackToAFullScan() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)")
+        db.run("INSERT INTO users VALUES (1, 36, 'ada'), (2, 36, 'grace')")
+        db.run("CREATE INDEX idx_both ON users(age, name)")
+        val table = db.catalog.table("users")
+        val scansBeforeSelect = table.scanCount
+        val result = db.select("SELECT id FROM users WHERE age = 36")
+        assertEquals(2, result.rows.size)
+        assertEquals(0, table.secondaryLookupCount)
+        assertEquals(scansBeforeSelect + 1, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnASingleColumnSecondaryIndexUsesARangeScanNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        val table = db.catalog.table("users")
+        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val result = db.select("SELECT name FROM users WHERE age > 40 AND age <= 85 ORDER BY age")
+        assertEquals(listOf(listOf(text("linus")), listOf(text("grace"))), result.rows)
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(0, table.secondaryLookupCount)
+        assertEquals(scansBeforeSelect, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnTheFirstColumnOfACompositeSecondaryIndexUsesARangeScanNotAFullScan() {
+        val db = newDatabase()
+        db.run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT)")
+        db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (2, 1, 'kiwi'), (3, 1, 'mango')")
+        db.run("CREATE INDEX idx_order_sku ON order_lines(order_id, sku)")
+        val table = db.catalog.table("order_lines")
+        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id > 1 ORDER BY order_id")
+        assertEquals(listOf(listOf(text("kiwi")), listOf(text("mango"))), result.rows)
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(scansBeforeSelect, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnTheSecondColumnOfACompositeSecondaryIndexAfterAnEqualityPrefixUsesARangeScanNotAFullScan() {
+        val db = newDatabase()
+        db.run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT)")
+        db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (1, 2, 'mango'), (2, 1, 'kiwi')")
+        db.run("CREATE INDEX idx_order_sku ON order_lines(order_id, sku)")
+        val table = db.catalog.table("order_lines")
+        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val result = db.select("SELECT line_no FROM order_lines WHERE order_id = 1 AND sku > 'apple'")
+        assertEquals(listOf(listOf(int(2))), result.rows)
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(0, table.secondaryLookupCount)
+        assertEquals(scansBeforeSelect, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnTheSecondColumnOfACompositeSecondaryIndexWithoutAnEqualityPrefixFallsBackToAFullScan() {
+        // Mirrors equalityOnOnlyOneColumnOfACompositeSecondaryIndexFallsBackToAFullScan - the index
+        // is sorted by order_id first, so a bare range on sku cannot narrow the scan without an
+        // equality prefix pinning order_id down first.
+        val db = newDatabase()
+        db.run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT)")
+        db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (1, 2, 'mango'), (2, 1, 'kiwi')")
+        db.run("CREATE INDEX idx_order_sku ON order_lines(order_id, sku)")
+        val table = db.catalog.table("order_lines")
+        val scansBeforeSelect = table.scanCount
+        val result = db.select("SELECT line_no FROM order_lines WHERE sku > 'apple'")
+        assertEquals(2, result.rows.size)
+        assertEquals(0, table.rangeScanCount)
+        assertEquals(scansBeforeSelect + 1, table.scanCount)
+    }
+
+    @Test
+    fun equalityOnASecondaryIndexIsPreferredOverARangeOnTheSameColumnAtRuntime() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        val table = db.catalog.table("users")
+        val result = db.select("SELECT name FROM users WHERE age = 54 AND age > 0")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+        assertEquals(0, table.rangeScanCount)
+    }
+
+    @Test
+    fun aPrimaryKeyEqualityIsPreferredOverASecondaryIndexInTheSamePredicate() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        val table = db.catalog.table("users")
+        // age = 999 matches nobody, but a point lookup on id must still run (and the extra
+        // conjunct is applied afterwards by the ordinary full-predicate filter), proving the
+        // planner picked the primary key rather than the secondary index for this predicate.
+        val result = db.select("SELECT name FROM users WHERE id = 2 AND age = 999")
+        assertEquals(emptyList<List<Value>>(), result.rows)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.secondaryLookupCount)
+    }
+
+    @Test
+    fun updateWithAPrimaryKeyEqualityWhereUsesAPointLookupNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val updated = db.run("UPDATE users SET age = 99 WHERE id = 1").single()
+        assertEquals(UpdateResult(1), updated)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+        assertEquals(int(99), db.select("SELECT age FROM users WHERE id = 1").rows.single().single())
+    }
+
+    @Test
+    fun deleteWithAPrimaryKeyEqualityWhereUsesAPointLookupNotAFullScan() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val deleted = db.run("DELETE FROM users WHERE id = 3").single()
+        assertEquals(DeleteResult(1), deleted)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    // --- table-level composite PRIMARY KEY (a, b): PRIMARY KEY (a, b) instead of an inline
+    // `col TYPE PRIMARY KEY`, mirroring kestrel.engine.Executor's own handling of the same clause.
+
+    private fun Database.seedOrderLines() {
+        run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT, PRIMARY KEY (order_id, line_no))")
+        run("INSERT INTO order_lines VALUES (1, 1, 'widget'), (1, 2, 'gadget'), (2, 1, 'widget')")
+    }
+
+    @Test
+    fun compositePrimaryKeyColumnsAreImplicitlyNotNullLikeAnInlinePrimaryKey() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO order_lines (line_no, sku) VALUES (1, 'x')") }
+    }
+
+    @Test
+    fun compositePrimaryKeyRejectsADuplicateColumnCombinationButAllowsSharedPartialValues() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO order_lines VALUES (1, 1, 'duplicate')") }
+        assertEquals(3, db.select("SELECT * FROM order_lines").rows.size)
+    }
+
+    @Test
+    fun compositePrimaryKeyEqualityOnAllColumnsUsesAPointLookupNotAFullScan() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        val table = db.catalog.table("order_lines")
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id = 1 AND line_no = 2")
+        assertEquals(listOf(listOf(text("gadget"))), result.rows)
+        assertEquals(1, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun compositePrimaryKeyEqualityOnOnlyOneColumnFallsBackToAFullScan() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        val table = db.catalog.table("order_lines")
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id = 1")
+        assertEquals(setOf("widget", "gadget"), result.rows.map { (it.single() as Value.TextValue).value }.toSet())
+        assertEquals(1, table.scanCount)
+        assertEquals(0, table.pointLookupCount)
+    }
+
+    @Test
+    fun aRangeOnTheLastCompositePrimaryKeyColumnAfterAnEqualityPrefixUsesARangeScanNotAFullScan() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        val table = db.catalog.table("order_lines")
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id = 1 AND line_no > 1")
+        assertEquals(listOf(listOf(text("gadget"))), result.rows)
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun aTwoSidedRangeOnTheLastCompositePrimaryKeyColumnAfterAnEqualityPrefixUsesARangeScan() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        db.run("INSERT INTO order_lines VALUES (1, 3, 'sprocket')")
+        val table = db.catalog.table("order_lines")
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id = 1 AND line_no >= 1 AND line_no <= 2")
+        assertEquals(setOf("widget", "gadget"), result.rows.map { (it.single() as Value.TextValue).value }.toSet())
+        assertEquals(1, table.rangeScanCount)
+        assertEquals(0, table.scanCount)
+    }
+
+    @Test
+    fun aRangeOnAnyOtherCompositePrimaryKeyColumnWithoutTheFullEqualityPrefixFallsBackToAFullScan() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        val table = db.catalog.table("order_lines")
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id > 1")
+        assertEquals(listOf(listOf(text("widget"))), result.rows)
+        assertEquals(1, table.scanCount)
+        assertEquals(0, table.rangeScanCount)
+    }
+
+    @Test
+    fun updateAndDeleteByFullCompositePrimaryKeyUsePointLookups() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        val table = db.catalog.table("order_lines")
+
+        val updated = db.run("UPDATE order_lines SET sku = 'sprocket' WHERE order_id = 1 AND line_no = 1").single()
+        assertEquals(UpdateResult(1), updated)
+        assertEquals(1, table.pointLookupCount)
+
+        val deleted = db.run("DELETE FROM order_lines WHERE order_id = 2 AND line_no = 1").single()
+        assertEquals(DeleteResult(1), deleted)
+        assertEquals(2, table.pointLookupCount)
+        assertEquals(0, table.scanCount)
+        assertEquals(2, db.select("SELECT * FROM order_lines").rows.size)
+    }
+
+    @Test
+    fun aTableCannotDeclareBothAnInlinePrimaryKeyColumnAndATableLevelCompositePrimaryKey() {
+        val db = newDatabase()
+        assertFailsWith<DiskExecutorException> {
+            db.run("CREATE TABLE bad (id INTEGER PRIMARY KEY, other INTEGER, PRIMARY KEY (id, other))")
+        }
+    }
+
+    @Test
+    fun aCompositePrimaryKeyReferencingAnUnknownColumnIsRejectedWithAClearError() {
+        val db = newDatabase()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.run("CREATE TABLE bad (order_id INTEGER, line_no INTEGER, PRIMARY KEY (order_id, missing_column))")
+        }
+        assertTrue(failure.message!!.contains("missing_column"))
+    }
+
+    @Test
+    fun compositePrimaryKeyDataAndUniquenessSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.seedOrderLines()
+        db.reopen()
+
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO order_lines VALUES (1, 1, 'duplicate')") }
+        val result = db.select("SELECT sku FROM order_lines WHERE order_id = 1 AND line_no = 2")
+        assertEquals(listOf(listOf(text("gadget"))), result.rows)
+        val table = db.catalog.table("order_lines")
+        assertEquals(0, table.scanCount, "the point lookup above must not have fallen back to a full scan after reopening")
+    }
+
+    private fun Database.seedDepartments() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL, budget INTEGER)")
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, department_id INTEGER, salary INTEGER)")
+        run("INSERT INTO departments VALUES (1, 'eng', 1000), (2, 'sales', 500), (3, 'ops', 0)")
+        run(
+            "INSERT INTO employees VALUES " +
+                "(1, 'ada', 1, 120), (2, 'linus', 1, 90), (3, 'grace', 2, 80), (4, 'guido', 2, 70)"
+        )
+    }
+
+    @Test
+    fun scalarSubqueryComparesAgainstAnUncorrelatedAggregate() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) ORDER BY name")
+        assertEquals(listOf(listOf(text("ada"))), result.rows)
+    }
+
+    @Test
+    fun scalarSubqueryReturningNoRowsEvaluatesToNull() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT (SELECT id FROM departments WHERE name = 'nope') FROM departments WHERE id = 1")
+        assertEquals(listOf(listOf(Value.NullValue)), result.rows)
+    }
+
+    @Test
+    fun scalarSubqueryReturningMoreThanOneRowFails() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val failure = assertFailsWith<KestrelException> {
+            db.select("SELECT (SELECT salary FROM employees) FROM departments WHERE id = 1")
+        }
+        assertTrue(failure.message!!.contains("more than one row"))
+    }
+
+    @Test
+    fun scalarSubqueryReturningMoreThanOneColumnFails() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val failure = assertFailsWith<KestrelException> {
+            db.select("SELECT (SELECT id, name FROM departments) FROM departments WHERE id = 1")
+        }
+        assertTrue(failure.message!!.contains("exactly one column"))
+    }
+
+    @Test
+    fun correlatedScalarSubqueryInProjectionCountsPerOuterRow() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select(
+            "SELECT d.name, (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id) " +
+                "FROM departments d ORDER BY d.id"
+        )
+        assertEquals(
+            listOf(listOf(text("eng"), int(2)), listOf(text("sales"), int(2)), listOf(text("ops"), int(0))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun correlatedScalarSubqueryInWhereComparesAgainstTheEmployeesOwnDepartmentAverage() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select(
+            "SELECT name FROM employees e WHERE e.salary > " +
+                "(SELECT AVG(salary) FROM employees e2 WHERE e2.department_id = e.department_id) ORDER BY name"
+        )
+        assertEquals(listOf(listOf(text("ada")), listOf(text("grace"))), result.rows)
+    }
+
+    @Test
+    fun inSubqueryMatchesAnUncorrelatedResultSet() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT name FROM departments WHERE id IN (SELECT department_id FROM employees) ORDER BY name")
+        assertEquals(listOf(listOf(text("eng")), listOf(text("sales"))), result.rows)
+    }
+
+    @Test
+    fun notInSubqueryExcludesMatchingRows() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT name FROM departments WHERE id NOT IN (SELECT department_id FROM employees)")
+        assertEquals(listOf(listOf(text("ops"))), result.rows)
+    }
+
+    @Test
+    fun notInSubqueryWithANullInTheResultSetExcludesEverythingByThreeValuedLogic() {
+        val db = newDatabase()
+        db.run("CREATE TABLE d (id INTEGER)")
+        db.run("CREATE TABLE e (dept INTEGER)")
+        db.run("INSERT INTO d VALUES (1), (2)")
+        db.run("INSERT INTO e VALUES (1), (NULL)")
+        val result = db.select("SELECT id FROM d WHERE id NOT IN (SELECT dept FROM e)")
+        assertEquals(emptyList(), result.rows)
+    }
+
+    @Test
+    fun inSubqueryRequiresExactlyOneColumn() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val failure = assertFailsWith<KestrelException> {
+            db.select("SELECT name FROM departments WHERE id IN (SELECT id, name FROM departments)")
+        }
+        assertTrue(failure.message!!.contains("exactly one column"))
+    }
+
+    @Test
+    fun existsWithoutCorrelationChecksOnlyWhetherTheSubqueryHasAnyRows() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT name FROM departments WHERE EXISTS (SELECT 1 FROM employees) ORDER BY name")
+        assertEquals(listOf(listOf(text("eng")), listOf(text("ops")), listOf(text("sales"))), result.rows)
+    }
+
+    @Test
+    fun correlatedExistsFindsDepartmentsWithEmployees() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select(
+            "SELECT name FROM departments d WHERE EXISTS " +
+                "(SELECT 1 FROM employees e WHERE e.department_id = d.id) ORDER BY name"
+        )
+        assertEquals(listOf(listOf(text("eng")), listOf(text("sales"))), result.rows)
+    }
+
+    @Test
+    fun correlatedNotExistsFindsDepartmentsWithoutEmployees() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select(
+            "SELECT name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.department_id = d.id)"
+        )
+        assertEquals(listOf(listOf(text("ops"))), result.rows)
+    }
+
+    @Test
+    fun nestedSubqueriesCorrelateAcrossTwoLevelsOfOuterRows() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select(
+            "SELECT d.name FROM departments d WHERE EXISTS (" +
+                "SELECT 1 FROM employees e WHERE e.department_id = d.id AND e.salary > (" +
+                "SELECT AVG(salary) FROM employees e2 WHERE e2.department_id = d.id" +
+                ")) ORDER BY d.name"
+        )
+        assertEquals(listOf(listOf(text("eng")), listOf(text("sales"))), result.rows)
+    }
+
+    @Test
+    fun correlatedScalarSubqueryIsUsableInUpdateSet() {
+        val db = newDatabase()
+        db.seedDepartments()
+        db.run("CREATE TABLE dept_stats (id INTEGER PRIMARY KEY, headcount INTEGER)")
+        db.run("INSERT INTO dept_stats VALUES (1, 0), (2, 0), (3, 0)")
+        db.run(
+            "UPDATE dept_stats SET headcount = " +
+                "(SELECT COUNT(*) FROM employees WHERE employees.department_id = dept_stats.id)"
+        )
+        val result = db.select("SELECT headcount FROM dept_stats ORDER BY id")
+        assertEquals(listOf(listOf(int(2)), listOf(int(2)), listOf(int(0))), result.rows)
+    }
+
+    @Test
+    fun inSubqueryIsUsableInDeleteWhereClause() {
+        val db = newDatabase()
+        db.seedDepartments()
+        db.run("INSERT INTO employees VALUES (5, 'temp', 3, 10)")
+        db.run("DELETE FROM employees WHERE department_id IN (SELECT id FROM departments WHERE budget = 0)")
+        val result = db.select("SELECT name FROM employees ORDER BY name")
+        assertEquals(
+            listOf(listOf(text("ada")), listOf(text("grace")), listOf(text("guido")), listOf(text("linus"))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun scalarSubqueryIsUsableAsAnInsertValue() {
+        val db = newDatabase()
+        db.seedDepartments()
+        db.run("CREATE TABLE summary (id INTEGER PRIMARY KEY, employee_count INTEGER)")
+        db.run("INSERT INTO summary VALUES (1, (SELECT COUNT(*) FROM employees))")
+        val result = db.select("SELECT employee_count FROM summary")
+        assertEquals(listOf(listOf(int(4))), result.rows)
+    }
+
+    @Test
+    fun aggregateOverAnUncorrelatedScalarSubqueryEvaluatesItPerRow() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val result = db.select("SELECT SUM((SELECT budget FROM departments WHERE id = 1)) FROM employees")
+        assertEquals(listOf(listOf(int(1000 * 4))), result.rows)
+    }
+
+    @Test
+    fun existsResultCannotBeUsedAsAnArithmeticOperand() {
+        val db = newDatabase()
+        db.seedDepartments()
+        assertFailsWith<KestrelException> {
+            db.select("SELECT 1 + EXISTS (SELECT 1 FROM employees) FROM departments WHERE id = 1")
+        }
+    }
+
+    @Test
+    fun aSubqueryReferencingAnUnknownColumnFailsWithAClearError() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val failure = assertFailsWith<KestrelException> {
+            db.select("SELECT (SELECT missing_column FROM employees) FROM departments")
+        }
+        assertTrue(failure.message!!.contains("missing_column"))
+    }
+
+    @Test
+    fun subqueryAgainstADerivedTableInsideItselfWorks() {
+        val db = newDatabase()
+        db.seedDepartments()
+        val matches = db.select(
+            "SELECT name FROM departments WHERE EXISTS " +
+                "(SELECT 1 FROM (SELECT id FROM employees WHERE salary > 100) sub) ORDER BY name"
+        )
+        assertEquals(listOf(text("eng"), text("ops"), text("sales")), matches.rows.map { it.single() })
+
+        val none = db.select(
+            "SELECT name FROM departments WHERE EXISTS (SELECT 1 FROM (SELECT id FROM employees WHERE salary > 1000) sub)"
+        )
+        assertEquals(emptyList(), none.rows)
+    }
+
+    private fun Database.seedCompound() {
+        run("CREATE TABLE dual (x INTEGER)")
+        run("INSERT INTO dual VALUES (1)")
+        run("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run("CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run("INSERT INTO t1 VALUES (1, 'ada'), (2, 'linus')")
+        run("INSERT INTO t2 VALUES (2, 'linus'), (3, 'grace')")
+    }
+
+    @Test
+    fun unionRemovesDuplicateRows() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("SELECT name FROM t1 UNION SELECT name FROM t2 ORDER BY name")
+        assertEquals(listOf(listOf(text("ada")), listOf(text("grace")), listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun unionAllKeepsDuplicateRows() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("SELECT name FROM t1 UNION ALL SELECT name FROM t2 ORDER BY name")
+        assertEquals(
+            listOf(listOf(text("ada")), listOf(text("grace")), listOf(text("linus")), listOf(text("linus"))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun intersectReturnsRowsPresentInBothQueries() {
+        val db = newDatabase()
+        db.seedCompound()
+        assertEquals(listOf(listOf(text("linus"))), db.select("SELECT name FROM t1 INTERSECT SELECT name FROM t2").rows)
+    }
+
+    @Test
+    fun exceptReturnsRowsOnlyInTheLeftQuery() {
+        val db = newDatabase()
+        db.seedCompound()
+        assertEquals(listOf(listOf(text("ada"))), db.select("SELECT name FROM t1 EXCEPT SELECT name FROM t2").rows)
+    }
+
+    @Test
+    fun intersectAllAndExceptAllPreserveMultisetCounts() {
+        val db = newDatabase()
+        db.run("CREATE TABLE bag_a (v INTEGER)")
+        db.run("CREATE TABLE bag_b (v INTEGER)")
+        db.run("INSERT INTO bag_a VALUES (1), (1), (1), (2)")
+        db.run("INSERT INTO bag_b VALUES (1), (1), (2), (2), (3)")
+        assertEquals(
+            listOf(listOf(int(1)), listOf(int(1)), listOf(int(2))),
+            db.select("SELECT v FROM bag_a INTERSECT ALL SELECT v FROM bag_b ORDER BY v").rows
+        )
+        assertEquals(listOf(listOf(int(1))), db.select("SELECT v FROM bag_a EXCEPT ALL SELECT v FROM bag_b ORDER BY v").rows)
+    }
+
+    @Test
+    fun compoundQueryWithMismatchedColumnCountsFails() {
+        val db = newDatabase()
+        db.seedCompound()
+        assertFailsWith<DiskExecutorException> { db.select("SELECT id, name FROM t1 UNION SELECT id FROM t2") }
+    }
+
+    @Test
+    fun compoundOperatorsChainLeftAssociatively() {
+        val db = newDatabase()
+        db.seedCompound()
+        db.run("CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        db.run("INSERT INTO t3 VALUES (2, 'linus')")
+        val result = db.select("SELECT name FROM t1 UNION ALL SELECT name FROM t2 INTERSECT SELECT name FROM t3 ORDER BY name")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun orderByAndLimitApplyToTheWholeCompoundResultNotEachSide() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("SELECT name FROM t1 UNION ALL SELECT name FROM t2 ORDER BY name DESC LIMIT 2")
+        assertEquals(listOf(listOf(text("linus")), listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun offsetSkipsRowsOfTheWholeCompoundResultBeforeLimitApplies() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("SELECT name FROM t1 UNION ALL SELECT name FROM t2 ORDER BY name DESC LIMIT 2 OFFSET 1")
+        assertEquals(listOf(listOf(text("linus")), listOf(text("grace"))), result.rows)
+    }
+
+    @Test
+    fun withClauseMakesACteAvailableInFrom() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("WITH recent AS (SELECT id, name FROM t1) SELECT name FROM recent WHERE id = 1")
+        assertEquals(listOf(listOf(text("ada"))), result.rows)
+    }
+
+    @Test
+    fun aCteShadowsARealTableOfTheSameName() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("WITH t1 AS (SELECT id FROM t1 WHERE id = 1) SELECT * FROM t1")
+        assertEquals(listOf("id"), result.columns)
+        assertEquals(listOf(listOf(int(1))), result.rows)
+    }
+
+    @Test
+    fun laterCteCanReferenceAnEarlierCteInTheSameWithClause() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select(
+            "WITH first_cte AS (SELECT id, name FROM t1), second_cte AS (SELECT name FROM first_cte WHERE id = 2) " +
+                "SELECT name FROM second_cte"
+        )
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun cteCanBeJoinedWithARealDiskTable() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("WITH t1_names AS (SELECT id, name FROM t1) SELECT t2.name FROM t1_names JOIN t2 ON t1_names.id = t2.id")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun cteWithExplicitColumnListRenamesOutputColumns() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select("WITH renamed(label) AS (SELECT name FROM t1) SELECT label FROM renamed ORDER BY label")
+        assertEquals(listOf(listOf(text("ada")), listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun cteColumnListSizeMustMatchQueryColumnCount() {
+        val db = newDatabase()
+        db.seedCompound()
+        val failure = assertFailsWith<DiskExecutorException> { db.select("WITH bad(a, b, c) AS (SELECT id FROM t1) SELECT * FROM bad") }
+        assertTrue(failure.message!!.contains("bad"))
+    }
+
+    @Test
+    fun recursiveCteGeneratesABoundedSequence() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select(
+            "WITH RECURSIVE counter(n) AS (" +
+                "SELECT 1 FROM dual " +
+                "UNION ALL " +
+                "SELECT n + 1 FROM counter WHERE n < 5" +
+                ") SELECT n FROM counter ORDER BY n"
+        )
+        assertEquals((1..5).map { listOf(int(it.toLong())) }, result.rows)
+    }
+
+    @Test
+    fun recursiveCteWithUnionDeduplicatesAndTerminatesOnACycleThroughARealDiskTable() {
+        val db = newDatabase()
+        db.seedCompound()
+        db.run("CREATE TABLE edges (from_node INTEGER, to_node INTEGER)")
+        db.run("INSERT INTO edges VALUES (1, 2), (2, 3), (3, 1), (3, 4)")
+        val result = db.select(
+            "WITH RECURSIVE reachable(node) AS (" +
+                "SELECT 1 FROM dual " +
+                "UNION " +
+                "SELECT edges.to_node FROM edges JOIN reachable ON edges.from_node = reachable.node" +
+                ") SELECT node FROM reachable ORDER BY node"
+        )
+        assertEquals(listOf(1L, 2L, 3L, 4L).map { listOf(int(it)) }, result.rows)
+    }
+
+    @Test
+    fun recursiveCteWithoutSelfReferenceBehavesAsAPlainCompoundQuery() {
+        val db = newDatabase()
+        db.seedCompound()
+        val result = db.select(
+            "WITH RECURSIVE notActuallyRecursive AS (SELECT 1 AS n FROM dual UNION ALL SELECT 2 FROM dual) " +
+                "SELECT n FROM notActuallyRecursive ORDER BY n"
+        )
+        assertEquals(listOf(listOf(int(1)), listOf(int(2))), result.rows)
+    }
+
+    @Test
+    fun recursiveCteReferencingItselfOnBothSidesFails() {
+        val db = newDatabase()
+        db.seedCompound()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.select("WITH RECURSIVE bad(n) AS (SELECT n FROM bad UNION ALL SELECT n FROM bad) SELECT n FROM bad")
+        }
+        assertTrue(failure.message!!.contains("bad"))
+    }
+
+    @Test
+    fun nonTerminatingRecursiveCteFailsInsteadOfLoopingForever() {
+        val db = newDatabase()
+        db.seedCompound()
+        val failure = assertFailsWith<DiskExecutorException> {
+            db.select(
+                "WITH RECURSIVE counter(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM counter) SELECT n FROM counter"
+            )
+        }
+        assertTrue(failure.message!!.contains("did not terminate"))
+    }
+
+    @Test
+    fun aWithClauseThatNeverReferencesItsCteLeavesOrdinaryPrimaryKeyPushdownUntouched() {
+        val db = newDatabase()
+        db.seedUsers()
+        val table = db.catalog.table("users")
+        val pointLookupsBefore = table.pointLookupCount
+        val scansBefore = table.scanCount
+        val result = db.select("WITH unused AS (SELECT id FROM users) SELECT name FROM users WHERE id = 1")
+        assertEquals(listOf(listOf(text("ada"))), result.rows)
+        // Every CTE is materialized up front regardless of whether the body ends up using it (mirroring
+        // kestrel.engine.SelectRunner), so "unused" itself contributes exactly one full scan - the point is
+        // that the OUTER query's own WHERE id = 1 still gets its point lookup rather than also falling
+        // back to a scan just because a WITH clause is present.
+        assertEquals(scansBefore + 1, table.scanCount)
+        assertEquals(pointLookupsBefore + 1, table.pointLookupCount)
+    }
+
+    /**
+     * eng (deptId 1): ada/linus tie at 400 (ada inserted first), grace at 300. sales (deptId 2):
+     * sam/kay tie at 200 (sam inserted first), meg at 100. Mirrors kestrel.WindowFunctionTest's seed()
+     * exactly so results can be cross-checked against the in-memory engine's own known-good values.
+     */
+    private fun Database.seedWindowEmployees() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run("CREATE TABLE employees (id INTEGER PRIMARY KEY, deptId INTEGER, name TEXT, salary INTEGER)")
+        run("INSERT INTO departments VALUES (1, 'eng'), (2, 'sales')")
+        run(
+            "INSERT INTO employees VALUES " +
+                "(1, 1, 'ada', 400), (2, 1, 'linus', 400), (3, 1, 'grace', 300), " +
+                "(4, 2, 'sam', 200), (5, 2, 'kay', 200), (6, 2, 'meg', 100)"
+        )
+    }
+
+    @Test
+    fun rowNumberAssignsSequentialNumbersWithinEachPartition() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY deptId ORDER BY salary DESC) AS rn " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(1)), listOf(int(2), int(2)), listOf(int(3), int(3)),
+                listOf(int(4), int(1)), listOf(int(5), int(2)), listOf(int(6), int(3))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rowNumberWithoutOverOrderByFallsBackToPartitionArrivalOrder() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, ROW_NUMBER() OVER (PARTITION BY deptId) AS rn FROM employees ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(int(1), int(1)), listOf(int(2), int(2)), listOf(int(3), int(3)),
+                listOf(int(4), int(1)), listOf(int(5), int(2)), listOf(int(6), int(3))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rankLeavesGapsAfterTiesButDenseRankDoesNot() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, RANK() OVER (PARTITION BY deptId ORDER BY salary DESC) AS r, " +
+                "DENSE_RANK() OVER (PARTITION BY deptId ORDER BY salary DESC) AS dr " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(1), int(1)),
+                listOf(int(2), int(1), int(1)),
+                listOf(int(3), int(3), int(2)),
+                listOf(int(4), int(1), int(1)),
+                listOf(int(5), int(1), int(1)),
+                listOf(int(6), int(3), int(2))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rankWithoutPartitionOrdersTheWholeResultSet() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, RANK() OVER (ORDER BY salary DESC) AS r FROM employees ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(int(1), int(1)), listOf(int(2), int(1)), listOf(int(3), int(3)),
+                listOf(int(4), int(4)), listOf(int(5), int(4)), listOf(int(6), int(6))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun aggregateWindowWithoutOrderByRepeatsTheWholePartitionTotalOnEveryRow() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, SUM(salary) OVER (PARTITION BY deptId) AS deptTotal FROM employees ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(int(1), int(1100)), listOf(int(2), int(1100)), listOf(int(3), int(1100)),
+                listOf(int(4), int(500)), listOf(int(5), int(500)), listOf(int(6), int(500))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun aggregateWindowWithOrderByRunsCumulativelyAndTiesSharePeerGroupTotal() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS running FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(800)), listOf(int(2), int(800)), listOf(int(3), int(1100)),
+                listOf(int(4), int(400)), listOf(int(5), int(400)), listOf(int(6), int(500))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun aggregateWindowWithUniqueOrderKeyProducesARunningTotal() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, SUM(salary) OVER (ORDER BY id) AS running FROM employees ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(int(1), int(400)), listOf(int(2), int(800)), listOf(int(3), int(1100)),
+                listOf(int(4), int(1300)), listOf(int(5), int(1500)), listOf(int(6), int(1600))
+            ),
+            result.rows
+        )
+    }
+
