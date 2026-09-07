@@ -2057,3 +2057,1274 @@ class DiskExecutorTest {
         )
     }
 
+    @Test
+    fun countStarOverPartitionCountsRowsRegardlessOfNulls() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        db.run("INSERT INTO employees VALUES (7, 3, 'unpaid', NULL)")
+        val result = db.select(
+            "SELECT COUNT(*) OVER (PARTITION BY deptId) AS n, COUNT(salary) OVER (PARTITION BY deptId) AS paid " +
+                "FROM employees WHERE deptId = 3"
+        )
+        assertEquals(listOf(listOf(int(1), int(0))), result.rows)
+    }
+
+    @Test
+    fun windowFunctionOverAJoinPartitionsByTheJoinedColumn() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT e.name, d.name AS dept, " +
+                "ROW_NUMBER() OVER (PARTITION BY d.name ORDER BY e.salary DESC) AS rn " +
+                "FROM employees e JOIN departments d ON e.deptId = d.id " +
+                "WHERE d.name = 'eng' ORDER BY rn ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(text("ada"), text("eng"), int(1)),
+                listOf(text("linus"), text("eng"), int(2)),
+                listOf(text("grace"), text("eng"), int(3))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun orderByCanReferenceAWindowFunctionByItsProjectionAlias() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, RANK() OVER (ORDER BY salary DESC) AS r FROM employees ORDER BY r ASC, id ASC")
+        assertEquals((1..6).map { it.toLong() }, result.rows.map { (it[0] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun selectStarWithAWindowFunctionOnlyInOrderByDoesNotLeakTheExtraColumn() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT * FROM departments ORDER BY ROW_NUMBER() OVER (ORDER BY id) DESC")
+        assertEquals(listOf("id", "name"), result.columns)
+        assertEquals(listOf(listOf(int(2), text("sales")), listOf(int(1), text("eng"))), result.rows)
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInWhere() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT id FROM employees WHERE ROW_NUMBER() OVER (ORDER BY id) = 1")
+        }
+        assertTrue(error.message!!.contains("WHERE"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInGroupBy() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        assertFailsWith<DiskExecutorException> {
+            db.run("SELECT COUNT(*) FROM employees GROUP BY ROW_NUMBER() OVER (ORDER BY id)")
+        }
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInHaving() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        assertFailsWith<DiskExecutorException> {
+            db.run("SELECT deptId, COUNT(*) FROM employees GROUP BY deptId HAVING ROW_NUMBER() OVER (ORDER BY deptId) > 1")
+        }
+    }
+
+    @Test
+    fun windowFunctionIsRejectedInAnOnCondition() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT e.id FROM employees e JOIN departments d ON ROW_NUMBER() OVER (ORDER BY e.id) = d.id")
+        }
+        assertTrue(error.message!!.contains("ON condition"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionCannotBeCombinedWithGroupByInTheSameQuery() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT deptId, COUNT(*), ROW_NUMBER() OVER (ORDER BY deptId) FROM employees GROUP BY deptId")
+        }
+        assertTrue(error.message!!.contains("combined"), error.message!!)
+    }
+
+    @Test
+    fun rankRequiresAnOrderByInsideOver() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT RANK() OVER (PARTITION BY deptId) FROM employees")
+        }
+        assertTrue(error.message!!.contains("ORDER BY"), error.message!!)
+    }
+
+    @Test
+    fun denseRankRequiresAnOrderByInsideOver() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        assertFailsWith<DiskExecutorException> {
+            db.run("SELECT DENSE_RANK() OVER (PARTITION BY deptId) FROM employees")
+        }
+    }
+
+    @Test
+    fun nestedWindowFunctionsAreRejected() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(salary) OVER (ORDER BY ROW_NUMBER() OVER (ORDER BY id)) FROM employees")
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun lagReturnsThePreviousRowsValueWithinEachPartitionAndNullAtTheEdge() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, LAG(salary) OVER (PARTITION BY deptId ORDER BY id) AS prev FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), Value.NullValue), listOf(int(2), int(400)), listOf(int(3), int(400)),
+                listOf(int(4), Value.NullValue), listOf(int(5), int(200)), listOf(int(6), int(200))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun leadReturnsTheNextRowsValueWithinEachPartitionAndNullAtTheEdge() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, LEAD(salary) OVER (PARTITION BY deptId ORDER BY id) AS next FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(400)), listOf(int(2), int(300)), listOf(int(3), Value.NullValue),
+                listOf(int(4), int(200)), listOf(int(5), int(100)), listOf(int(6), Value.NullValue)
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun lagWithAnExplicitOffsetSkipsMultipleRows() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select("SELECT id, LAG(salary, 2) OVER (ORDER BY id) AS prev2 FROM employees ORDER BY id ASC")
+        assertEquals(
+            listOf(
+                listOf(int(1), Value.NullValue), listOf(int(2), Value.NullValue), listOf(int(3), int(400)),
+                listOf(int(4), int(400)), listOf(int(5), int(300)), listOf(int(6), int(200))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun lagPastThePartitionEdgeFallsBackToTheDefaultExpressionInsteadOfNull() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, LAG(salary, 1, 0) OVER (PARTITION BY deptId ORDER BY id) AS prev FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(int(0), int(400), int(400), int(0), int(200), int(200)), result.rows.map { it[1] })
+    }
+
+    @Test
+    fun lagOffsetMustNotBeNegative() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT LAG(salary, -1) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun lagOffsetMustBeAnInteger() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT LAG(salary, 1.5) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun firstValueReturnsTheFirstRowsValueForEveryRowInThePartition() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, FIRST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY id) AS f FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(400L, 400L, 400L, 200L, 200L, 200L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun lastValueSharesOneValuePerPeerGroupRatherThanTheWholePartition() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, LAST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY salary DESC) AS l FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(400L, 400L, 300L, 200L, 200L, 100L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun lastValueWithoutOverOrderByUsesTheWholePartitionsLastRow() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, LAST_VALUE(salary) OVER (PARTITION BY deptId) AS l FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(300L, 300L, 300L, 100L, 100L, 100L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileSplitsEachPartitionIntoAsEvenBucketsAsPossible() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, NTILE(2) OVER (PARTITION BY deptId ORDER BY salary DESC) AS bucket FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(1L, 1L, 2L, 1L, 1L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileWithMoreBucketsThanRowsLeavesTheHighestBucketsUnused() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, NTILE(5) OVER (PARTITION BY deptId ORDER BY salary DESC) AS bucket FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(1L, 2L, 3L, 1L, 2L, 3L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun ntileBucketCountMustBePositive() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT NTILE(0) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("positive"), error.message!!)
+    }
+
+    @Test
+    fun ntileBucketCountMustBeAnInteger() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT NTILE(1.5) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionNestedInsideLagsOffsetIsRejected() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT LAG(salary, ROW_NUMBER() OVER (ORDER BY id)) OVER (ORDER BY id) FROM employees")
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    @Test
+    fun explicitRowsFrameProducesAMovingAverageInsteadOfARunningTotal() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(400L, 800L, 700L, 200L, 400L, 300L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rowsBetweenCurrentRowAndFollowingLooksForward() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(listOf(800L, 700L, 300L, 400L, 300L, 100L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rowsBetweenUnboundedPrecedingAndCurrentRowMatchesTheImplicitDefaultOnAUniqueOrderKey() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val explicit = db.select(
+            "SELECT id, SUM(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        val implicit = db.select("SELECT id, SUM(salary) OVER (ORDER BY id) AS s FROM employees ORDER BY id ASC")
+        assertEquals(implicit.rows, explicit.rows)
+    }
+
+    @Test
+    fun frameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS c " +
+                "FROM employees WHERE deptId = 1 ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(listOf(int(1), Value.NullValue, int(0)), listOf(int(2), Value.NullValue, int(0)), listOf(int(3), Value.NullValue, int(0))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun firstValueAndLastValueRespectAnExplicitFrameInsteadOfThePeerGroupDefault() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, " +
+                "FIRST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS f, " +
+                "LAST_VALUE(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS l " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(
+            listOf(
+                listOf(int(1), int(400), int(400)),
+                listOf(int(2), int(400), int(300)),
+                listOf(int(3), int(400), int(300)),
+                listOf(int(4), int(200), int(200)),
+                listOf(int(5), int(200), int(100)),
+                listOf(int(6), int(200), int(100))
+            ),
+            result.rows
+        )
+    }
+
+    @Test
+    fun rowsFrameShorthandWithoutBetweenEndsAtCurrentRow() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val explicit = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS 1 PRECEDING) AS s FROM employees ORDER BY id ASC"
+        )
+        val spelledOut = db.select(
+            "SELECT id, SUM(salary) OVER (PARTITION BY deptId ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s " +
+                "FROM employees ORDER BY id ASC"
+        )
+        assertEquals(spelledOut.rows, explicit.rows)
+    }
+
+    @Test
+    fun rowsFrameOffsetMustNotBeNegative() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun rowsFrameOffsetMustBeAnInteger() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("integer"), error.message!!)
+    }
+
+    @Test
+    fun rowsFrameIsRejectedOnRankingAndOffsetWindowFunctions() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT ROW_NUMBER() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("frame"), error.message!!)
+    }
+
+    @Test
+    fun windowFunctionNestedInsideAFrameOffsetIsRejected() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run(
+                "SELECT SUM(salary) OVER (ORDER BY id ROWS BETWEEN ROW_NUMBER() OVER (ORDER BY id) PRECEDING AND CURRENT ROW) " +
+                    "FROM employees"
+            )
+        }
+        assertTrue(error.message!!.contains("nested"), error.message!!)
+    }
+
+    /** amount is monotonic in id (10, 20, 20, 30, 50) so `ORDER BY id` and `ORDER BY amount` agree, with a tie at 20. */
+    private fun Database.seedWindowSales() {
+        run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
+        run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
+    }
+
+    @Test
+    fun rangeBetweenPrecedingAndFollowingIncludesRowsWithinValueDistanceRegardlessOfPhysicalRowCount() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(50L, 80L, 80L, 70L, 50L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeBetweenPrecedingAndFollowingOnADescendingOrderByFlipsWhichDirectionIsPreceding() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount DESC RANGE BETWEEN 15 PRECEDING AND 5 FOLLOWING) AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(50L, 70L, 70L, 30L, 50L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeCurrentRowExpandsToTheWholePeerGroupUnlikeRowsCurrentRow() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val range = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM sales ORDER BY id ASC"
+        )
+        val rows = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(10L, 50L, 50L, 80L, 130L), range.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(listOf(10L, 30L, 50L, 80L, 130L), rows.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameMeasuresDistanceOnADecimalColumn() {
+        val db = newDatabase()
+        db.run("CREATE TABLE prices (id INTEGER PRIMARY KEY, price DECIMAL(10, 2))")
+        db.run("INSERT INTO prices VALUES (1, 1.00), (2, 1.40), (3, 1.50), (4, 2.00)")
+        val result = db.select(
+            "SELECT id, COUNT(*) OVER (ORDER BY price RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) AS c FROM prices ORDER BY id ASC"
+        )
+        assertEquals(listOf(3L, 3L, 4L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameMeasuresDistanceInDaysOnADateColumn() {
+        val db = newDatabase()
+        db.run("CREATE TABLE events (id INTEGER PRIMARY KEY, day DATE)")
+        db.run(
+            "INSERT INTO events VALUES " +
+                "(1, CAST('2024-01-01' AS DATE)), (2, CAST('2024-01-02' AS DATE)), " +
+                "(3, CAST('2024-01-05' AS DATE)), (4, CAST('2024-01-06' AS DATE)), (5, CAST('2024-01-10' AS DATE))"
+        )
+        val result = db.select(
+            "SELECT id, COUNT(*) OVER (ORDER BY day RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c FROM events ORDER BY id ASC"
+        )
+        assertEquals(listOf(2L, 2L, 2L, 2L, 1L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun rangeFrameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (ORDER BY amount RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS c " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals((1L..5L).map { listOf(int(it), Value.NullValue, int(0)) }, result.rows)
+    }
+
+    @Test
+    fun rangeFrameWithAPrecedingBoundRequiresExactlyOneOrderByColumn() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(amount) OVER (ORDER BY amount, id RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) FROM sales")
+        }
+        assertTrue(error.message!!.contains("exactly one ORDER BY column"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameWithAPrecedingBoundRequiresANumericOrDateOrderColumn() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(salary) OVER (ORDER BY name RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("numeric or DATE"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameOffsetMustBeNumeric() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("numeric"), error.message!!)
+    }
+
+    @Test
+    fun rangeFrameOffsetMustNotBeNegative() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT SUM(amount) OVER (ORDER BY amount RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM sales")
+        }
+        assertTrue(error.message!!.contains("negative"), error.message!!)
+    }
+
+    @Test
+    fun groupsBetweenPrecedingAndFollowingCountsPeerGroupsNotPhysicalRows() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val groups = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM sales ORDER BY id ASC"
+        )
+        val rows = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(50L, 80L, 80L, 120L, 80L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(listOf(30L, 50L, 70L, 100L, 80L), rows.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsCurrentRowExpandsToTheWholePeerGroupJustLikeRangeCurrentRow() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val groups = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM sales ORDER BY id ASC"
+        )
+        val range = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(10L, 50L, 50L, 80L, 130L), groups.rows.map { (it[1] as Value.IntegerValue).value })
+        assertEquals(groups.rows, range.rows)
+    }
+
+    @Test
+    fun groupsFrameWorksWithAMultiColumnNonNumericOrderByUnlikeRange() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val result = db.select(
+            "SELECT id, COUNT(*) OVER (ORDER BY deptId, name GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c " +
+                "FROM employees ORDER BY deptId ASC, name ASC"
+        )
+        assertEquals(listOf(int(1), int(3), int(2), int(5), int(6), int(4)), result.rows.map { it[0] })
+        assertEquals(listOf(2L, 3L, 3L, 3L, 3L, 2L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun groupsFrameEntirelyPastThePartitionEdgeAggregatesToNullAndCountsZero() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (ORDER BY amount GROUPS BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS s, " +
+                "COUNT(*) OVER (ORDER BY amount GROUPS BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS c " +
+                "FROM sales ORDER BY id ASC"
+        )
+        assertEquals((1L..5L).map { listOf(int(it), Value.NullValue, int(0)) }, result.rows)
+    }
+
+    @Test
+    fun groupsFrameIsRejectedOnRankingAndOffsetWindowFunctions() {
+        val db = newDatabase()
+        db.seedWindowEmployees()
+        val error = assertFailsWith<DiskExecutorException> {
+            db.run("SELECT ROW_NUMBER() OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM employees")
+        }
+        assertTrue(error.message!!.contains("GROUPS"), error.message!!)
+    }
+
+    @Test
+    fun excludeCurrentRowRemovesOnlyTheCurrentRowFromTheWholePartitionFrame() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(120L, 110L, 110L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeGroupRemovesTheWholePeerGroupIncludingTheCurrentRow() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(120L, 90L, 90L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeTiesRemovesOnlyTheOtherTiedRowsAndKeepsTheCurrentRow() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(130L, 110L, 110L, 130L, 130L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    @Test
+    fun excludeCurrentRowInteractsWithABoundedFrameInsteadOfOnlyTheWholePartition() {
+        val db = newDatabase()
+        db.seedWindowSales()
+        val result = db.select(
+            "SELECT id, SUM(amount) OVER (" +
+                "ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW" +
+                ") AS s FROM sales ORDER BY id ASC"
+        )
+        assertEquals(listOf(20L, 30L, 50L, 70L, 30L), result.rows.map { (it[1] as Value.IntegerValue).value })
+    }
+
+    private fun Database.seedUsersForViews() {
+        run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, dept TEXT)")
+        run(
+            "INSERT INTO users VALUES " +
+                "(1, 'ada', 36, 'eng'), (2, 'linus', 54, 'eng'), (3, 'grace', 85, 'navy'), (4, 'alan', 41, NULL)"
+        )
+    }
+
+    @Test
+    fun createViewReturnsResultAndRegistersName() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        val result = db.run("CREATE VIEW adults AS SELECT id, name FROM users WHERE age >= 40").single()
+        assertEquals(CreateViewResult("adults"), result)
+        assertEquals(listOf("adults"), db.catalog.viewNames)
+    }
+
+    @Test
+    fun queryingAViewRunsItsDefiningQueryFresh() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name FROM users WHERE age >= 40")
+        val first = db.select("SELECT name FROM adults ORDER BY id ASC")
+        assertEquals(listOf(text("linus"), text("grace"), text("alan")), first.rows.map { it.single() })
+
+        db.run("INSERT INTO users VALUES (5, 'margaret', 61, 'navy')")
+        val second = db.select("SELECT name FROM adults ORDER BY id ASC")
+        assertEquals(
+            listOf(text("linus"), text("grace"), text("alan"), text("margaret")),
+            second.rows.map { it.single() }
+        )
+    }
+
+    @Test
+    fun viewCanBeUsedAsAJoinTarget() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE TABLE bonuses (dept TEXT, amount INTEGER)")
+        db.run("INSERT INTO bonuses VALUES ('eng', 1000), ('navy', 500)")
+        db.run("CREATE VIEW eng_staff AS SELECT id, name, dept FROM users WHERE dept = 'eng'")
+        val result = db.select(
+            "SELECT eng_staff.name, bonuses.amount FROM eng_staff " +
+                "JOIN bonuses ON eng_staff.dept = bonuses.dept ORDER BY eng_staff.id ASC"
+        )
+        assertEquals(
+            listOf(listOf(text("ada"), int(1000)), listOf(text("linus"), int(1000))),
+            result.rows
+        )
+    }
+
+    @Test
+    fun viewOverAggregateQueryWorks() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW dept_counts AS SELECT dept, COUNT(*) AS n FROM users GROUP BY dept")
+        val result = db.select("SELECT dept, n FROM dept_counts WHERE n > 1 ORDER BY dept ASC")
+        assertEquals(listOf(listOf(text("eng"), int(2))), result.rows)
+    }
+
+    @Test
+    fun viewDefinitionCanReferenceAnotherView() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name, age FROM users WHERE age >= 40")
+        db.run("CREATE VIEW seniors AS SELECT id, name FROM adults WHERE age >= 60")
+        val result = db.select("SELECT name FROM seniors")
+        assertEquals(listOf(listOf(text("grace"))), result.rows)
+    }
+
+    @Test
+    fun viewCanBeReferencedInsideAWithCteBody() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name, age FROM users WHERE age >= 40")
+        val result = db.select("WITH a AS (SELECT name FROM adults WHERE age >= 60) SELECT name FROM a")
+        assertEquals(listOf(listOf(text("grace"))), result.rows)
+    }
+
+    @Test
+    fun viewCanAppearOnEitherSideOfASetOperation() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW eng AS SELECT name FROM users WHERE dept = 'eng'")
+        db.run("CREATE VIEW navy AS SELECT name FROM users WHERE dept = 'navy'")
+        val result = db.select("SELECT name FROM eng UNION SELECT name FROM navy ORDER BY name")
+        assertEquals(listOf(listOf(text("ada")), listOf(text("grace")), listOf(text("linus"))), result.rows)
+    }
+
+    @Test
+    fun creatingAViewValidatesColumnsEagerly() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        assertFailsWith<KestrelException> { db.run("CREATE VIEW broken AS SELECT nope FROM users") }
+        assertTrue(db.catalog.viewNames.isEmpty())
+    }
+
+    @Test
+    fun creatingAViewOverAnUnknownTableFails() {
+        val db = newDatabase()
+        assertFailsWith<KestrelException> { db.run("CREATE VIEW v AS SELECT * FROM missing") }
+    }
+
+    @Test
+    fun duplicateViewNameFailsWithoutOrReplace() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        assertFailsWith<KestrelException> { db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 21") }
+    }
+
+    @Test
+    fun createOrReplaceViewSwapsTheDefinition() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        db.run("CREATE OR REPLACE VIEW adults AS SELECT id FROM users WHERE age >= 50")
+        val result = db.select("SELECT id FROM adults ORDER BY id ASC")
+        assertEquals(listOf(listOf(int(2)), listOf(int(3))), result.rows)
+    }
+
+    @Test
+    fun dropViewRemovesItAndItStopsBeingQueryable() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        val result = db.run("DROP VIEW adults").single()
+        assertEquals(DropViewResult("adults"), result)
+        assertFailsWith<KestrelException> { db.run("SELECT * FROM adults") }
+    }
+
+    @Test
+    fun droppingAnUnknownViewFails() {
+        val db = newDatabase()
+        assertFailsWith<DiskCatalogException> { db.run("DROP VIEW nope") }
+    }
+
+    @Test
+    fun cannotCreateTableWithSameNameAsAnExistingView() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        assertFailsWith<DiskCatalogException> { db.run("CREATE TABLE adults (id INTEGER)") }
+    }
+
+    @Test
+    fun cannotCreateViewWithSameNameAsAnExistingTable() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        assertFailsWith<DiskCatalogException> { db.run("CREATE VIEW users AS SELECT id FROM users") }
+    }
+
+    @Test
+    fun dropTableRefusesAViewNameAndDropViewRefusesATableName() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        assertFailsWith<DiskCatalogException> { db.run("DROP TABLE adults") }
+        assertFailsWith<DiskCatalogException> { db.run("DROP VIEW users") }
+    }
+
+    @Test
+    fun insertUpdateDeleteAgainstAViewAreRejected() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name FROM users WHERE age >= 18")
+        assertFailsWith<DiskCatalogException> { db.run("INSERT INTO adults VALUES (9, 'x')") }
+        assertFailsWith<DiskCatalogException> { db.run("UPDATE adults SET name = 'x'") }
+        assertFailsWith<DiskCatalogException> { db.run("DELETE FROM adults") }
+    }
+
+    @Test
+    fun creatingAnIndexOnAViewIsRejected() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name FROM users WHERE age >= 18")
+        assertFailsWith<DiskCatalogException> { db.run("CREATE INDEX idx ON adults (id)") }
+    }
+
+    @Test
+    fun mutuallyRecursiveViewsFailInsteadOfOverflowingTheStack() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW a AS SELECT id FROM users")
+        db.run("CREATE VIEW b AS SELECT id FROM a")
+        db.run("CREATE OR REPLACE VIEW a AS SELECT id FROM b")
+        assertFailsWith<DiskExecutorException> { db.run("SELECT * FROM a") }
+    }
+
+    @Test
+    fun selfReferencingViewFailsCleanly() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW a AS SELECT id FROM users")
+        db.run("CREATE OR REPLACE VIEW a AS SELECT id FROM a")
+        assertFailsWith<DiskExecutorException> { db.run("SELECT * FROM a") }
+    }
+
+    @Test
+    fun dropTableWithADependentViewFailsByDefaultAndAlsoWithExplicitRestrict() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        assertFailsWith<DiskCatalogException> { db.run("DROP TABLE users") }
+        assertFailsWith<DiskCatalogException> { db.run("DROP TABLE users RESTRICT") }
+        assertEquals(listOf("users"), db.catalog.tableNames)
+        assertEquals(listOf("adults"), db.catalog.viewNames)
+    }
+
+    @Test
+    fun dropViewWithADependentViewFailsByDefault() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        db.run("CREATE VIEW seniorAdults AS SELECT id FROM adults WHERE id > 0")
+        assertFailsWith<DiskCatalogException> { db.run("DROP VIEW adults") }
+        assertEquals(listOf("adults", "seniorAdults"), db.catalog.viewNames)
+    }
+
+    @Test
+    fun dropViewCascadeDropsATransitiveChainOfDependentViews() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW a AS SELECT id FROM users WHERE age >= 18")
+        db.run("CREATE VIEW b AS SELECT id FROM a WHERE id > 0")
+        db.run("CREATE VIEW c AS SELECT id FROM b WHERE id > 0")
+        db.run("DROP VIEW a CASCADE")
+        assertTrue(db.catalog.viewNames.isEmpty())
+    }
+
+    @Test
+    fun dropTableWithADiamondOfDependentViewsIsBlockedByEveryDirectDependent() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW b AS SELECT id FROM users WHERE age >= 18")
+        db.run("CREATE VIEW c AS SELECT id FROM users WHERE age >= 21")
+        assertFailsWith<DiskCatalogException> { db.run("DROP TABLE users") }
+        assertEquals(listOf("users"), db.catalog.tableNames)
+        assertEquals(listOf("b", "c"), db.catalog.viewNames)
+    }
+
+    @Test
+    fun dropTableCascadeDropsTheTableAndItsDependentView() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        db.run("DROP TABLE users CASCADE")
+        assertTrue(db.catalog.tableNames.isEmpty())
+        assertTrue(db.catalog.viewNames.isEmpty())
+    }
+
+    @Test
+    fun dropTableCascadeHandlesADiamondOfDependentViewsWithoutFailing() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW b AS SELECT id FROM users WHERE age >= 18")
+        db.run("CREATE VIEW c AS SELECT id FROM users WHERE age >= 21")
+        db.run("CREATE VIEW d AS SELECT b.id FROM b JOIN c ON b.id = c.id")
+        db.run("DROP TABLE users CASCADE")
+        assertTrue(db.catalog.tableNames.isEmpty())
+        assertTrue(db.catalog.viewNames.isEmpty())
+    }
+
+    @Test
+    fun dropTableCascadeDroppedViewsSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id FROM users WHERE age >= 18")
+        db.run("DROP TABLE users CASCADE")
+        db.reopen()
+        assertTrue(db.catalog.tableNames.isEmpty())
+        assertTrue(db.catalog.viewNames.isEmpty())
+    }
+
+    @Test
+    fun columnTypeOfAViewIsInferredFromActualData() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW names AS SELECT name FROM users")
+        val result = db.select("SELECT name FROM names WHERE name = 'ada'")
+        assertEquals(listOf(listOf(text("ada"))), result.rows)
+    }
+
+    @Test
+    fun viewDefinitionSurvivesClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name FROM users WHERE age >= 40")
+        db.reopen()
+        assertEquals(listOf("adults"), db.catalog.viewNames)
+        val result = db.select("SELECT name FROM adults ORDER BY id ASC")
+        assertEquals(listOf(text("linus"), text("grace"), text("alan")), result.rows.map { it.single() })
+
+        db.run("INSERT INTO users VALUES (5, 'margaret', 61, 'navy')")
+        db.reopen()
+        val afterInsertAndReopen = db.select("SELECT name FROM adults ORDER BY id ASC")
+        assertEquals(
+            listOf(text("linus"), text("grace"), text("alan"), text("margaret")),
+            afterInsertAndReopen.rows.map { it.single() }
+        )
+    }
+
+    @Test
+    fun viewOverViewAndDropViewSurviveReopen() {
+        val db = newDatabase()
+        db.seedUsersForViews()
+        db.run("CREATE VIEW adults AS SELECT id, name, age FROM users WHERE age >= 40")
+        db.run("CREATE VIEW seniors AS SELECT id, name FROM adults WHERE age >= 60")
+        db.reopen()
+        assertEquals(listOf(listOf(text("grace"))), db.select("SELECT name FROM seniors").rows)
+
+        db.run("DROP VIEW seniors")
+        db.reopen()
+        assertEquals(listOf("adults"), db.catalog.viewNames)
+        assertFailsWith<KestrelException> { db.run("SELECT * FROM seniors") }
+    }
+
+    @Test
+    fun columnLevelCheckAcceptsSatisfyingRowsAndRejectsViolatingOnes() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        assertEquals(InsertResult(1), db.run("INSERT INTO t VALUES (1, 30)").single())
+        val error = assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (2, -5)") }
+        assertTrue(error.message!!.contains("CHECK"))
+    }
+
+    @Test
+    fun checkPassesWhenExpressionIsUnknownBecauseOfNull() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        // three-valued logic: NULL > 0 is UNKNOWN, not FALSE, so the row is accepted
+        assertEquals(InsertResult(1), db.run("INSERT INTO t (id) VALUES (1)").single())
+    }
+
+    @Test
+    fun tableLevelCheckCanSpanMultipleColumns() {
+        val db = newDatabase()
+        db.run("CREATE TABLE ranges (id INTEGER PRIMARY KEY, low INTEGER, high INTEGER, CHECK (low <= high))")
+        assertEquals(InsertResult(1), db.run("INSERT INTO ranges VALUES (1, 1, 10)").single())
+        assertFailsWith<KestrelException> { db.run("INSERT INTO ranges VALUES (2, 10, 1)") }
+    }
+
+    @Test
+    fun multipleCheckConstraintsAllMustBeSatisfied() {
+        val db = newDatabase()
+        db.run(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0), " +
+                "score INTEGER CHECK (score BETWEEN 0 AND 100))"
+        )
+        assertEquals(InsertResult(1), db.run("INSERT INTO t VALUES (1, 30, 90)").single())
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (2, 30, 150)") }
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (3, -1, 90)") }
+    }
+
+    @Test
+    fun checkIsEnforcedOnUpdateToo() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        db.run("INSERT INTO t VALUES (1, 30)")
+        assertFailsWith<KestrelException> { db.run("UPDATE t SET age = -1 WHERE id = 1") }
+        assertEquals(UpdateResult(1), db.run("UPDATE t SET age = 40 WHERE id = 1").single())
+    }
+
+    @Test
+    fun checkRejectsAggregateFunctions() {
+        val db = newDatabase()
+        assertFailsWith<KestrelException> {
+            db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER CHECK (SUM(amount) > 0))")
+        }
+    }
+
+    @Test
+    fun checkRejectsSubqueries() {
+        val db = newDatabase()
+        db.run("CREATE TABLE other (id INTEGER PRIMARY KEY)")
+        assertFailsWith<KestrelException> {
+            db.run("CREATE TABLE t (id INTEGER PRIMARY KEY CHECK (id IN (SELECT id FROM other)))")
+        }
+    }
+
+    @Test
+    fun checkRejectsUnknownColumn() {
+        val db = newDatabase()
+        assertFailsWith<KestrelException> {
+            db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, CHECK (nope > 0))")
+        }
+    }
+
+    @Test
+    fun checkCanReferenceStringAndCallExpressions() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT CHECK (LENGTH(name) > 0))")
+        assertEquals(InsertResult(1), db.run("INSERT INTO t VALUES (1, 'ada')").single())
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (2, '')") }
+    }
+
+    @Test
+    fun checkDefinitionSurvivesClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0), CHECK (id > 0))")
+        db.run("INSERT INTO t VALUES (1, 30)")
+        db.reopen()
+
+        assertEquals(InsertResult(1), db.run("INSERT INTO t VALUES (2, 40)").single())
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (3, -1)") }
+        assertFailsWith<KestrelException> { db.run("UPDATE t SET age = -5 WHERE id = 1") }
+
+        db.reopen()
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (4, -1)") }
+        assertEquals(2, db.select("SELECT * FROM t").rows.size)
+    }
+
+    private fun Database.seedDepartmentsAndEmployees() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run(
+            "CREATE TABLE employees (" +
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL, dept_id INTEGER REFERENCES departments(id))"
+        )
+        run("INSERT INTO departments VALUES (1, 'eng'), (2, 'ops')")
+    }
+
+    private fun Database.seedCascadeDepartments() {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+                "dept_id INTEGER REFERENCES departments(id) ON DELETE CASCADE ON UPDATE CASCADE)"
+        )
+        run("INSERT INTO departments VALUES (1, 'eng'), (2, 'ops')")
+        run("INSERT INTO employees VALUES (1, 'ada', 1), (2, 'linus', 1), (3, 'grace', 2)")
+    }
+
+    private fun Database.seedSetNullDepartments(childNotNull: Boolean) {
+        run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        val childColumn = if (childNotNull) "dept_id INTEGER NOT NULL" else "dept_id INTEGER"
+        run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+                "$childColumn REFERENCES departments(id) ON DELETE SET NULL)"
+        )
+        run("INSERT INTO departments VALUES (1, 'eng')")
+        run("INSERT INTO employees VALUES (1, 'ada', 1)")
+    }
+
+    @Test
+    fun insertRejectsForeignKeyViolation() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        val error = assertFailsWith<KestrelException> { db.run("INSERT INTO employees VALUES (1, 'ada', 99)") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"))
+    }
+
+    @Test
+    fun insertAllowsNullForeignKeyValue() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (1, 'ada', NULL)").single())
+    }
+
+    @Test
+    fun insertSucceedsWhenReferencedRowExists() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (1, 'ada', 1)").single())
+    }
+
+    @Test
+    fun updateRejectsForeignKeyViolationOnChildColumn() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        assertFailsWith<KestrelException> { db.run("UPDATE employees SET dept_id = 99 WHERE id = 1") }
+    }
+
+    @Test
+    fun foreignKeyRequiresReferencedTableToExist() {
+        val db = newDatabase()
+        assertFailsWith<KestrelException> {
+            db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER REFERENCES missing(id))")
+        }
+    }
+
+    @Test
+    fun foreignKeyRequiresReferencedColumnToBeAPrimaryKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)")
+        assertFailsWith<KestrelException> {
+            db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT REFERENCES departments(name))")
+        }
+    }
+
+    @Test
+    fun tableLevelForeignKeySyntaxIsEquivalentToColumnLevel() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER, " +
+                "FOREIGN KEY (dept_id) REFERENCES departments(id))"
+        )
+        db.run("INSERT INTO departments VALUES (1, 'eng')")
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (1, 1)").single())
+        assertFailsWith<KestrelException> { db.run("INSERT INTO employees VALUES (2, 99)") }
+    }
+
+    @Test
+    fun deleteIsRestrictedByDefaultWhenChildrenReferenceTheRow() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        val error = assertFailsWith<KestrelException> { db.run("DELETE FROM departments WHERE id = 1") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"))
+        assertEquals(1, db.select("SELECT * FROM departments WHERE id = 1").rows.size)
+    }
+
+    @Test
+    fun deleteWithoutReferencingChildrenSucceeds() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        assertEquals(DeleteResult(1), db.run("DELETE FROM departments WHERE id = 2").single())
+    }
+
+    @Test
+    fun onDeleteCascadeRemovesReferencingChildren() {
+        val db = newDatabase()
+        db.seedCascadeDepartments()
+        assertEquals(DeleteResult(1), db.run("DELETE FROM departments WHERE id = 1").single())
+        assertEquals(listOf(listOf(text("grace"))), db.select("SELECT name FROM employees ORDER BY id").rows)
+    }
+
+    @Test
+    fun onUpdateCascadeChangesChildForeignKeyWhenParentPrimaryKeyChanges() {
+        val db = newDatabase()
+        db.seedCascadeDepartments()
+        db.run("UPDATE departments SET id = 10 WHERE id = 1")
+        val depts = db.select("SELECT dept_id FROM employees ORDER BY id")
+        assertEquals(listOf(listOf(int(10)), listOf(int(10)), listOf(int(2))), depts.rows)
+    }
+
+    @Test
+    fun onUpdateRestrictByDefaultBlocksPrimaryKeyChangeWhenChildrenReference() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        assertFailsWith<KestrelException> { db.run("UPDATE departments SET id = 99 WHERE id = 1") }
+    }
+
+    @Test
+    fun onDeleteSetNullNullsOutReferencingChildren() {
+        val db = newDatabase()
+        db.seedSetNullDepartments(childNotNull = false)
+        db.run("DELETE FROM departments WHERE id = 1")
+        assertEquals(listOf(listOf(Value.NullValue)), db.select("SELECT dept_id FROM employees WHERE id = 1").rows)
+    }
+
+    @Test
+    fun onDeleteSetNullFailsWhenChildColumnIsNotNull() {
+        val db = newDatabase()
+        db.seedSetNullDepartments(childNotNull = true)
+        val error = assertFailsWith<KestrelException> { db.run("DELETE FROM departments WHERE id = 1") }
+        assertTrue(error.message!!.contains("NOT NULL"))
+    }
+
+    @Test
+    fun selfReferencingForeignKeyIsAllowedAndCascadesThroughMultipleLevels() {
+        val db = newDatabase()
+        db.run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+                "manager_id INTEGER REFERENCES employees(id) ON DELETE CASCADE)"
+        )
+        db.run(
+            "INSERT INTO employees VALUES " +
+                "(1, 'ceo', NULL), (2, 'vp', 1), (3, 'manager', 2), (4, 'ic', 3)"
+        )
+        assertEquals(DeleteResult(1), db.run("DELETE FROM employees WHERE id = 1").single())
+        assertEquals(emptyList(), db.select("SELECT id FROM employees").rows)
+    }
+
+    @Test
+    fun selfReferencingForeignKeyAllowsForwardAndBackwardSiblingReferencesInTheSameInsertBatch() {
+        val db = newDatabase()
+        db.run(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+                "manager_id INTEGER REFERENCES employees(id))"
+        )
+        // row 1 references row 2 (forward, not yet on disk) and row 3 references row 1 (backward) -
+        // order-independence within a single multi-row INSERT statement.
+        assertEquals(
+            InsertResult(3),
+            db.run("INSERT INTO employees VALUES (1, 'a', 2), (2, 'b', NULL), (3, 'c', 1)").single()
+        )
+    }
+
+    @Test
+    fun dropTableIsRestrictedByDefaultWhenAForeignKeyReferencesIt() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        val error = assertFailsWith<KestrelException> { db.run("DROP TABLE departments") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"))
+    }
+
+    @Test
+    fun dropTableCascadeStripsTheForeignKeyButKeepsTheReferencingTableAndItsRows() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        db.run("DROP TABLE departments CASCADE")
+        assertEquals(listOf("employees"), db.catalog.tableNames)
+        assertEquals(1, db.select("SELECT * FROM employees").rows.size)
+        // the constraint is gone, so a now-dangling value is accepted
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (2, 'linus', 99)").single())
+    }
+
+    @Test
+    fun dropTableCascadeStrippedForeignKeySurvivesClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        db.run("DROP TABLE departments CASCADE")
+        db.reopen()
+        assertEquals(listOf("employees"), db.catalog.tableNames)
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (2, 'linus', 99)").single())
+    }
+
+    @Test
+    fun dropTableCascadeDropsDependentViewsAndStripsForeignKeysInTheSameStatement() {
+        val db = newDatabase()
+        db.seedDepartmentsAndEmployees()
+        db.run("CREATE VIEW deptNames AS SELECT name FROM departments")
+        db.run("INSERT INTO employees VALUES (1, 'ada', 1)")
+        db.run("DROP TABLE departments CASCADE")
+        assertEquals(listOf("employees"), db.catalog.tableNames)
+        assertTrue(db.catalog.viewNames.isEmpty())
+        assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (2, 'linus', 99)").single())
+    }
+
