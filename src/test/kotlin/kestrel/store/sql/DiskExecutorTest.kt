@@ -3328,3 +3328,163 @@ class DiskExecutorTest {
         assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (2, 'linus', 99)").single())
     }
 
+    @Test
+    fun foreignKeyConstraintSurvivesClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.seedCascadeDepartments()
+        db.reopen()
+
+        assertFailsWith<KestrelException> { db.run("INSERT INTO employees VALUES (4, 'ed', 99)") }
+        db.run("DELETE FROM departments WHERE id = 1")
+        assertEquals(listOf(listOf(text("grace"))), db.select("SELECT name FROM employees ORDER BY id").rows)
+
+        db.reopen()
+        assertFailsWith<KestrelException> { db.run("DROP TABLE departments") }
+        assertEquals(1, db.select("SELECT * FROM employees").rows.size)
+    }
+
+    // ---- ALTER TABLE ADD COLUMN ----
+
+    @Test
+    fun addColumnAppendsNullToExistingRowsWhenNoDefaultIsGiven() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        val result = db.run("ALTER TABLE t ADD COLUMN age INTEGER").single()
+        assertEquals(AlterTableResult("t"), result)
+        assertEquals(listOf(listOf(int(1), text("ada"), Value.NullValue)), db.select("SELECT * FROM t").rows)
+    }
+
+    @Test
+    fun addColumnBackfillsExistingRowsWithDefaultValue() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada'), (2, 'linus')")
+        db.run("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'active'")
+        assertEquals(
+            listOf(listOf(text("active")), listOf(text("active"))),
+            db.select("SELECT status FROM t ORDER BY id ASC").rows
+        )
+    }
+
+    @Test
+    fun addColumnRejectsNotNullWithoutDefaultWhenTableHasRows() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("INSERT INTO t VALUES (1)")
+        val error = assertFailsWith<KestrelException> { db.run("ALTER TABLE t ADD COLUMN name TEXT NOT NULL") }
+        assertTrue(error.message!!.contains("NOT NULL"))
+        assertEquals(listOf("id"), db.select("SELECT * FROM t").columns)
+    }
+
+    @Test
+    fun addColumnAllowsNotNullWithoutDefaultWhenTableIsEmpty() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("ALTER TABLE t ADD COLUMN name TEXT NOT NULL")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        assertEquals(listOf(listOf(text("ada"))), db.select("SELECT name FROM t").rows)
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t (id) VALUES (2)") }
+    }
+
+    @Test
+    fun addColumnRejectsDuplicateColumnName() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t ADD COLUMN name TEXT") }
+        assertTrue(error.message!!.contains("duplicate column"))
+    }
+
+    @Test
+    fun addColumnRequiresTableToExist() {
+        val db = newDatabase()
+        assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE missing ADD COLUMN x INTEGER") }
+    }
+
+    @Test
+    fun newColumnParticipatesInInsertUpdateWhereAndSelect() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        db.run("ALTER TABLE t ADD COLUMN age INTEGER DEFAULT 0")
+        db.run("INSERT INTO t VALUES (2, 'linus', 54)")
+        db.run("UPDATE t SET age = 36 WHERE id = 1")
+        assertEquals(listOf(listOf(text("linus"))), db.select("SELECT name FROM t WHERE age > 40").rows)
+    }
+
+    @Test
+    fun addColumnOnATableWithASecondaryIndexKeepsThePushdownWorking() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("CREATE INDEX idx_age ON users(age)")
+        db.run("ALTER TABLE users ADD COLUMN dept TEXT DEFAULT 'eng'")
+        val table = db.catalog.table("users")
+        val scansBefore = table.scanCount
+        val result = db.select("SELECT name FROM users WHERE age = 54")
+        assertEquals(listOf(listOf(text("linus"))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+        assertEquals(scansBefore, table.scanCount)
+        assertEquals(listOf(listOf(text("eng"))), db.select("SELECT dept FROM users WHERE id = 1").rows)
+    }
+
+    @Test
+    fun addColumnDefinitionAndBackfilledDataSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        db.run("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'active'")
+        db.reopen()
+        assertEquals(listOf(listOf(int(1), text("ada"), text("active"))), db.select("SELECT * FROM t").rows)
+        db.run("INSERT INTO t VALUES (2, 'linus', DEFAULT)")
+        assertEquals(listOf(listOf(text("active"))), db.select("SELECT status FROM t WHERE id = 2").rows)
+    }
+
+    // ---- ALTER TABLE DROP COLUMN ----
+
+    @Test
+    fun dropColumnRemovesColumnFromSchemaAndData() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, bio TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada', 'mathematician')")
+        db.run("ALTER TABLE t DROP COLUMN bio")
+        val result = db.select("SELECT * FROM t")
+        assertEquals(listOf("id", "name"), result.columns)
+        assertEquals(listOf(listOf(int(1), text("ada"))), result.rows)
+    }
+
+    @Test
+    fun dropColumnRejectsWhenItIsTheOnlyColumn() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t DROP COLUMN id") }
+        assertTrue(error.message!!.contains("no columns"))
+    }
+
+    @Test
+    fun dropColumnRejectsPrimaryKeyColumnEvenWithCascade() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t DROP COLUMN id CASCADE") }
+        assertTrue(error.message!!.contains("PRIMARY KEY"))
+    }
+
+    @Test
+    fun dropColumnRestrictsWhenReferencedByAnotherTablesForeignKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_code TEXT REFERENCES departments(code))")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE departments DROP COLUMN code") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"))
+    }
+
+    @Test
+    fun dropColumnCascadeRemovesTheReferencingForeignKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_code TEXT REFERENCES departments(code))")
+        db.run("INSERT INTO departments VALUES (1, 'eng')")
+        db.run("ALTER TABLE departments DROP COLUMN code CASCADE")
+        db.run("INSERT INTO employees VALUES (1, 'ghost')")
+        assertEquals(listOf(listOf(text("ghost"))), db.select("SELECT dept_code FROM employees").rows)
+    }
+
