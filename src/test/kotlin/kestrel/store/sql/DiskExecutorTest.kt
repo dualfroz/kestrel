@@ -3488,3 +3488,552 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(text("ghost"))), db.select("SELECT dept_code FROM employees").rows)
     }
 
+    @Test
+    fun dropColumnRestrictsWhenUsedByItsOwnForeignKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id))")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE employees DROP COLUMN dept_id") }
+        assertTrue(error.message!!.contains("FOREIGN KEY"))
+    }
+
+    @Test
+    fun dropColumnCascadeRemovesItsOwnForeignKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id))")
+        db.run("ALTER TABLE employees DROP COLUMN dept_id CASCADE")
+        assertEquals(listOf("id"), db.select("SELECT * FROM employees").columns)
+    }
+
+    @Test
+    fun dropColumnRestrictsWhenUsedByAUniqueConstraint() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t DROP COLUMN email") }
+        assertTrue(error.message!!.contains("UNIQUE"))
+    }
+
+    @Test
+    fun dropColumnCascadeRemovesTheUniqueConstraint() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO t VALUES (1, 'a@x.com')")
+        db.run("ALTER TABLE t DROP COLUMN email CASCADE")
+        db.run("INSERT INTO t VALUES (2)")
+        assertEquals(2, db.select("SELECT * FROM t").rows.size)
+    }
+
+    @Test
+    fun dropColumnRestrictsWhenUsedByACheckConstraint() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t DROP COLUMN age") }
+        assertTrue(error.message!!.contains("CHECK"))
+    }
+
+    @Test
+    fun dropColumnCascadeRemovesTheCheckConstraint() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        db.run("ALTER TABLE t DROP COLUMN age CASCADE")
+        db.run("INSERT INTO t VALUES (1)")
+        assertEquals(1, db.select("SELECT * FROM t").rows.size)
+    }
+
+    @Test
+    fun dropColumnRestrictsWhenUsedByAnIndex() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+        db.run("CREATE INDEX idx_age ON t (age)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t DROP COLUMN age") }
+        assertTrue(error.message!!.contains("idx_age"))
+    }
+
+    /**
+     * Beyond mirroring the in-memory engine's own coverage, this also proves the position
+     * realignment [DiskTable.rewriteRows] performs for every surviving secondary index: `dept`
+     * shifts from column position 2 to 1 once `age` (position 1) is dropped, and `idx_dept` must
+     * keep resolving against the new position rather than the stale one it was built with.
+     */
+    @Test
+    fun dropColumnCascadeRemovesTheIndexAndASurvivingLaterIndexStillResolvesAtItsShiftedPosition() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER, dept TEXT)")
+        db.run("INSERT INTO t VALUES (1, 30, 'eng'), (2, 40, 'ops')")
+        db.run("CREATE INDEX idx_age ON t (age)")
+        db.run("CREATE INDEX idx_dept ON t (dept)")
+        db.run("ALTER TABLE t DROP COLUMN age CASCADE")
+
+        val table = db.catalog.table("t")
+        assertEquals(listOf("idx_dept"), table.secondaryIndexes.map { it.name })
+        val result = db.select("SELECT id FROM t WHERE dept = 'ops'")
+        assertEquals(listOf(listOf(int(2))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+    }
+
+    @Test
+    fun dropColumnDefinitionAndRemainingDataSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, bio TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada', 'mathematician')")
+        db.run("ALTER TABLE t DROP COLUMN bio")
+        db.reopen()
+        assertEquals(listOf("id", "name"), db.select("SELECT * FROM t").columns)
+        assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM t").rows)
+    }
+
+    // ---- ALTER TABLE RENAME COLUMN ----
+
+    @Test
+    fun renameColumnRenamesSchemaAndPreservesData() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, bio TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'mathematician')")
+        db.run("ALTER TABLE t RENAME COLUMN bio TO biography")
+        val result = db.select("SELECT * FROM t")
+        assertEquals(listOf("id", "biography"), result.columns)
+        assertEquals(listOf(listOf(int(1), text("mathematician"))), result.rows)
+    }
+
+    @Test
+    fun renameColumnRejectsUnknownColumn() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t RENAME COLUMN missing TO whatever") }
+    }
+
+    @Test
+    fun renameColumnRejectsWhenNewNameAlreadyExists() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t RENAME COLUMN name TO id") }
+        assertTrue(error.message!!.contains("already exists"))
+    }
+
+    @Test
+    fun renameColumnUpdatesCompositePrimaryKeyListing() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (region TEXT, seq INTEGER, PRIMARY KEY (region, seq))")
+        db.run("INSERT INTO t VALUES ('eu', 1)")
+        db.run("ALTER TABLE t RENAME COLUMN region TO area")
+        assertFailsWith<DiskTableException> { db.run("INSERT INTO t VALUES ('eu', 1)") }
+        db.run("INSERT INTO t VALUES ('eu', 2)")
+        assertEquals(2, db.select("SELECT * FROM t").rows.size)
+    }
+
+    @Test
+    fun renameColumnUpdatesItsOwnForeignKeyColumns() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id))")
+        db.run("INSERT INTO departments VALUES (1)")
+        db.run("ALTER TABLE employees RENAME COLUMN dept_id TO department_id")
+        assertFailsWith<KestrelException> { db.run("INSERT INTO employees VALUES (1, 99)") }
+        db.run("INSERT INTO employees VALUES (1, 1)")
+        assertEquals(1, db.select("SELECT * FROM employees").rows.size)
+    }
+
+    @Test
+    fun renameColumnPropagatesToOtherTablesForeignKeyReferencedColumns() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id) ON DELETE CASCADE)")
+        db.run("INSERT INTO departments VALUES (1)")
+        db.run("INSERT INTO employees VALUES (1, 1)")
+        db.run("ALTER TABLE departments RENAME COLUMN id TO dept_pk")
+        db.run("DELETE FROM departments WHERE dept_pk = 1")
+        assertTrue(db.select("SELECT * FROM employees").rows.isEmpty())
+    }
+
+    @Test
+    fun renameColumnUpdatesAUniqueConstraint() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        db.run("INSERT INTO t VALUES (1, 'a@x.com')")
+        db.run("ALTER TABLE t RENAME COLUMN email TO contact_email")
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (2, 'a@x.com')") }
+    }
+
+    @Test
+    fun renameColumnUpdatesACheckConstraintAndStillEnforcesIt() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
+        db.run("ALTER TABLE t RENAME COLUMN age TO years")
+        assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (1, -5)") }
+        db.run("INSERT INTO t VALUES (1, 30)")
+        assertEquals(listOf(listOf(int(30))), db.select("SELECT years FROM t").rows)
+    }
+
+    @Test
+    fun renameColumnUpdatesASecondaryIndexAndPushdownStillWorks() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+        db.run("INSERT INTO t VALUES (1, 30), (2, 40)")
+        db.run("CREATE INDEX idx_age ON t (age)")
+        db.run("ALTER TABLE t RENAME COLUMN age TO years")
+
+        val table = db.catalog.table("t")
+        val result = db.select("SELECT id FROM t WHERE years = 30")
+        assertEquals(listOf(listOf(int(1))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+        assertEquals(listOf("years"), table.secondaryIndexes.single().columnNames)
+    }
+
+    @Test
+    fun renameColumnDefinitionSurvivesClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, bio TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'mathematician')")
+        db.run("ALTER TABLE t RENAME COLUMN bio TO biography")
+        db.reopen()
+        assertEquals(listOf("id", "biography"), db.select("SELECT * FROM t").columns)
+        assertEquals(listOf(listOf(int(1), text("mathematician"))), db.select("SELECT * FROM t").rows)
+    }
+
+    // ---- ALTER TABLE RENAME TO ----
+
+    @Test
+    fun renameTableRenamesAndPreservesData() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        val result = db.run("ALTER TABLE t RENAME TO people").single()
+        assertEquals(AlterTableResult("people"), result)
+        assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM people").rows)
+        assertFailsWith<DiskCatalogException> { db.run("SELECT * FROM t") }
+        assertEquals(listOf("people"), db.catalog.tableNames)
+    }
+
+    @Test
+    fun renameTableRejectsWhenNewNameAlreadyExistsAsTable() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE other (id INTEGER PRIMARY KEY)")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t RENAME TO other") }
+        assertTrue(error.message!!.contains("already exists"))
+    }
+
+    @Test
+    fun renameTableRejectsWhenNewNameAlreadyExistsAsView() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE other (id INTEGER PRIMARY KEY)")
+        db.run("CREATE VIEW v AS SELECT * FROM other")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE t RENAME TO v") }
+        assertTrue(error.message!!.contains("already exists"))
+    }
+
+    @Test
+    fun renameTableRejectsRenamingAView() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("CREATE VIEW v AS SELECT * FROM t")
+        val error = assertFailsWith<DiskCatalogException> { db.run("ALTER TABLE v RENAME TO w") }
+        assertTrue(error.message!!.contains("cannot modify view"))
+    }
+
+    @Test
+    fun renameTablePropagatesToOtherTablesForeignKeyReference() {
+        val db = newDatabase()
+        db.run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
+        db.run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id) ON DELETE CASCADE)")
+        db.run("INSERT INTO departments VALUES (1)")
+        db.run("INSERT INTO employees VALUES (1, 1)")
+        db.run("ALTER TABLE departments RENAME TO divisions")
+        db.run("INSERT INTO divisions VALUES (2)")
+        db.run("INSERT INTO employees VALUES (2, 2)")
+        assertFailsWith<KestrelException> { db.run("INSERT INTO employees VALUES (3, 99)") }
+        db.run("DELETE FROM divisions WHERE id = 1")
+        assertEquals(listOf(listOf(int(2))), db.select("SELECT id FROM employees").rows)
+    }
+
+    @Test
+    fun renameTableUpdatesItsOwnSelfReferencingForeignKey() {
+        val db = newDatabase()
+        db.run("CREATE TABLE staff (id INTEGER PRIMARY KEY, manager_id INTEGER REFERENCES staff(id))")
+        db.run("INSERT INTO staff VALUES (1, NULL)")
+        db.run("ALTER TABLE staff RENAME TO personnel")
+        db.run("INSERT INTO personnel VALUES (2, 1)")
+        assertFailsWith<KestrelException> { db.run("INSERT INTO personnel VALUES (3, 99)") }
+        assertEquals(2, db.select("SELECT * FROM personnel").rows.size)
+    }
+
+    @Test
+    fun renameTableUpdatesASecondaryIndexAndPushdownStillWorks() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+        db.run("INSERT INTO t VALUES (1, 30), (2, 40)")
+        db.run("CREATE INDEX idx_age ON t (age)")
+        db.run("ALTER TABLE t RENAME TO people")
+
+        val table = db.catalog.table("people")
+        val result = db.select("SELECT id FROM people WHERE age = 30")
+        assertEquals(listOf(listOf(int(1))), result.rows)
+        assertEquals(1, table.secondaryLookupCount)
+    }
+
+    @Test
+    fun renameTablePropagatesIntoASimpleViewDefinition() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        db.run("CREATE VIEW v AS SELECT * FROM t")
+        db.run("ALTER TABLE t RENAME TO people")
+        assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM v").rows)
+    }
+
+    @Test
+    fun renameTableRenamingToItsOwnNameIsANoOp() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("INSERT INTO t VALUES (1)")
+        db.run("ALTER TABLE t RENAME TO t")
+        assertEquals(listOf(listOf(int(1))), db.select("SELECT * FROM t").rows)
+    }
+
+    @Test
+    fun renameTableDefinitionAndViewSurviveClosingAndReopeningTheCatalog() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        db.run("INSERT INTO t VALUES (1, 'ada')")
+        db.run("CREATE VIEW v AS SELECT * FROM t")
+        db.run("ALTER TABLE t RENAME TO people")
+        db.reopen()
+        assertEquals(listOf("people"), db.catalog.tableNames)
+        assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM v").rows)
+        assertFailsWith<DiskCatalogException> { db.run("SELECT * FROM t") }
+    }
+
+    /**
+     * The regression this guards against: [DiskCatalog.renameTable] used to capture the directory
+     * key a [DiskTable]'s `onRootsChanged` callback persists under *by value* at table-creation
+     * time. After a rename moved the row to a new map key, any *later* write that actually split a
+     * B+Tree (not the rename itself, which persists synchronously) would still try to persist under
+     * the stale, now-removed key and blow up with `NoSuchElementException`. 300 sequential inserts
+     * reliably force at least one primary-key index split (same row count [DiskCatalogTest] already
+     * relies on for the same reason).
+     */
+    @Test
+    fun renameTableFollowedByEnoughInsertsToSplitTheIndexPersistsCorrectlyAfterReopen() {
+        val db = newDatabase()
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        db.run("INSERT INTO t VALUES (1)")
+        db.run("ALTER TABLE t RENAME TO renamed")
+        for (id in 2..300) db.run("INSERT INTO renamed VALUES ($id)")
+
+        db.reopen()
+        assertEquals(300, db.select("SELECT * FROM renamed").rows.size)
+        for (id in listOf(1, 150, 300)) {
+            assertEquals(listOf(listOf(int(id.toLong()))), db.select("SELECT id FROM renamed WHERE id = $id").rows)
+        }
+    }
+
+    /**
+     * `PREPARE`/`EXECUTE`/`DEALLOCATE` ported to the disk-backed executor - see [DiskExecutor]'s own
+     * class doc. These mirror [kestrel.PreparedStatementTest] (the in-memory engine's own suite for
+     * the same feature) case by case, plus two disk-specific ones proving via a real close/reopen of
+     * the backing files that the registry is genuinely session-scoped rather than durable - the same
+     * distinction [kestrel.PersistenceTest] draws for the in-memory engine's own text WAL.
+     */
+    @Test
+    fun prepareReturnsItsNameAndExecuteRunsAParameterizedSelect() {
+        val db = newDatabase()
+        db.seedUsers()
+        assertEquals(
+            PrepareResult("byId"),
+            db.run("PREPARE byId AS SELECT name, age FROM users WHERE id = \$1").single()
+        )
+        val result = db.select("EXECUTE byId(2)")
+        assertEquals(listOf("name", "age"), result.columns)
+        assertEquals(listOf(listOf(text("linus"), int(54))), result.rows)
+    }
+
+    @Test
+    fun theSamePreparedStatementCanBeExecutedRepeatedlyWithDifferentArguments() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        assertEquals(listOf(listOf(text("ada"))), db.select("EXECUTE byId(1)").rows)
+        assertEquals(listOf(listOf(text("grace"))), db.select("EXECUTE byId(3)").rows)
+    }
+
+    @Test
+    fun executeSubstitutesMultipleParametersPositionally() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE inRange AS SELECT name FROM users WHERE age >= \$1 AND age <= \$2 ORDER BY age")
+        assertEquals(
+            listOf(listOf(text("ada")), listOf(text("linus"))),
+            db.select("EXECUTE inRange(30, 60)").rows
+        )
+    }
+
+    @Test
+    fun prepareCanWrapInsertAndExecuteInsertsARealRow() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER DEFAULT 0)")
+        db.run("PREPARE addUser AS INSERT INTO users VALUES (\$1, \$2, \$3)")
+        assertEquals(InsertResult(1), db.run("EXECUTE addUser(1, 'ada', 36)").single())
+        assertEquals(listOf(listOf(int(1), text("ada"), int(36))), db.select("SELECT * FROM users").rows)
+        assertEquals(InsertResult(1), db.run("EXECUTE addUser(2, 'linus', 54)").single())
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun prepareCanWrapUpdate() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE birthday AS UPDATE users SET age = age + \$1 WHERE id = \$2")
+        assertEquals(UpdateResult(1), db.run("EXECUTE birthday(1, 1)").single())
+        assertEquals(listOf(listOf(int(37))), db.select("SELECT age FROM users WHERE id = 1").rows)
+    }
+
+    @Test
+    fun prepareCanWrapDelete() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE removeUser AS DELETE FROM users WHERE id = \$1")
+        assertEquals(DeleteResult(1), db.run("EXECUTE removeUser(2)").single())
+        assertEquals(2, db.select("SELECT * FROM users").rows.size)
+    }
+
+    @Test
+    fun prepareCanWrapMergeAndAParameterReachesTheMatchedUpdateAssignment() {
+        val db = newDatabase()
+        db.run("CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL, balance INTEGER)")
+        db.run("CREATE TABLE staging (id INTEGER PRIMARY KEY, name TEXT NOT NULL, balance INTEGER)")
+        db.run("INSERT INTO accounts VALUES (1, 'ada', 100)")
+        db.run("INSERT INTO staging VALUES (1, 'ada', 500)")
+        db.run(
+            "PREPARE topUp AS MERGE INTO accounts USING staging ON accounts.id = staging.id " +
+                "WHEN MATCHED THEN UPDATE SET balance = staging.balance + \$1"
+        )
+        db.run("EXECUTE topUp(10)")
+        assertEquals(listOf(listOf(int(510))), db.select("SELECT balance FROM accounts WHERE id = 1").rows)
+        // A second EXECUTE with a DIFFERENT argument proves substitution recomputes fresh every call
+        // rather than baking in whatever value the first call used.
+        db.run("EXECUTE topUp(20)")
+        assertEquals(listOf(listOf(int(520))), db.select("SELECT balance FROM accounts WHERE id = 1").rows)
+    }
+
+    @Test
+    fun executeWithTheWrongNumberOfArgumentsFailsWithAClearMessage() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        val tooMany = assertFailsWith<DiskExecutorException> { db.run("EXECUTE byId(1, 2)") }
+        assertTrue(tooMany.message!!.contains("expects 1 parameter"), tooMany.message)
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE byId()") }
+    }
+
+    @Test
+    fun executeOfAnUnknownNameFails() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE nope(1)") }
+    }
+
+    @Test
+    fun preparingTheSameNameTwiceFails() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        assertFailsWith<DiskExecutorException> { db.run("PREPARE byId AS SELECT age FROM users WHERE id = \$1") }
+    }
+
+    @Test
+    fun deallocateRemovesAPreparedStatementSoExecuteNoLongerFindsIt() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        assertEquals(DeallocateResult("byId", all = false), db.run("DEALLOCATE byId").single())
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE byId(1)") }
+    }
+
+    @Test
+    fun deallocateAllRemovesEveryPreparedStatement() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE p1 AS SELECT name FROM users WHERE id = \$1")
+        db.run("PREPARE p2 AS SELECT age FROM users WHERE id = \$1")
+        assertEquals(DeallocateResult(null, all = true), db.run("DEALLOCATE ALL").single())
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE p1(1)") }
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE p2(1)") }
+    }
+
+    @Test
+    fun aNameCanBeReparedAfterBeingDeallocated() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        db.run("DEALLOCATE byId")
+        db.run("PREPARE byId AS SELECT age FROM users WHERE id = \$1")
+        assertEquals(listOf(listOf(int(36))), db.select("EXECUTE byId(1)").rows)
+    }
+
+    @Test
+    fun preparedStatementsAreNotUndoneByRollback() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("BEGIN")
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        db.run("ROLLBACK")
+        // Session-scoped, deliberately outside the storage-engine transaction that ROLLBACK undoes -
+        // see DiskExecutor's own doc on preparedStatements for why.
+        assertEquals(listOf(listOf(text("ada"))), db.select("EXECUTE byId(1)").rows)
+    }
+
+    @Test
+    fun executeArgumentsMustBeConstantNotColumnReferences() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        // The bare Evaluator() resolveExecute uses to evaluate EXECUTE arguments as constants is
+        // shared with the in-memory engine and throws the shared KestrelException directly, not a
+        // DiskExecutorException - unlike disk-executor-specific validation elsewhere in this class.
+        assertFailsWith<KestrelException> { db.run("EXECUTE byId(id)") }
+    }
+
+    @Test
+    fun preparedStatementDoesNotSurviveReopen() {
+        val db = newDatabase()
+        db.seedUsers()
+        db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
+        assertEquals(listOf(listOf(text("ada"))), db.select("EXECUTE byId(1)").rows)
+
+        db.reopen()
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE byId(1)") }
+    }
+
+    @Test
+    fun aPreparedInsertsRowSurvivesReopenEvenThoughThePrepareItselfDoesNot() {
+        val db = newDatabase()
+        db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER DEFAULT 0)")
+        db.run("PREPARE addUser AS INSERT INTO users VALUES (\$1, \$2, \$3)")
+        db.run("EXECUTE addUser(1, 'ada', 36)")
+
+        db.reopen()
+        assertEquals(listOf(listOf(int(1), text("ada"), int(36))), db.select("SELECT * FROM users").rows)
+        assertFailsWith<DiskExecutorException> { db.run("EXECUTE addUser(2, 'linus', 54)") }
+    }
+
+    /**
+     * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` used to be rejected outright here - see
+     * [DiskExecutorTemporaryTableTest] for the full feature (now a real, live in-memory-only table
+     * on this executor) this pair of tests only confirms is reachable through both spellings.
+     */
+    @Test
+    fun createTempTableIsAcceptedByTheDiskBackedExecutor() {
+        val db = newDatabase()
+        assertEquals(CreateTableResult("scratch"), db.run("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY)").single())
+        db.run("INSERT INTO scratch VALUES (1)")
+        assertEquals(listOf(listOf(int(1))), db.select("SELECT * FROM scratch").rows)
+    }
+
+    @Test
+    fun createTemporaryTableIsAcceptedByTheDiskBackedExecutor() {
+        val db = newDatabase()
+        assertEquals(CreateTableResult("scratch"), db.run("CREATE TEMPORARY TABLE scratch (id INTEGER PRIMARY KEY)").single())
+    }
+}
