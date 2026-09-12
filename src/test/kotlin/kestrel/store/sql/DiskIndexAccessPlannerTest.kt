@@ -153,3 +153,163 @@ class DiskIndexAccessPlannerTest {
         compositePrimaryKey = listOf("order_id", "line_no")
     )
 
+    @Test
+    fun equalityOnEveryCompositePrimaryKeyColumnIsAPointLookupInSchemaOrder() {
+        val predicate = and(
+            cmp(col("line_no"), BinaryOperator.Equal, int(2)),
+            cmp(col("order_id"), BinaryOperator.Equal, int(1))
+        )
+        val plan = planner.plan(orderLineSchema, emptyList(), predicate)
+        val point = assertIs<DiskAccessPlan.CompositePrimaryKeyPoint>(plan)
+        assertEquals(listOf(Value.IntegerValue(1), Value.IntegerValue(2)), point.keys)
+    }
+
+    @Test
+    fun equalityOnOnlySomeCompositePrimaryKeyColumnsFallsBackToAFullScan() {
+        // A partial equality match with no range on the remaining column either cannot be
+        // turned into a point lookup (line_no is left entirely unbound) - see
+        // DiskAccessPlan.CompositePrimaryKeyRange's own documentation for the narrower case where
+        // a range on the remaining last column IS pushed down instead.
+        val plan = planner.plan(orderLineSchema, emptyList(), cmp(col("order_id"), BinaryOperator.Equal, int(1)))
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    @Test
+    fun aRangeOnTheLastColumnOfACompositePrimaryKeyAfterAnEqualityPrefixIsPushedDown() {
+        val predicate = and(
+            cmp(col("order_id"), BinaryOperator.Equal, int(1)),
+            cmp(col("line_no"), BinaryOperator.Greater, int(2))
+        )
+        val plan = planner.plan(orderLineSchema, emptyList(), predicate)
+        val range = assertIs<DiskAccessPlan.CompositePrimaryKeyRange>(plan)
+        assertEquals(listOf(Value.IntegerValue(1)), range.prefix)
+        assertEquals(Value.IntegerValue(2), range.lower)
+        assertEquals(false, range.lowerInclusive)
+        assertNull(range.upper)
+    }
+
+    @Test
+    fun aTwoSidedRangeOnTheLastColumnOfACompositePrimaryKeyCombinesBothBounds() {
+        val predicate = and(
+            cmp(col("order_id"), BinaryOperator.Equal, int(1)),
+            and(
+                cmp(col("line_no"), BinaryOperator.GreaterEqual, int(2)),
+                cmp(col("line_no"), BinaryOperator.LessEqual, int(8))
+            )
+        )
+        val range = assertIs<DiskAccessPlan.CompositePrimaryKeyRange>(planner.plan(orderLineSchema, emptyList(), predicate))
+        assertEquals(listOf(Value.IntegerValue(1)), range.prefix)
+        assertEquals(Value.IntegerValue(2), range.lower)
+        assertEquals(true, range.lowerInclusive)
+        assertEquals(Value.IntegerValue(8), range.upper)
+        assertEquals(true, range.upperInclusive)
+    }
+
+    @Test
+    fun aRangeOnTheFirstColumnOfACompositePrimaryKeyWithNoEqualityPrefixIsNotPushedDown() {
+        // order_id is not the LAST composite PRIMARY KEY column - see
+        // DiskAccessPlan.CompositePrimaryKeyRange's own documentation on why leaving line_no
+        // entirely unconstrained after a range on order_id is a deliberate scope cut.
+        val plan = planner.plan(orderLineSchema, emptyList(), cmp(col("order_id"), BinaryOperator.Greater, int(1)))
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    @Test
+    fun anEqualityPrefixOnACompositePrimaryKeyIsPreferredOverARangeOnTheSameLastColumn() {
+        val predicate = and(
+            cmp(col("order_id"), BinaryOperator.Equal, int(1)),
+            and(
+                cmp(col("line_no"), BinaryOperator.Equal, int(2)),
+                cmp(col("line_no"), BinaryOperator.Greater, int(0))
+            )
+        )
+        val point = assertIs<DiskAccessPlan.CompositePrimaryKeyPoint>(planner.plan(orderLineSchema, emptyList(), predicate))
+        assertEquals(listOf(Value.IntegerValue(1), Value.IntegerValue(2)), point.keys)
+    }
+
+    private val orderLineWithWarehouseSchema = TableSchema(
+        "order_lines3",
+        listOf(
+            Column("warehouse", ColumnType.Text, notNull = true, primaryKey = false),
+            Column("order_id", ColumnType.Integer, notNull = true, primaryKey = false),
+            Column("line_no", ColumnType.Integer, notNull = true, primaryKey = false)
+        ),
+        compositePrimaryKey = listOf("warehouse", "order_id", "line_no")
+    )
+
+    @Test
+    fun aRangeOnTheLastColumnOfAThreeColumnCompositePrimaryKeyAfterATwoColumnEqualityPrefixIsPushedDown() {
+        val predicate = and(
+            cmp(col("warehouse"), BinaryOperator.Equal, text("west")),
+            and(
+                cmp(col("order_id"), BinaryOperator.Equal, int(1)),
+                cmp(col("line_no"), BinaryOperator.Less, int(10))
+            )
+        )
+        val range = assertIs<DiskAccessPlan.CompositePrimaryKeyRange>(planner.plan(orderLineWithWarehouseSchema, emptyList(), predicate))
+        assertEquals(listOf(Value.TextValue("west"), Value.IntegerValue(1)), range.prefix)
+        assertNull(range.lower)
+        assertEquals(Value.IntegerValue(10), range.upper)
+        assertEquals(false, range.upperInclusive)
+    }
+
+    @Test
+    fun aRangeOnAMiddleColumnOfAThreeColumnCompositePrimaryKeyLeavingTheLastColumnUnconstrainedIsNotPushedDown() {
+        // line_no would be left entirely unconstrained after a range on order_id - the same
+        // "must always fill every PRIMARY KEY column" restriction as the two-column schema's
+        // aRangeOnTheFirstColumnOfACompositePrimaryKeyWithNoEqualityPrefixIsNotPushedDown, just one
+        // column deeper.
+        val predicate = and(
+            cmp(col("warehouse"), BinaryOperator.Equal, text("west")),
+            cmp(col("order_id"), BinaryOperator.Greater, int(1))
+        )
+        val plan = planner.plan(orderLineWithWarehouseSchema, emptyList(), predicate)
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    @Test
+    fun comparingToANullLiteralIsNeverPushedDown() {
+        // "id = NULL" is never true under three-valued SQL logic and must not be
+        // treated as an equality lookup for NULL (which the encoding cannot represent).
+        val plan = planner.plan(schema, emptyList(), cmp(col("id"), BinaryOperator.Equal, LiteralExpression(Value.NullValue)))
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    /**
+     * A real [SecondaryIndexHandle] backed by a genuine, temp-file [DiskCatalog].
+     * The planner only ever reads a handle's `name`/`columnName` - never its
+     * live [kestrel.store.engine.TransactionalIndex] - but that index has no
+     * lightweight fake (its constructor is private and wired to a real
+     * [kestrel.store.page.PageStore]/[kestrel.store.txn.TransactionManager]),
+     * so real disk infrastructure is the simplest way to obtain a valid one.
+     */
+    private fun secondaryHandleStub(name: String, columnName: String): SecondaryIndexHandle {
+        val dataFile = Files.createTempFile("kestrel-planner-test-data", ".db").toFile().also { it.deleteOnExit() }
+        val walFile = Files.createTempFile("kestrel-planner-test-wal", ".db").toFile().also { it.deleteOnExit() }
+        val catalog = DiskCatalog.open(dataFile, walFile)
+        catalog.createTable("stub", schema.columns)
+        return catalog.createIndex("stub", name, columnName)
+    }
+
+    /** Composite-column counterpart of [secondaryHandleStub], over [orderLineSchema]'s columns. */
+    private fun compositeSecondaryHandleStub(name: String, columnNames: List<String>): SecondaryIndexHandle {
+        val dataFile = Files.createTempFile("kestrel-planner-test-data", ".db").toFile().also { it.deleteOnExit() }
+        val walFile = Files.createTempFile("kestrel-planner-test-wal", ".db").toFile().also { it.deleteOnExit() }
+        val catalog = DiskCatalog.open(dataFile, walFile)
+        catalog.createTable("stub", orderLineSchema.columns)
+        return catalog.createIndex("stub", name, columnNames)
+    }
+
+    @Test
+    fun equalityOnEveryColumnOfACompositeSecondaryIndexUsesIt() {
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val predicate = and(
+            cmp(col("sku"), BinaryOperator.Equal, text("widget")),
+            cmp(col("order_id"), BinaryOperator.Equal, int(1))
+        )
+        val plan = planner.plan(orderLineSchema, listOf(handle), predicate)
+        val secondary = assertIs<DiskAccessPlan.Secondary>(plan)
+        assertEquals("idx_order_sku", secondary.indexName)
+        assertEquals(listOf(Value.IntegerValue(1), Value.TextValue("widget")), secondary.keys)
+    }
+
