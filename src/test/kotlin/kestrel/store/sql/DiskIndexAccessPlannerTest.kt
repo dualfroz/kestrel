@@ -313,3 +313,99 @@ class DiskIndexAccessPlannerTest {
         assertEquals(listOf(Value.IntegerValue(1), Value.TextValue("widget")), secondary.keys)
     }
 
+    @Test
+    fun equalityOnOnlySomeColumnsOfACompositeSecondaryIndexFallsBackToAFullScan() {
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val plan = planner.plan(orderLineSchema, listOf(handle), cmp(col("order_id"), BinaryOperator.Equal, int(1)))
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    @Test
+    fun aSingleSidedRangeOnASingleColumnSecondaryIndexIsASecondaryRange() {
+        val handle = secondaryHandleStub("idx_age", "age")
+        val plan = planner.plan(schema, listOf(handle), cmp(col("age"), BinaryOperator.GreaterEqual, int(30)))
+        val range = assertIs<DiskAccessPlan.SecondaryRange>(plan)
+        assertEquals("idx_age", range.indexName)
+        assertEquals(emptyList<Value>(), range.prefix)
+        assertEquals(Value.IntegerValue(30), range.lower)
+        assertEquals(true, range.lowerInclusive)
+        assertNull(range.upper)
+    }
+
+    @Test
+    fun aTwoSidedRangeOnASingleColumnSecondaryIndexCombinesBothBounds() {
+        val handle = secondaryHandleStub("idx_age", "age")
+        val predicate = and(
+            cmp(col("age"), BinaryOperator.Greater, int(20)),
+            cmp(col("age"), BinaryOperator.Less, int(40))
+        )
+        val plan = planner.plan(schema, listOf(handle), predicate)
+        val range = assertIs<DiskAccessPlan.SecondaryRange>(plan)
+        assertEquals("idx_age", range.indexName)
+        assertEquals(emptyList<Value>(), range.prefix)
+        assertEquals(Value.IntegerValue(20), range.lower)
+        assertEquals(false, range.lowerInclusive)
+        assertEquals(Value.IntegerValue(40), range.upper)
+        assertEquals(false, range.upperInclusive)
+    }
+
+    @Test
+    fun anEqualityOnASecondaryIndexIsPreferredOverARangeOnTheSameColumn() {
+        // A range predicate alone would push down to SecondaryRange, but a stricter equality
+        // conjunct on the very same column is always more selective and must win.
+        val handle = secondaryHandleStub("idx_age", "age")
+        val predicate = and(cmp(col("age"), BinaryOperator.Equal, int(30)), cmp(col("age"), BinaryOperator.Greater, int(20)))
+        val plan = planner.plan(schema, listOf(handle), predicate)
+        val equality = assertIs<DiskAccessPlan.Secondary>(plan)
+        assertEquals(listOf(Value.IntegerValue(30)), equality.keys)
+    }
+
+    @Test
+    fun aRangeOnTheFirstColumnOfACompositeSecondaryIndexWithNoPrefixIsPushedDown() {
+        // The composite index is sorted by order_id first, so a bare range on it (no equality
+        // on any column at all) is just as pushable as the single-column case above - an empty
+        // prefix, mirroring kestrel.engine.IndexAccessPlanner's own "even an empty run" case.
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val plan = planner.plan(orderLineSchema, listOf(handle), cmp(col("order_id"), BinaryOperator.Greater, int(1)))
+        val range = assertIs<DiskAccessPlan.SecondaryRange>(plan)
+        assertEquals("idx_order_sku", range.indexName)
+        assertEquals(emptyList<Value>(), range.prefix)
+        assertEquals(Value.IntegerValue(1), range.lower)
+        assertEquals(false, range.lowerInclusive)
+        assertNull(range.upper)
+    }
+
+    @Test
+    fun aRangeOnTheSecondColumnOfACompositeSecondaryIndexAfterAnEqualityPrefixIsPushedDown() {
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val predicate = and(cmp(col("order_id"), BinaryOperator.Equal, int(1)), cmp(col("sku"), BinaryOperator.GreaterEqual, text("m")))
+        val plan = planner.plan(orderLineSchema, listOf(handle), predicate)
+        val range = assertIs<DiskAccessPlan.SecondaryRange>(plan)
+        assertEquals("idx_order_sku", range.indexName)
+        assertEquals(listOf(Value.IntegerValue(1)), range.prefix)
+        assertEquals(Value.TextValue("m"), range.lower)
+        assertEquals(true, range.lowerInclusive)
+        assertNull(range.upper)
+    }
+
+    @Test
+    fun aRangeOnTheSecondColumnOfACompositeSecondaryIndexWithNoEqualityPrefixIsNotPushedDown() {
+        // The index is sorted by order_id first - a range on sku alone cannot narrow the scan
+        // without first pinning order_id down, the same restriction as an equality-only prefix.
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val plan = planner.plan(orderLineSchema, listOf(handle), cmp(col("sku"), BinaryOperator.Greater, text("m")))
+        assertEquals(DiskAccessPlan.FullScan, plan)
+    }
+
+    @Test
+    fun anEqualityPrefixOnACompositeSecondaryIndexIsPreferredOverARangeOnTheSameNextColumn() {
+        val handle = compositeSecondaryHandleStub("idx_order_sku", listOf("order_id", "sku"))
+        val predicate = and(
+            cmp(col("order_id"), BinaryOperator.Equal, int(1)),
+            and(cmp(col("sku"), BinaryOperator.Equal, text("widget")), cmp(col("sku"), BinaryOperator.Greater, text("a")))
+        )
+        val plan = planner.plan(orderLineSchema, listOf(handle), predicate)
+        val equality = assertIs<DiskAccessPlan.Secondary>(plan)
+        assertEquals(listOf(Value.IntegerValue(1), Value.TextValue("widget")), equality.keys)
+    }
+}
