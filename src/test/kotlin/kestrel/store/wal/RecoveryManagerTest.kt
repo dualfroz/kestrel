@@ -156,3 +156,178 @@ class RecoveryManagerTest {
         assertTrue(abortSeen)
     }
 
+    @Test
+    fun rollingBackAnUnknownTransactionFails() {
+        val walFile = tempFile("kestrel-recovery-wal")
+        val dataFile = tempFile("kestrel-recovery-data")
+        val wal = WriteAheadLog(walFile)
+        val diskManager = DiskManager(dataFile)
+        assertFailsWith<IllegalArgumentException> { RecoveryManager(wal, diskManager).rollback(12345L) }
+    }
+
+    @Test
+    fun rollbackToUndoesOnlyUpdatesAfterTheSavepoint() {
+        val dataFile = tempFile("kestrel-recovery-data")
+        val walFile = tempFile("kestrel-recovery-wal")
+
+        val diskManager = DiskManager(dataFile)
+        val pageId = diskManager.allocatePage()
+        val v0 = pageOf(0)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v0, 0, it.data, 0, v0.size) })
+
+        val wal = WriteAheadLog(walFile)
+        val txn = wal.beginTransaction()
+        val v1 = pageOf(1)
+        wal.logUpdate(txn, pageId, v0, v1)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v1, 0, it.data, 0, v1.size) })
+        val savepointLsn = wal.lastLsnOf(txn)
+        val v2 = pageOf(2)
+        wal.logUpdate(txn, pageId, v1, v2)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v2, 0, it.data, 0, v2.size) })
+
+        RecoveryManager(wal, diskManager).rollbackTo(txn, savepointLsn)
+
+        assertContentEquals(v1, diskManager.readPage(pageId).data, "only the write after the savepoint should be undone")
+        val newTail = wal.lastLsnOf(txn)
+        val clr = wal.readAt(newTail)
+        assertTrue(clr is LogRecord.CompensationUpdate, "the transaction's chain tail should land on a new compensation record, not the undone update")
+        assertEquals(savepointLsn, clr.undoNextLsn, "the compensation record must skip straight back to the savepoint on a later undo walk")
+    }
+
+    @Test
+    fun rollbackToLeavesTheTransactionActiveForFurtherWritesOrAFullResolution() {
+        val dataFile = tempFile("kestrel-recovery-data")
+        val walFile = tempFile("kestrel-recovery-wal")
+
+        val diskManager = DiskManager(dataFile)
+        val pageId = diskManager.allocatePage()
+        val v0 = pageOf(0)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v0, 0, it.data, 0, v0.size) })
+
+        val wal = WriteAheadLog(walFile)
+        val txn = wal.beginTransaction()
+        val savepointLsn = wal.lastLsnOf(txn)
+        val v1 = pageOf(1)
+        wal.logUpdate(txn, pageId, v0, v1)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v1, 0, it.data, 0, v1.size) })
+
+        val recovery = RecoveryManager(wal, diskManager)
+        recovery.rollbackTo(txn, savepointLsn)
+        assertContentEquals(v0, diskManager.readPage(pageId).data)
+
+        // The savepoint itself is still usable, and the transaction can still be written to and resolved.
+        val v3 = pageOf(3)
+        wal.logUpdate(txn, pageId, v0, v3)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v3, 0, it.data, 0, v3.size) })
+        recovery.rollback(txn)
+
+        assertContentEquals(v0, diskManager.readPage(pageId).data, "a full rollback after a savepoint rollback must undo everything")
+        assertEquals(WriteAheadLog.NO_LSN, wal.lastLsnOf(txn))
+    }
+
+    /**
+     * The whole reason [LogRecord.CompensationUpdate] exists: a full rollback that walks back through
+     * a range already undone by an earlier [RecoveryManager.rollbackTo] must skip it via
+     * [LogRecord.CompensationUpdate.undoNextLsn] rather than re-undoing it, or it would misapply a
+     * stale before-image to a page a later write already changed again.
+     */
+    @Test
+    fun fullRollbackAfterAPartialRollbackDoesNotMisapplyAnAlreadyUndoneBeforeImage() {
+        val dataFile = tempFile("kestrel-recovery-data")
+        val walFile = tempFile("kestrel-recovery-wal")
+
+        val diskManager = DiskManager(dataFile)
+        val pageA = diskManager.allocatePage()
+        val pageB = diskManager.allocatePage()
+        diskManager.writePage(Page(pageA).also { System.arraycopy(pageOf(0), 0, it.data, 0, Page.PAGE_SIZE) })
+        diskManager.writePage(Page(pageB).also { System.arraycopy(pageOf(0), 0, it.data, 0, Page.PAGE_SIZE) })
+
+        val wal = WriteAheadLog(walFile)
+        val txn = wal.beginTransaction()
+        // Write A, then take a savepoint, then write B (on a *different* page than A).
+        wal.logUpdate(txn, pageA, pageOf(0), pageOf(1))
+        diskManager.writePage(Page(pageA).also { System.arraycopy(pageOf(1), 0, it.data, 0, Page.PAGE_SIZE) })
+        val savepointLsn = wal.lastLsnOf(txn)
+        wal.logUpdate(txn, pageB, pageOf(0), pageOf(9))
+        diskManager.writePage(Page(pageB).also { System.arraycopy(pageOf(9), 0, it.data, 0, Page.PAGE_SIZE) })
+
+        val recovery = RecoveryManager(wal, diskManager)
+        recovery.rollbackTo(txn, savepointLsn)
+        // Now write B again, with a *different* before/after pair than the undone write had.
+        wal.logUpdate(txn, pageB, pageOf(0), pageOf(20))
+        diskManager.writePage(Page(pageB).also { System.arraycopy(pageOf(20), 0, it.data, 0, Page.PAGE_SIZE) })
+
+        recovery.rollback(txn)
+
+        assertContentEquals(pageOf(0), diskManager.readPage(pageA).data)
+        assertContentEquals(pageOf(0), diskManager.readPage(pageB).data)
+    }
+
+    @Test
+    fun rollbackToASavepointLsnNotOnTheTransactionsChainFails() {
+        val dataFile = tempFile("kestrel-recovery-data")
+        val walFile = tempFile("kestrel-recovery-wal")
+        val diskManager = DiskManager(dataFile)
+        val pageId = diskManager.allocatePage()
+        diskManager.writePage(Page(pageId).also { System.arraycopy(pageOf(0), 0, it.data, 0, Page.PAGE_SIZE) })
+
+        val wal = WriteAheadLog(walFile)
+        val otherTxn = wal.beginTransaction()
+        val foreignLsn = wal.lastLsnOf(otherTxn)
+        val txn = wal.beginTransaction()
+        wal.logUpdate(txn, pageId, pageOf(0), pageOf(1))
+
+        assertFailsWith<RecoveryException> { RecoveryManager(wal, diskManager).rollbackTo(txn, foreignLsn) }
+    }
+
+    /**
+     * A crash right after a live savepoint rollback (before the enclosing transaction resolves) must
+     * still end up fully rolled back on the next recovery pass, including the write from *before* the
+     * savepoint - proving the forward-redo-then-backward-undo dance around a
+     * [LogRecord.CompensationUpdate] reproduces the live session's state exactly, not just the parts
+     * that happen to already be correct on disk.
+     */
+    @Test
+    fun recoverFullyUndoesATransactionThatCrashedRightAfterASavepointRollback() {
+        val dataFile = tempFile("kestrel-recovery-data")
+        val walFile = tempFile("kestrel-recovery-wal")
+
+        val diskManager = DiskManager(dataFile)
+        val pageId = diskManager.allocatePage()
+        val v0 = pageOf(0)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v0, 0, it.data, 0, v0.size) })
+
+        val wal = WriteAheadLog(walFile)
+        val txn = wal.beginTransaction()
+        val v1 = pageOf(1)
+        wal.logUpdate(txn, pageId, v0, v1)
+        diskManager.writePage(Page(pageId).also { System.arraycopy(v1, 0, it.data, 0, v1.size) })
+        val savepointLsn = wal.lastLsnOf(txn)
+        val v2 = pageOf(2)
+        wal.logUpdate(txn, pageId, v1, v2)
+        // The buffer pool never flushed v2 to disk before the crash, unlike the earlier tests -
+        // the data file still shows v1 (from a flush before the savepoint), the WAL is the only
+        // record that v2 (and its subsequent undo) ever happened.
+        RecoveryManager(wal, diskManager).rollbackTo(txn, savepointLsn)
+        // No commit, no abort: simulate a crash right here, mid-transaction.
+
+        val reopenedWal = WriteAheadLog(walFile)
+        val result = RecoveryManager(reopenedWal, diskManager).recover()
+
+        assertEquals(listOf(txn), result.rolledBackTxns)
+        assertContentEquals(v0, diskManager.readPage(pageId).data, "the unresolved transaction must be fully undone, including its pre-savepoint write")
+    }
+
+    @Test
+    fun redoOfAnUnallocatedPageFailsWithADescriptiveError() {
+        val walFile = tempFile("kestrel-recovery-wal")
+        val dataFile = tempFile("kestrel-recovery-data")
+        val diskManager = DiskManager(dataFile)
+        val wal = WriteAheadLog(walFile)
+        val txn = wal.beginTransaction()
+        wal.logUpdate(txn, 99L, pageOf(0), pageOf(1))
+        wal.commit(txn)
+
+        assertFailsWith<RecoveryException> { RecoveryManager(wal, diskManager).recover() }
+    }
+}
