@@ -16,7 +16,6 @@ data class CreateTableResult(val tableName: String) : StatementResult
 
 data class DropTableResult(val tableName: String) : StatementResult
 
-/** [tableNames] is every table actually truncated - the statement's own list plus, under CASCADE, every transitive FOREIGN KEY referencer added to it. */
 data class TruncateTableResult(val tableNames: List<String>) : StatementResult
 
 data class MergeResult(
@@ -62,5 +61,4 @@ data class RollbackToSavepointResult(val name: String) : StatementResult
 
 data class PrepareResult(val name: String) : StatementResult
 
-/** [name] is `null` exactly when [all] is `true` (`DEALLOCATE ALL`), mirroring [kestrel.sql.ast.DeallocateStatement]. */
 data class DeallocateResult(val name: String?, val all: Boolean) : StatementResult

@@ -79,15 +79,8 @@ class SelectRunner(private val catalog: Catalog) {
         is WithQuery -> explainWith(query)
     }
 
-    /**
-     * Resolves a single [FromItem] to its schema and row snapshot - the same lookup a `FROM`/`JOIN`
-     * source uses ([resolveSource]), exposed for [Executor.executeMerge]'s `USING` clause so a MERGE
-     * source can be either a real table or a derived-table subquery without duplicating view/CTE/
-     * subquery resolution.
-     */
     fun resolveMergeSource(item: FromItem): Pair<TableSchema, List<Row>> = resolveSource(item)
 
-    /** The name a MERGE `ON`/`WHEN` condition would qualify a column from [item] with - its alias if given, its bare table name otherwise (a subquery source always has one). */
     fun mergeSourceLabel(item: FromItem): String = sourceLabel(item)
 
     private fun explainSetOperation(statement: SetOperationStatement): List<String> {
@@ -171,29 +164,9 @@ class SelectRunner(private val catalog: Catalog) {
         return SelectResult(left.columns, rows)
     }
 
-    /**
-     * The declared `COLLATE` of [statement]'s combined output column named by an ORDER BY key
-     * expression (an unqualified [ColumnExpression] - the only kind [evaluateOutputRow] resolves
-     * for a set operation's own ORDER BY, since it rejects any qualifier), traced back to a real
-     * table column in [statement]'s LEFT branch only - the branch [SelectResult.columns] itself
-     * always takes column identity from (`runSetOperation` returns `SelectResult(left.columns,
-     * ...)`, never consulting the right side's names). Resolves only when that branch is a plain
-     * `SELECT ... FROM realTable [JOIN realTable ...]` (no CTE, view, or derived table anywhere in
-     * its FROM clause) referencing the column bare - going further would mean inheriting collation
-     * through a view/CTE/derived-table boundary, the still-open scope-cut already left by #65/#66
-     * for a plain SELECT's own WHERE/ORDER BY over such a source (see kestrel-stan.md), not
-     * extended here.
-     */
     private fun declaredSetOperationCollation(statement: SetOperationStatement, columns: List<String>): (ColumnExpression) -> Collation? =
         (statement.left as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
 
-    /**
-     * The same "plain `SELECT ... FROM realTable [JOIN realTable ...]`, no CTE/view/derived table"
-     * structural resolution [declaredSetOperationCollation] does for a set operation's LEFT branch,
-     * factored out so [declaredRecursiveCteCollation] can apply the identical rule to a recursive
-     * CTE's own anchor (base) term - the branch that owns [CteScope.schema]/column identity there,
-     * exactly like the LEFT branch owns [SelectResult.columns] for a plain set operation.
-     */
     private fun declaredCollationForSelectOutput(select: SelectStatement, columns: List<String>): (ColumnExpression) -> Collation? {
         val items = listOf(select.from) + select.joins.map { it.from }
         val sources = items.map { item ->
@@ -226,7 +199,6 @@ class SelectRunner(private val catalog: Catalog) {
         }
     }
 
-    /** Mirrors [declaredSetOperationCollation] but resolves against a recursive CTE's anchor (`base`) term. */
     private fun declaredRecursiveCteCollation(base: QueryStatement, columns: List<String>): (ColumnExpression) -> Collation? =
         (base as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
 
@@ -383,12 +355,6 @@ class SelectRunner(private val catalog: Catalog) {
         val sources = mutableListOf<Source>()
         var offset = 0
         fun add(item: FromItem) {
-            // A LATERAL derived table's rows depend on the row of an earlier FROM item it
-            // correlates with, so they cannot be resolved once up front like every other source -
-            // only its column *names* are needed here (for offset bookkeeping and validating
-            // references to its alias elsewhere in the query), computed structurally from the
-            // subquery's own AST without running it. Real rows are produced per left row in
-            // [executeJoin].
             val (schema, rows) = if (item is SubquerySource && item.lateral) {
                 lateralSchema(item) to emptyList()
             } else {
@@ -412,13 +378,6 @@ class SelectRunner(private val catalog: Catalog) {
         return TableSchema(item.alias, columns)
     }
 
-    /**
-     * The output column names of [query], derived purely from its AST (no execution, no catalog
-     * row data) - needed to give a LATERAL derived table a stable schema before any row of the
-     * source it correlates with is known. Column names never depend on data (aliases and bare
-     * column references are syntactic, and a table/view/CTE's shape is fixed), so this is safe
-     * even though the real rows can only be produced later, per outer row.
-     */
     private fun structuralColumnNames(query: QueryStatement, localCtes: Map<String, List<String>> = emptyMap()): List<String> =
         when (query) {
             is SelectStatement -> when (val projection = query.projection) {
@@ -513,11 +472,6 @@ class SelectRunner(private val catalog: Catalog) {
             return expression
         }
 
-        /**
-         * Every distinct window-function call in the SELECT list or (post alias-resolution) ORDER
-         * BY - the only two clauses where one is allowed. Computed once per [Plan] and reused both
-         * to append the values ([appendWindowColumns]) and to substitute them back in ([evaluateRow]).
-         */
         private val windowExpressions: List<WindowExpression> = run {
             val projectionWindows = (statement.projection as? ExpressionProjection)?.items
                 ?.flatMap { collectWindowExpressions(it.expression) } ?: emptyList()
@@ -543,12 +497,6 @@ class SelectRunner(private val catalog: Catalog) {
         fun resolveIndex(expression: ColumnExpression): Int =
             resolveIndexOrNull(expression) ?: throw KestrelException("no such column: ${describe(expression)}")
 
-        /**
-         * [expression]'s declared `COLLATE` (its [kestrel.catalog.Column.collation]) from whichever
-         * [sources] entry it resolves against - `null` when it names no column here (ambiguous
-         * across sources, same as [resolveIndexOrNull], resolves to nothing at all, or the matching
-         * column simply declared no COLLATE of its own).
-         */
         fun declaredCollationOrNull(expression: ColumnExpression): Collation? {
             val qualifier = expression.qualifier
             val matches = mutableListOf<Collation>()
@@ -575,7 +523,6 @@ class SelectRunner(private val catalog: Catalog) {
                 statement.projection.items.forEach { validateColumns(it.expression) }
             }
             statement.joins.forEachIndexed { position, join ->
-                // CROSS JOIN has no ON condition at all (its `on` is null) - nothing to validate.
                 val on = join.on ?: return@forEachIndexed
                 validateColumns(on)
                 rejectWindowFunction(on, "an ON condition")
@@ -589,13 +536,6 @@ class SelectRunner(private val catalog: Catalog) {
             if (statement.distinctOn.isNotEmpty()) validateDistinctOn()
         }
 
-        /**
-         * `DISTINCT ON (...)` has no unsurprising meaning once rows are already collapsed into
-         * aggregate groups - rejected outright rather than guessing which pre-aggregate row a group
-         * should be "first" for. The leading-`ORDER BY` requirement mirrors Postgres: `DISTINCT ON`
-         * exists to pick a deterministic row per group, which only means something if `ORDER BY`
-         * (when present at all) agrees on what "first" means for those same expressions.
-         */
         private fun validateDistinctOn() {
             statement.distinctOn.forEach { validateColumns(it); rejectWindowFunction(it, "DISTINCT ON") }
             if (aggregated) {
@@ -615,14 +555,6 @@ class SelectRunner(private val catalog: Catalog) {
             }
         }
 
-        /**
-         * Window functions are rejected outright alongside GROUP BY/aggregates ([aggregated]) -
-         * windowing over an already-grouped result is valid SQL but requires running GroupAggregation
-         * first and then a second pass over its output rows, which this engine does not implement.
-         * RANK/DENSE_RANK need an explicit tie-break (unlike ROW_NUMBER, which falls back to this
-         * partition's row arrival order when OVER has no ORDER BY) and nesting one window function
-         * inside another's argument/PARTITION BY/ORDER BY is invalid SQL in the first place.
-         */
         private fun validateWindows() {
             if (aggregated) {
                 throw KestrelException("window functions cannot be combined with GROUP BY or aggregate functions in the same query")
@@ -708,16 +640,8 @@ class SelectRunner(private val catalog: Catalog) {
                 is InSubqueryExpression -> requireGrouped(expression.operand, groupColumns)
                 is CastExpression -> requireGrouped(expression.operand, groupColumns)
                 is CollateExpression -> requireGrouped(expression.operand, groupColumns)
-                // Unreachable: validateWindows() rejects mixing window functions with GROUP BY/
-                // aggregates before requireGrouped ever runs, so this branch only keeps `when` exhaustive.
                 is WindowExpression -> Unit
-                // Unreachable in practice: NEXTVAL/CURRVAL/MERGE_ACTION() are never legal in a SELECT
-                // at all (MERGE's RETURNING is evaluated by Executor.evaluateMergeReturning, an
-                // entirely separate projection path from this one) - kept here only to keep `when`
-                // exhaustive.
                 is NextValueExpression, is CurrentValueExpression, is MergeActionExpression -> Unit
-                // A parameter reference behaves like any other constant here - `SELECT $1, SUM(x)
-                // FROM t GROUP BY y` needs $1 in GROUP BY no more than a literal would.
                 is ParameterExpression -> Unit
             }
         }
@@ -736,13 +660,6 @@ class SelectRunner(private val catalog: Catalog) {
                 declaredCollationOrNull(expression) ?: outer?.declaredCollation(expression)
         }
 
-        /**
-         * When [windowExpressions] is non-empty, a [row] handed in here may carry extra trailing
-         * values appended by [appendWindowColumns] (one per entry of [windowExpressions], in order,
-         * right after the real columns) - [substituteWindowValues] rewrites any window-function node
-         * in [expression] into a [LiteralExpression] reading straight from that trailing slot before
-         * the plain [Evaluator] ever sees it, the same trick [GroupAggregation] uses for aggregates.
-         */
         private fun evaluateRow(expression: Expression, row: List<Value>): Value {
             val prepared = if (windowExpressions.isEmpty()) expression else substituteWindowValues(expression, row)
             return Evaluator(rowResolver(row), subqueryRunner).evaluate(prepared)
@@ -793,13 +710,6 @@ class SelectRunner(private val catalog: Catalog) {
             return appendWindowColumns(combined)
         }
 
-        /**
-         * Runs after FROM/JOIN/WHERE and (per [validateWindows]) never alongside GROUP BY, matching
-         * standard SQL's logical order of window-function evaluation. Each entry of
-         * [windowExpressions] contributes one trailing value per row, computed once over the whole
-         * (already filtered) row set - [evaluateRow]/[substituteWindowValues] read them back out by
-         * position for the final projection and this query's own ORDER BY.
-         */
         private fun appendWindowColumns(combined: List<List<Value>>): List<List<Value>> {
             if (windowExpressions.isEmpty()) return combined
             val perExpression = windowExpressions.map { computeWindowValues(it, combined) }
@@ -888,14 +798,6 @@ class SelectRunner(private val catalog: Catalog) {
             }
         }
 
-        /**
-         * With no ORDER BY in OVER, the whole partition is one frame (every row gets the same
-         * value). With an ORDER BY, the default SQL frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND
-         * CURRENT ROW`: a running aggregate where rows tied on the order key (a "peer group") share
-         * one value - the aggregate through the end of their peer group, not through their own row
-         * alone. A single-column running total (`ORDER BY` with no ties) falls out of this as the
-         * special case where every peer group has size 1.
-         */
         private fun assignAggregateWindowValues(window: WindowExpression, ordered: List<Int>, combined: List<List<Value>>, out: Array<Value?>) {
             val frame = window.frame
             if (frame == null) {
@@ -911,12 +813,6 @@ class SelectRunner(private val catalog: Catalog) {
             }
         }
 
-        /**
-         * The frame's base [frameRange], narrowed by its [FrameExclude] mode (default [FrameExclude.NoOthers],
-         * which leaves the range untouched). Excluding rows can split a contiguous range into two
-         * pieces (e.g. `EXCLUDE CURRENT ROW` on a frame that spans the current row), so this returns
-         * the actual member positions rather than an [IntRange].
-         */
         private fun frameMembers(window: WindowExpression, position: Int, ordered: List<Int>, combined: List<List<Value>>): List<Int> {
             val range = frameRange(window, position, ordered, combined)
             if (range.isEmpty()) return emptyList()
@@ -936,14 +832,6 @@ class SelectRunner(private val catalog: Catalog) {
             }
         }
 
-        /**
-         * Resolves an explicit `ROWS|RANGE BETWEEN ... AND ...` [WindowFrame] to a range of positions
-         * into [ordered] for the row at [position] - clamped to the partition's edges rather than
-         * erroring, exactly like the implicit default frame already does. A frame that falls entirely
-         * off one edge (e.g. `2 FOLLOWING AND 3 FOLLOWING` on the partition's last row) yields an empty
-         * range, which [aggregateWindowValue]/FIRST_VALUE/LAST_VALUE each already know how to treat as
-         * "no rows" (NULL, or 0 for COUNT).
-         */
         private fun frameRange(window: WindowExpression, position: Int, ordered: List<Int>, combined: List<List<Value>>): IntRange {
             val frame = window.frame!!
             if (frame.unit == FrameUnit.Groups) {
@@ -986,18 +874,6 @@ class SelectRunner(private val catalog: Catalog) {
             return amount.toInt()
         }
 
-        /**
-         * `GROUPS BETWEEN <bound> AND <bound>` counts whole peer groups (rows tied on the OVER's
-         * ORDER BY) rather than physical rows ([FrameUnit.Rows]) or distance in a value
-         * ([FrameUnit.Range]) - `1 PRECEDING` means "the peer group immediately before the current
-         * row's own peer group", however many rows that group has. Resolved entirely in group-index
-         * space (mirroring exactly how [frameRange] resolves ROWS/RANGE in row-index space, including
-         * the same one-sided-clamp trick for correctly detecting an out-of-partition frame as empty
-         * rather than accidentally clamping it back into range), then translated to a row [IntRange]
-         * only once both bounds land on a valid group. Unlike [rangeBoundary], this places no
-         * restriction on the OVER's ORDER BY - zero, one, or many columns of any type all define peer
-         * groups equally well, since [peerGroupRanges] only ever compares them for equality.
-         */
         private fun groupsFrameRange(
             frame: WindowFrame,
             orderBy: List<OrderKey>,
@@ -1021,12 +897,6 @@ class SelectRunner(private val catalog: Catalog) {
             FrameBoundType.Following -> currentGroup + resolveIntegerFrameOffset(bound, row, "GROUPS")
         }
 
-        /**
-         * `CURRENT ROW` in a RANGE frame does not mean "just this row" (that is what ROWS is for) - it
-         * means the boundary of the current row's peer group (every row tied with it on the OVER's
-         * ORDER BY, or the whole partition when there is no ORDER BY). [isStart] picks which edge of
-         * that peer group to return.
-         */
         private fun peerBoundary(orderBy: List<OrderKey>, position: Int, ordered: List<Int>, combined: List<List<Value>>, isStart: Boolean): Int {
             if (orderBy.isEmpty()) return if (isStart) 0 else ordered.size - 1
             fun keyAt(index: Int) = orderBy.map { evaluateRow(it.expression, combined[ordered[index]]) }
@@ -1040,15 +910,6 @@ class SelectRunner(private val catalog: Catalog) {
             return boundary
         }
 
-        /**
-         * `<value> PRECEDING`/`<value> FOLLOWING` in a RANGE frame measure distance in the value of a
-         * single numeric or DATE ORDER BY column rather than a row count, so the frame can span a
-         * different number of physical rows for every current row (e.g. `RANGE BETWEEN 5 PRECEDING AND
-         * 5 FOLLOWING` on `ORDER BY amount` widens or narrows with how densely `amount` is populated
-         * nearby). Binary search works because [ordered] is already sorted on this column - ascending
-         * in "logical" terms via [rangeLogicalValue], which folds DESC into a sign flip so the same
-         * `>=`/`<=` comparisons apply regardless of sort direction.
-         */
         private fun rangeBoundary(
             bound: FrameBound,
             orderBy: List<OrderKey>,
@@ -1116,13 +977,6 @@ class SelectRunner(private val catalog: Catalog) {
             return offset
         }
 
-        /**
-         * Splits [ordered] (positions into [combined], already sorted by the OVER's ORDER BY) into
-         * contiguous "peer group" ranges of rows tied on the order key - or one range spanning the
-         * whole partition when there is no ORDER BY, matching the default SQL frame. Shared by
-         * [assignAggregateWindowValues] (running aggregate through the end of a peer group) and
-         * [WindowFunctionKind.LastValue] (last row of a peer group).
-         */
         private fun peerGroupRanges(orderBy: List<OrderKey>, ordered: List<Int>, combined: List<List<Value>>): List<IntRange> {
             if (orderBy.isEmpty()) return listOf(ordered.indices)
             val keys = ordered.map { index -> orderBy.map { key -> evaluateRow(key.expression, combined[index]) } }
@@ -1140,13 +994,6 @@ class SelectRunner(private val catalog: Catalog) {
         private fun aggregateWindowValue(window: WindowExpression, rows: List<List<Value>>): Value =
             AggregateFunctions.compute(window.name, window.argument, window.star, rows, ::evaluateRow)
 
-        /**
-         * LAG (direction -1) / LEAD (direction +1): reads [WindowExpression.argument] from the row
-         * [WindowExpression.offset] positions before/after the current one in [ordered] (default 1,
-         * evaluated per row so it may itself be a computed expression, though in practice it is
-         * almost always a literal). Past either edge of the partition, falls back to
-         * [WindowExpression.defaultValue] (evaluated against the *current* row) or NULL.
-         */
         private fun assignOffsetWindowValues(
             window: WindowExpression,
             ordered: List<Int>,
@@ -1174,12 +1021,6 @@ class SelectRunner(private val catalog: Catalog) {
             return amount.toInt()
         }
 
-        /**
-         * NTILE(n): splits the partition into `n` buckets as evenly as possible - when the partition
-         * size does not divide evenly, the first `size % n` buckets get one extra row, exactly like
-         * every other SQL engine's NTILE. `n` larger than the partition just leaves the highest
-         * bucket numbers unused, rather than being an error.
-         */
         private fun assignNtileWindowValues(window: WindowExpression, ordered: List<Int>, combined: List<List<Value>>, out: Array<Value?>) {
             val bucketValue = evaluateRow(window.argument!!, combined[ordered.first()])
             val buckets = (bucketValue as? Value.IntegerValue)?.value
@@ -1210,9 +1051,6 @@ class SelectRunner(private val catalog: Catalog) {
         private fun executeJoin(left: List<List<Value>>, join: JoinClause, rightIndex: Int): List<List<Value>> {
             val right = sources[rightIndex]
             val nullRight = List(right.schema.columns.size) { Value.NullValue }
-            // Width of everything already combined to the left of this join - exactly what a RIGHT/
-            // FULL JOIN needs to pad an unmatched right row with, since `right.offset` is defined as
-            // the running column count of every source before it.
             val nullLeft = List(right.offset) { Value.NullValue }
             val outerRight = join.type == JoinType.Right || join.type == JoinType.Full
             val outerLeft = join.type == JoinType.Left || join.type == JoinType.Full
@@ -1264,14 +1102,6 @@ class SelectRunner(private val catalog: Catalog) {
         private fun lateralSelectOf(item: FromItem): QueryStatement? =
             (item as? SubquerySource)?.takeIf { it.lateral }?.select
 
-        /**
-         * Unlike every other join, a LATERAL derived table has no fixed row set: it is
-         * re-evaluated once per row already accumulated on the left, correlated to that row via
-         * [lateralOuterResolver] exactly like a correlated subquery in WHERE/SELECT (same
-         * [SubqueryRunner] plumbing, just invoked from FROM instead). Hash-joining is therefore
-         * meaningless here (there is no static right-hand row set to build buckets from) - always
-         * nested loop, matching how real engines execute LATERAL.
-         */
         private fun executeLateralJoin(
             left: List<List<Value>>,
             join: JoinClause,
@@ -1295,12 +1125,6 @@ class SelectRunner(private val catalog: Catalog) {
             return result
         }
 
-        /**
-         * Resolves a column against the sources already joined by the time a LATERAL subquery
-         * runs (everything to its left in the FROM clause) - [leftRow] holds exactly their values,
-         * so a resolved global index landing past its end means the expression names a source that
-         * has not been joined yet (or is the LATERAL item itself), which SQL forbids.
-         */
         private fun lateralOuterResolver(leftRow: List<Value>): kestrel.engine.ColumnResolver = object : kestrel.engine.ColumnResolver {
             override fun resolve(expression: ColumnExpression): Value {
                 val index = resolveIndex(expression)
@@ -1323,15 +1147,6 @@ class SelectRunner(private val catalog: Catalog) {
             return Evaluator(resolver).evaluate(expression)
         }
 
-        /**
-         * A [Value.TextValue] hash-join key under any collation but [Collation.Binary] must land in
-         * the same bucket as every other spelling the declared/explicit `COLLATE` treats as equal
-         * (e.g. `'Bob'`/`'bob'` under `NOCASE`) - otherwise the fast path silently disagrees with
-         * the nested-loop `Evaluator` path it is an optimization of, which already resolves this via
-         * [pairCollation] for every non-hashable equality condition. [Collation.Binary]'s
-         * [Collation.canonicalize] is the identity, so a key from an equality with no COLLATE
-         * anywhere in play keeps its exact original `equals`/`hashCode`.
-         */
         private fun foldHashJoinKey(value: Value, collation: Collation): Value =
             if (value is Value.TextValue) Value.TextValue(collation.canonicalize(value.value)) else value
 
@@ -1342,10 +1157,6 @@ class SelectRunner(private val catalog: Catalog) {
             val built = (0 until rightIndex).toSet()
             val leftRefs = referencedSources(condition.left)
             val rightRefs = referencedSources(condition.right)
-            // Resolved from the ORIGINAL (unswapped) left/right of `a = b`, not buildExpression/
-            // probeExpression below, so `pairCollation`'s left-first tie-break matches exactly what
-            // evaluating this same `=` through Evaluator would have decided regardless of which side
-            // ends up building the hash buckets.
             val collation = pairCollation(condition.left, condition.right, ::declaredCollationOrNull)
             return when {
                 rightRefs == setOf(rightIndex) && leftRefs.all { it in built } ->
@@ -1370,9 +1181,6 @@ class SelectRunner(private val catalog: Catalog) {
                 rows = rows.sortedWith(multiKeyComparator(orderKeys, ::evaluateRow, ::declaredCollationOrNull))
             }
             if (statement.distinctOn.isNotEmpty()) {
-                // Kept in the order already established above (scan order with no ORDER BY, sorted
-                // order otherwise) - `LinkedHashMap.putIfAbsent` keeps the first row per key and
-                // never disturbs where that first row sits relative to the others kept.
                 val kept = LinkedHashMap<List<Value>, List<Value>>()
                 for (row in rows) {
                     val key = statement.distinctOn.map { evaluateRow(it, row) }
@@ -1387,9 +1195,6 @@ class SelectRunner(private val catalog: Catalog) {
                 }
             }
             val (labels, projected) = when (val projection = statement.projection) {
-                // rows may carry trailing window-function values appended by appendWindowColumns
-                // (only possible here if ORDER BY names one directly, since `SELECT *` cannot spell
-                // an OVER clause itself) - trimmed back off so the row width matches columnNames.
                 is StarProjection -> columnNames to rows.map { it.subList(0, columnNames.size) }
                 is ExpressionProjection -> {
                     val labels = projection.items.mapIndexed { index, item -> columnLabel(item, index) }
@@ -1398,10 +1203,6 @@ class SelectRunner(private val catalog: Catalog) {
             }
             var resultRows = projected
             if (statement.distinct) {
-                // Plain DISTINCT dedups the *output* row (post-projection); DISTINCT ON already
-                // collapsed to one row per group above, on the pre-projection row, so re-deduping the
-                // projected columns here would incorrectly merge distinct groups that happen to
-                // project to the same visible values.
                 if (statement.distinctOn.isEmpty()) {
                     val itemExpressions = when (val projection = statement.projection) {
                         is ExpressionProjection -> projection.items.map { it.expression }
@@ -1453,8 +1254,6 @@ class SelectRunner(private val catalog: Catalog) {
                 val lateral = lateralSelectOf(join.from) != null
                 val hash = !lateral && hashJoinKeys(join, position + 1) != null
                 val label = joinLabel(join) + if (lateral) " Lateral" else ""
-                // `hash` is only true when hashJoinKeys() matched a binary equality condition, which
-                // means join.on is guaranteed non-null here (CROSS JOIN's null `on` never hashes).
                 val header = if (hash) "Hash Join ${describeExpression(join.on!!)}" else "Nested Loop $label"
                 val rightScan = if (lateral) "Lateral Subquery Scan on ${right.tableName}" else "Seq Scan on ${right.tableName}"
                 lines = listOf(header) + lines.map { "  -> $it" } + listOf("  -> $rightScan")
@@ -1541,15 +1340,10 @@ class SelectRunner(private val catalog: Catalog) {
                 (expression.elseExpression?.let { containsAggregate(it) } ?: false)
         is CastExpression -> containsAggregate(expression.operand)
         is CollateExpression -> containsAggregate(expression.operand)
-        // A window function never triggers GROUP BY collapsing on its own - it is deliberately not
-        // recursed into here, so an aggregate nested inside its OVER clause (invalid SQL) is instead
-        // caught uniformly at evaluation time by the same guard that rejects any bare aggregate
-        // outside GROUP BY (see Evaluator.evaluate's FunctionExpression branch).
         is WindowExpression -> false
         else -> false
     }
 
-    /** Window functions are only legal in the SELECT list and ORDER BY - never WHERE/GROUP BY/HAVING/ON. */
     private fun containsWindowFunction(expression: Expression): Boolean = when (expression) {
         is WindowExpression -> true
         is BinaryExpression -> containsWindowFunction(expression.left) || containsWindowFunction(expression.right)
@@ -1569,7 +1363,6 @@ class SelectRunner(private val catalog: Catalog) {
         else -> false
     }
 
-    /** Every distinct window-function call reachable from [expression] (nested inside arithmetic, CASE, ...). */
     private fun collectWindowExpressions(expression: Expression): List<WindowExpression> = when (expression) {
         is WindowExpression -> listOf(expression)
         is BinaryExpression -> collectWindowExpressions(expression.left) + collectWindowExpressions(expression.right)
@@ -1677,7 +1470,6 @@ class SelectRunner(private val catalog: Catalog) {
     private companion object {
         const val MAX_RECURSION_ITERATIONS = 10_000
 
-        /** Kinds whose result actually depends on which rows fall inside the frame. */
         val FRAME_CAPABLE_KINDS = setOf(WindowFunctionKind.Aggregate, WindowFunctionKind.FirstValue, WindowFunctionKind.LastValue)
     }
 }

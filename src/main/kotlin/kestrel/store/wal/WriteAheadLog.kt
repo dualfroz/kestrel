@@ -7,19 +7,6 @@ import java.io.RandomAccessFile
 
 class WalException(message: String) : KestrelException(message)
 
-/**
- * Append-only binary log file. Every record is framed as
- * `[4-byte length][payload][4-byte CRC32C]`, and a record's LSN is simply
- * the file offset its frame starts at, which lets [readAt] seek straight to
- * a `prevLsn` during undo instead of needing an in-memory LSN index.
- *
- * Tracks, for transactions begun through this instance, the LSN of their
- * most recent record so [logUpdate] can chain `prevLsn` and callers can look
- * up a transaction's tail for rollback. Reconstructing that table for
- * transactions that were active before a crash is [RecoveryManager]'s job,
- * not this class's - on reopen only `nextTxnId` and [lastCheckpointLsn] are
- * recovered by scanning the existing file once.
- */
 class WriteAheadLog(file: File) : AutoCloseable {
     companion object {
         const val NO_LSN = -1L
@@ -69,12 +56,6 @@ class WriteAheadLog(file: File) : AutoCloseable {
         return lsn
     }
 
-    /**
-     * Logs a compensation record for an undo step taken against [txnId] (see
-     * [LogRecord.CompensationUpdate]) and threads it into the transaction's `prevLsn` chain exactly
-     * like [logUpdate] does for a forward write, so the transaction's tail always points at the most
-     * recent record regardless of whether it was a normal write or an undo.
-     */
     fun logCompensation(txnId: Long, pageId: Long, undoImage: ByteArray, undoNextLsn: Long): Long {
         val prevLsn = lastLsnByTxn[txnId] ?: throw WalException("transaction $txnId is not active")
         val lsn = appendRaw(LogRecord.CompensationUpdate(txnId, prevLsn, pageId, undoImage, undoNextLsn))
@@ -90,7 +71,6 @@ class WriteAheadLog(file: File) : AutoCloseable {
         return lsn
     }
 
-    /** Records that [txnId] is resolved after its updates were undone. Used by [RecoveryManager]. */
     fun markAborted(txnId: Long): Long {
         val lsn = appendRaw(LogRecord.Abort(txnId))
         flush()
@@ -98,7 +78,6 @@ class WriteAheadLog(file: File) : AutoCloseable {
         return lsn
     }
 
-    /** Requires no transaction to be active (a quiescent checkpoint). */
     fun checkpoint(): Long {
         check(lastLsnByTxn.isEmpty()) { "checkpoint requires no active transactions" }
         val lsn = appendRaw(LogRecord.Checkpoint(emptyList()))
@@ -113,7 +92,6 @@ class WriteAheadLog(file: File) : AutoCloseable {
         raf.fd.sync()
     }
 
-    /** Sequentially reads every record from [startLsn] to the end of the log. */
     fun readFrom(startLsn: Long): List<Pair<Long, LogRecord>> {
         val result = ArrayList<Pair<Long, LogRecord>>()
         var pos = startLsn

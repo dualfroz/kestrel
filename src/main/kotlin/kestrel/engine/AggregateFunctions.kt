@@ -12,14 +12,6 @@ import kestrel.storage.Value
 import kestrel.storage.ValueOrdering
 import kestrel.storage.typeName
 
-/**
- * COUNT/SUM/AVG/MIN/MAX over a fixed list of rows - the one piece of arithmetic shared by grouped
- * aggregation ([GroupAggregation], which collapses a whole group into one row) and windowed
- * aggregation (a [kestrel.sql.ast.WindowExpression] with [kestrel.sql.ast.WindowFunctionKind.Aggregate],
- * which instead computes the same thing once per partition/frame and keeps every row). Both callers
- * hand in their own `evaluateRow` so the argument expression is resolved the same way it would be
- * anywhere else in that context (correlated outer columns, subqueries, and so on).
- */
 internal object AggregateFunctions {
     fun compute(
         name: String,
@@ -53,16 +45,6 @@ internal object AggregateFunctions {
         }
     }
 
-    /**
-     * NULL [argument] values are skipped (standard STRING_AGG behavior, matching how SUM/AVG/MIN/MAX
-     * above already drop NULLs before combining). With no [orderBy], values keep [rows]' own order -
-     * for a GROUP BY aggregate that is source/scan order, which is exactly what every other order-
-     * sensitive-but-unordered SQL construct in this engine already falls back to. [separator] is
-     * evaluated once, against whichever surviving row ends up first after any [orderBy] sort - it is
-     * expected to be a per-call constant (a literal in every realistic query), so which row supplies it
-     * only matters if someone writes a genuinely row-varying separator expression, an edge case no SQL
-     * engine defines cleanly either.
-     */
     private fun stringAgg(
         argument: Expression?,
         separator: Expression?,
@@ -126,7 +108,6 @@ internal object AggregateFunctions {
         return Value.RealValue(values.sumOf { numeric(it) } / values.size)
     }
 
-    /** SUM/AVG stay exact (BigDecimal) rather than falling back to Double when a DECIMAL value is involved. */
     private fun isExactDecimalMix(values: List<Value>): Boolean =
         values.any { it is Value.DecimalValue } && values.all { it is Value.DecimalValue || it is Value.IntegerValue }
 

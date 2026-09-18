@@ -6,7 +6,6 @@ import kestrel.store.codec.ByteWriter
 
 class WalCorruptionException(message: String) : KestrelException(message)
 
-/** Serializes [LogRecord]s to and from the byte payload stored in each log frame. */
 object LogRecordCodec {
     private const val TYPE_BEGIN = 1
     private const val TYPE_COMMIT = 2

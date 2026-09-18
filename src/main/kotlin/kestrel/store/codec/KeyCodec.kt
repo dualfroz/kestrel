@@ -5,28 +5,6 @@ import java.math.BigInteger
 import java.time.LocalDate
 import kestrel.storage.Value
 
-/**
- * Order-preserving byte encoding for index keys: unsigned lexicographic
- * comparison of the encoded bytes agrees with SQL value ordering, so a
- * B+Tree can use plain `ByteArray` comparison instead of decoding values.
- *
- * Numeric values sort by type tag first, then by magnitude: same-type
- * comparisons (INTEGER-INTEGER, REAL-REAL, DECIMAL-DECIMAL) are exact, but a
- * mixed INTEGER/REAL/DECIMAL comparison is ordered by tag rather than by
- * numeric value. Index columns are schema-typed in practice, so this does not
- * affect single-column indexes; it is a deliberate scope cut versus the full
- * cross-type semantics of [kestrel.storage.ValueOrdering].
- *
- * DECIMAL uses a normalized "scientific notation" encoding: a sign byte, an
- * offset-binary exponent (so larger magnitude sorts later), then the
- * significant digits (trailing zeros stripped, one mapped byte per digit,
- * terminated by a byte no digit can produce). Two decimals compare equal
- * under this scheme exactly when [BigDecimal.compareTo] says they are equal
- * (`1.5` and `1.50` included), and it holds arbitrary precision - unlike
- * REAL's key encoding this never rounds through a `Double`. Negative values
- * bit-complement the whole magnitude encoding, which reverses byte-order
- * comparison so a more-negative number still sorts first.
- */
 object KeyCodec {
     private const val TAG_NULL = 0
     private const val TAG_BOOLEAN = 1
@@ -66,7 +44,6 @@ object KeyCodec {
         return result
     }
 
-    /** Unsigned lexicographic comparison, matching how the bytes are compared on disk. */
     fun compare(a: ByteArray, b: ByteArray): Int {
         val n = minOf(a.size, b.size)
         for (i in 0 until n) {

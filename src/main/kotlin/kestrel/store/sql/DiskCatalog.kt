@@ -35,40 +35,6 @@ import java.io.File
 
 class DiskCatalogException(message: String) : KestrelException(message)
 
-/**
- * A disk-backed system catalog: one [DiskTable] per user table, described by
- * a [TableDirectoryEntry] row in a dedicated directory heap. The directory
- * heap is always the very first heap allocated in a fresh database file, so
- * it always lands on page 0 (see [DiskManager][kestrel.store.page.DiskManager]:
- * page ids are handed out from 0 upward and nothing else runs before it) -
- * that fixed, well-known id is what lets a fresh process find the directory
- * again without another bootstrap record pointing at it.
- *
- * Every [DiskTable] this catalog opens is created with a callback that
- * rewrites its directory row, in the same transaction as the write that
- * triggered it, whenever a primary or secondary index's root page changes
- * (see [DiskTable]'s documentation on why that matters). That keeps the
- * directory heap's on-disk contents always in sync with the last committed
- * root, so [open] can reconstruct every table and index purely from what is
- * on disk after a full process restart - not just within one process's
- * lifetime the way holding a live [kestrel.store.engine.TransactionalIndex]
- * object would.
- *
- * The same directory heap also holds one row per view, tagged (see
- * `ENTRY_TAG_TABLE`/`ENTRY_TAG_VIEW`) and encoded by [ViewDirectoryEntryCodec] instead of
- * [DirectoryEntryCodec] - a view has no heap/index pages of its own to describe, only its
- * `CREATE VIEW ... AS ...;` text (see [ViewDirectoryEntry]), so it rides along in the one heap
- * that is already guaranteed to exist at a well-known page id, rather than needing a second
- * fixed-page-id heap of its own.
- *
- * A third tag, `ENTRY_TAG_SEQUENCE`, holds one row per SEQUENCE, encoded by
- * [SequenceDirectoryEntryCodec] - see [SequenceDirectoryEntry]'s own doc for why its live counter
- * (unlike everything else in this heap) is deliberately NOT part of that transactional row.
- *
- * A fourth tag, `ENTRY_TAG_TRIGGER`, holds one row per TRIGGER, encoded by
- * [TriggerDirectoryEntryCodec] - the same "store rendered SQL text, re-parse on open" trick as
- * [ViewDirectoryEntry], since a trigger's WHEN clause and body are arbitrarily deep AST too.
- */
 class DiskCatalog private constructor(
     private val engine: StorageEngine,
     private val directory: TransactionalHeap
@@ -76,13 +42,6 @@ class DiskCatalog private constructor(
     companion object {
         private const val DIRECTORY_HEADER_PAGE_ID = 0L
 
-        /**
-         * Leading byte on every row stored in the directory heap, distinguishing a
-         * [TableDirectoryEntry] from a [ViewDirectoryEntry] - both share the same heap rather than
-         * each getting a dedicated one, since a fresh heap's header page id is only deterministic
-         * (page 0) for the very first heap [open] allocates; a second fixed-page-id heap would need
-         * its own bootstrap record pointing at it, which this tag byte avoids entirely.
-         */
         private const val ENTRY_TAG_TABLE: Int = 0
         private const val ENTRY_TAG_VIEW: Int = 1
         private const val ENTRY_TAG_SEQUENCE: Int = 2
@@ -107,12 +66,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * A mutable box for the [rowsByName] key a [DiskTable]'s `onRootsChanged` callback should
-     * persist under - captured by reference rather than by value so `ALTER TABLE ... RENAME TO`
-     * (see [renameTable]) can repoint an already-constructed [DiskTable]'s callback at its new key
-     * without having to reconstruct the table (which would mean reopening its heap/index pages).
-     */
     private class TableKeyBox(var value: String)
 
     private class DirectoryRow(var rid: RecordId, var entry: TableDirectoryEntry, val table: DiskTable, val keyBox: TableKeyBox)
@@ -125,18 +78,6 @@ class DiskCatalog private constructor(
     private val sequencesByName = LinkedHashMap<String, SequenceRow>()
     private val triggersByName = LinkedHashMap<String, TriggerRow>()
 
-    /**
-     * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE`: a plain in-memory [Table] - the exact same
-     * class [kestrel.catalog.Catalog] uses for every table on the in-memory engine - rather than a
-     * [DiskTable]. It never allocates a heap or index page and never gains a directory entry, so
-     * [loadDirectory] can never discover it again after a process restart: there is no "don't
-     * persist this one" flag to thread through the pager/WAL at all, unlike
-     * [kestrel.catalog.TableSchema.temporary] on the in-memory engine (which shares its `tables` map
-     * with every ordinary table and instead relies on [kestrel.persistence.SqlWriter] skipping it).
-     * See [DiskExecutor]'s temporary-table INSERT/UPDATE/DELETE/SELECT path for how it is read and
-     * mutated, and its BEGIN/SAVEPOINT/ROLLBACK handling for why a live [Table] reference (not just
-     * its rows) needs to be reachable from outside this class.
-     */
     private val temporaryTables = LinkedHashMap<String, Table>()
 
     private fun loadDirectory() {
@@ -168,11 +109,6 @@ class DiskCatalog private constructor(
         engine.commit(txn)
     }
 
-    /**
-     * Re-derives a view's [QueryStatement] from its stored `CREATE VIEW ... AS ...;` text using the
-     * same [Lexer]/[Parser] pair the REPL and every other SQL entry point already go through - no
-     * bespoke AST codec, see [ViewDirectoryEntry]'s own KDoc for why.
-     */
     private fun parseViewQuery(entry: ViewDirectoryEntry): QueryStatement {
         val statements = Parser(Lexer(entry.statementText).tokenize()).parseProgram()
         val statement = statements.singleOrNull() as? CreateViewStatement
@@ -180,11 +116,6 @@ class DiskCatalog private constructor(
         return statement.query
     }
 
-    /**
-     * Re-derives a trigger's [TriggerDefinition] from its stored `CREATE TRIGGER ...;` text - same
-     * "reuse the real Lexer/Parser instead of a bespoke codec" trick [parseViewQuery] uses for a
-     * whole query.
-     */
     private fun parseTriggerDefinition(entry: TriggerDirectoryEntry): TriggerDefinition {
         val statements = Parser(Lexer(entry.statementText).tokenize()).parseProgram()
         val statement = statements.singleOrNull() as? CreateTriggerStatement
@@ -194,13 +125,6 @@ class DiskCatalog private constructor(
         )
     }
 
-    /**
-     * Re-derives a CHECK constraint's [Expression] from its stored text (see [CheckConstraintEntry])
-     * by wrapping it back into a throwaway, never-executed `SELECT (<expr>) FROM ...` and pulling the
-     * expression back out of the parsed projection - the same "reuse the real Lexer/Parser instead of
-     * a bespoke codec" trick [parseViewQuery] uses for a whole query. The FROM target is never
-     * resolved against this or any catalog, so its name is arbitrary.
-     */
     private fun parseCheckExpressionText(text: String): Expression {
         val statements = Parser(Lexer("SELECT ($text) FROM check_constraint_placeholder;").tokenize()).parseProgram()
         val statement = statements.singleOrNull() as? SelectStatement
@@ -243,13 +167,6 @@ class DiskCatalog private constructor(
 
     val tableNames: List<String> get() = rowsByName.values.map { it.entry.tableName } + temporaryTables.values.map { it.schema.name }
 
-    /**
-     * Total pages ever allocated in the backing data file, including any now sitting on the free
-     * list after a `DROP TABLE`/`DROP INDEX` (see [DiskTable.destroyStorage]/[DiskTable.dropSecondaryIndexByName]) -
-     * exposed so a caller (chiefly a test) can confirm a later `CREATE TABLE`/`CREATE INDEX` reused
-     * that reclaimed space instead of only ever growing the file, the same proof-by-counter
-     * [DiskTable]'s own `scanCount`/`pointLookupCount`/etc. give for index pushdown.
-     */
     fun allocatedPageCount(): Long = engine.allocatedPageCount()
 
     fun table(name: String): DiskTable {
@@ -261,13 +178,6 @@ class DiskCatalog private constructor(
 
     fun tableOrNull(name: String): DiskTable? = rowsByName[name.lowercase()]?.table
 
-    /**
-     * `compositePrimaryKey` mirrors [kestrel.catalog.TableSchema.compositePrimaryKey]: a
-     * table-level `PRIMARY KEY (a, b, ...)`, as an alternative to an inline `col TYPE PRIMARY KEY`
-     * tracked by [Column.primaryKey]. Marking the listed columns NOT NULL (like the in-memory
-     * [kestrel.engine.Executor] does for the same clause) is the caller's responsibility - this
-     * catalog only records schema/storage, it does not rewrite the SQL-level column definitions.
-     */
     fun createTable(
         name: String,
         columns: List<Column>,
@@ -329,15 +239,6 @@ class DiskCatalog private constructor(
         return table
     }
 
-    /**
-     * Registers a brand new `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` - see [temporaryTables]'
-     * own KDoc for why this never touches [engine]/[directory] at all, unlike [createTable]. Name
-     * collisions are checked against every namespace a permanent table already checks against
-     * ([rowsByName]/[viewsByName]) plus every other temp table, deliberately NOT allowing a temp
-     * table to shadow a same-named permanent table/view the way SQLite does - see [DiskExecutor]'s
-     * own resolution order for the reasoning (a single, simpler, unambiguous namespace is a
-     * deliberate, narrower scope-cut for this executor).
-     */
     fun createTemporaryTable(schema: TableSchema): Table {
         val key = schema.name.lowercase()
         if (rowsByName.containsKey(key)) throw DiskCatalogException("table '${schema.name}' already exists")
@@ -354,33 +255,8 @@ class DiskCatalog private constructor(
         temporaryTables.remove(name.lowercase()) ?: throw DiskCatalogException("no such temporary table: $name")
     }
 
-    /**
-     * Every currently-open temp table, oldest first - used by [DiskExecutor]'s BEGIN/SAVEPOINT/
-     * ROLLBACK handling to snapshot/restore live [Table.rows] lists around a disk transaction. Since
-     * `CREATE`/`DROP TEMPORARY TABLE` are DDL and already rejected inside an explicit transaction
-     * (see [DiskExecutor.isDdl]), the *set* of temp tables never changes mid-transaction - only their
-     * row contents can - so returning the live objects (not a name list) is enough for that caller to
-     * snapshot/restore without a second lookup.
-     */
     val temporaryTableValues: List<Table> get() = temporaryTables.values.toList()
 
-    /**
-     * Drops a table's directory entry so it is no longer visible, and frees every page its heap
-     * and indexes (primary and secondary) own back to the shared [kestrel.store.page.DiskManager]
-     * free list, via [DiskTable.destroyStorage] - so a later `CREATE TABLE`/`CREATE INDEX` reuses
-     * this space instead of only ever growing the data file. RESTRICT (default) is blocked by any view depending on it, directly or
-     * through another view, or by any other table's FOREIGN KEY referencing it (a self-referencing
-     * FK does not count - it disappears together with the table itself). [cascade] drops every
-     * dependent view (transitively, diamond-safe like [dropView]) and strips - never drops - every
-     * other table's FOREIGN KEY referencing this one, mirroring [kestrel.catalog.Catalog.dropTable]'s
-     * `dropDependentViews`/`dropDependentForeignKeys`: CASCADE never implies dropping a table that
-     * merely references the one being dropped, only the constraint pointing at it. Everything - the
-     * view deletions, the table's own row, and every stripped referencing schema - commits in one
-     * transaction so a mid-way failure leaves nothing half-dropped. A trigger defined on [name] is
-     * always dropped alongside it, CASCADE or not - mirrors [kestrel.catalog.Catalog.dropTable]: a
-     * trigger without its table makes no sense to keep around, unlike a FOREIGN KEY reference, so
-     * there is nothing to RESTRICT against.
-     */
     fun dropTable(name: String, cascade: Boolean = false) {
         val key = name.lowercase()
         val row = rowsByName[key] ?: run {
@@ -412,10 +288,6 @@ class DiskCatalog private constructor(
         rowsByName.remove(key)
     }
 
-    /**
-     * RESTRICT check against every view depending on [name] - returns the transitive closure to
-     * delete instead when [cascade] is set. See [dropTable]'s KDoc.
-     */
     private fun dependentViewsOrThrow(name: String, cascade: Boolean): Set<String> {
         val closure = transitiveViewDependents(name.lowercase())
         if (closure.isEmpty() || cascade) return closure
@@ -423,11 +295,6 @@ class DiskCatalog private constructor(
         throw DiskCatalogException("cannot drop '$name' because view(s) ${names.joinToString(", ")} depend on it")
     }
 
-    /**
-     * RESTRICT check against every other table's FOREIGN KEY referencing [name] - returns those
-     * rows instead when [cascade] is set, so the caller can strip the constraint from each. See
-     * [dropTable]'s KDoc.
-     */
     private fun dependentForeignKeysOrThrow(name: String, cascade: Boolean): List<Map.Entry<String, DirectoryRow>> {
         val key = name.lowercase()
         val referencing = rowsByName.entries.filter { (otherKey, other) ->
@@ -447,19 +314,6 @@ class DiskCatalog private constructor(
         throw DiskCatalogException("no such table: $tableName")
     }
 
-    /**
-     * Mirrors [kestrel.catalog.Catalog.truncateTables]: wiping every row of [tableNames] makes every
-     * row of any OTHER table with a FOREIGN KEY into one of them dangling at once, so RESTRICT
-     * (default) blocks on that regardless of the FK's own `onDelete` action - there is no per-row
-     * delete for it to act on - and [cascade] means "also truncate the whole referencing table", a
-     * transitive closure over FOREIGN KEY edges computed exactly like [dependentForeignKeysOrThrow]'s
-     * single-hop version, never a per-row [DiskForeignKeyEnforcer.cascadeDelete]-style plan. Every
-     * table in the closure is emptied against the SAME [txn] the caller already opened (see
-     * [DiskExecutor.executeTruncate]), so it shares that statement's commit/rollback exactly like a
-     * WHERE-less DELETE does - unlike RESTART IDENTITY's sequence reset, which
-     * [DiskExecutor.executeTruncate] deliberately runs outside any transaction, mirroring [nextValue]'s
-     * own already-non-transactional sequence position.
-     */
     fun truncateTables(txn: Long, tableNames: List<String>, cascade: Boolean): List<String> {
         tableNames.forEach { rowOrThrow(it) }
         val closure = truncateClosure(tableNames.map { it.lowercase() }.toCollection(linkedSetOf()), cascade, tableNames)
@@ -491,14 +345,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * Appends a new column (already validated by [DiskExecutor]) to every existing row - mirrors
-     * [kestrel.catalog.Catalog.addColumn]. [valueForRow] backfills every pre-existing row (each
-     * called with that row's OLD, pre-append values, then [DiskTable.rewriteRows]-transformed to
-     * carry the result) - a constant lambda for a plain DEFAULT, or a fresh per-row expression
-     * evaluation for GENERATED ALWAYS AS; a table with zero rows just gets the new schema with
-     * nothing to rewrite.
-     */
     fun addColumn(tableName: String, column: Column, valueForRow: (Row) -> Value) {
         val row = rowOrThrow(tableName)
         val schema = row.table.schema
@@ -519,19 +365,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * `ALTER TABLE t ALTER COLUMN col TYPE ...` - mirrors [kestrel.catalog.Catalog.changeColumnType],
-     * built on [DiskTable.rewriteRows] exactly like [addColumn] rather than [addColumn]'s own
-     * `List<Value> -> Value` append shape, since this replaces an EXISTING position instead of
-     * appending a new one. Unlike the in-memory engine's [kestrel.engine.Executor], which validates
-     * every row up front and only ever calls its own `Catalog.changeColumnType` once every row is
-     * already known-good, [valueForRow] here is BOTH the value-computation AND the NOT NULL/CHECK
-     * validation step (see [DiskExecutor.executeChangeColumnType]) - a failure partway through
-     * throws out of [DiskTable.rewriteRows]'s loop, and the `catch` below aborts the transaction,
-     * unwinding every row already rewritten. Same "validate lazily, rely on abort to undo a partial
-     * per-row rewrite" contract [addColumn] already leans on for a NOT NULL `GENERATED ALWAYS AS`
-     * backfill.
-     */
     fun changeColumnType(tableName: String, columnName: String, newColumn: Column, valueForRow: (Row) -> Value) {
         val row = rowOrThrow(tableName)
         val schema = row.table.schema
@@ -556,13 +389,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * RESTRICT (default) rejects the drop if [columnName] is used by another table's FOREIGN KEY,
-     * this table's own FOREIGN KEY, a UNIQUE constraint, a CHECK constraint, or a secondary index -
-     * CASCADE removes all of those alongside the column itself. Mirrors
-     * [kestrel.catalog.Catalog.dropColumn], including that a PRIMARY KEY column can never be
-     * dropped, with or without CASCADE.
-     */
     fun dropColumn(tableName: String, columnName: String, cascade: Boolean) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -575,11 +401,6 @@ class DiskCatalog private constructor(
             throw DiskCatalogException("cannot drop column $columnName because it is part of the PRIMARY KEY of $tableName")
         }
 
-        // Mirrors kestrel.catalog.Catalog.dropColumn: a GENERATED column can only ever read this
-        // table's own non-GENERATED columns, so dropping columnName orphans any GENERATED column
-        // depending on it exactly like a CHECK constraint referencing it - CASCADE drops it too,
-        // RESTRICT blocks the whole drop instead. GENERATED can never be a PRIMARY KEY column, so
-        // there is no "cascaded into dropping the PRIMARY KEY" case to guard against here.
         val ownGeneratedDependents = schema.columns.filter { column ->
             !column.name.equals(columnName, ignoreCase = true) &&
                 column.generated?.let { CheckExpressionColumns.references(it, columnName) } == true
@@ -652,12 +473,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * Always fully propagates rather than being rejected the way [dropColumn] can be - mirrors
-     * [kestrel.catalog.Catalog.renameColumn]: this table's own PRIMARY KEY/FOREIGN KEY/UNIQUE/CHECK
-     * definitions, any other table's FOREIGN KEY referencing this column, and any secondary index
-     * defined on it (see [DiskTable.renameColumnAndIndexes]) all get the new name.
-     */
     fun renameColumn(tableName: String, oldName: String, newName: String) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -671,8 +486,6 @@ class DiskCatalog private constructor(
 
         val newColumns = schema.columns.map { column ->
             val renamed = if (column.name.equals(oldName, ignoreCase = true)) column.copy(name = newName) else column
-            // A GENERATED column can only ever reference this table's own columns, so renaming one
-            // of them must rewrite that reference too - mirrors kestrel.catalog.Catalog.renameColumn.
             renamed.generated?.let { renamed.copy(generated = CheckExpressionColumns.rename(it, oldName, newName)) } ?: renamed
         }
         val newForeignKeys = schema.foreignKeys.map { fk ->
@@ -715,16 +528,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * Renames a table and propagates the identifier everywhere it is used by name - mirrors
-     * [kestrel.catalog.Catalog.renameTable]: this table's own FOREIGN KEY(s) that self-reference it,
-     * any other table's FOREIGN KEY pointing at it, every view whose defining query mentions it
-     * anywhere (see [RelationRename]), and every trigger defined ON it (just the [TriggerDefinition.
-     * tableName] field, re-rendered and re-persisted - trigger body statements are NOT rewritten,
-     * same documented scope-cut as [kestrel.catalog.Catalog.renameTable]). Unlike the in-memory
-     * engine there is no separate global index map to fix up - every secondary index lives inside its
-     * own [DiskTable], keyed by column name, which a table rename never touches.
-     */
     fun renameTable(oldName: String, newName: String) {
         val oldKey = oldName.lowercase()
         val row = rowOrThrow(oldName)
@@ -794,13 +597,6 @@ class DiskCatalog private constructor(
         schema.name, schema.columns, foreignKeys, schema.checks, schema.uniqueConstraints, schema.compositePrimaryKey
     )
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...` - mirrors
-     * [kestrel.catalog.Catalog.addForeignKey]: [kestrel.store.sql.DiskExecutor.executeAddConstraint]
-     * has already validated every existing row against [foreignKey] before calling this, so installing
-     * it is pure schema metadata - [DiskTable.replaceSchemaMetadata] plus a re-persisted directory
-     * entry, no row rewrite (row shape is unchanged) and no index to build.
-     */
     fun addForeignKey(tableName: String, foreignKey: ForeignKeyConstraint) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -819,7 +615,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /** [addForeignKey]'s counterpart for `ADD CONSTRAINT name UNIQUE (...)` - see its own doc for the validate-before-install contract. */
     fun addUniqueConstraint(tableName: String, unique: UniqueConstraint) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -838,7 +633,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /** [addForeignKey]'s counterpart for `ADD CONSTRAINT name CHECK (...)` - see its own doc for the validate-before-install contract. */
     fun addCheckConstraint(tableName: String, check: CheckConstraint) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -857,12 +651,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * `ALTER TABLE t DROP CONSTRAINT name [RESTRICT | CASCADE]` - mirrors
-     * [kestrel.catalog.Catalog.dropConstraint]: finds a named CHECK, UNIQUE, or FOREIGN KEY
-     * constraint on [tableName] (case-insensitive; a PRIMARY KEY has no name to match against) and
-     * removes it. Only a UNIQUE constraint has cross-table fallout - see [dropUniqueConstraint].
-     */
     fun dropConstraint(tableName: String, name: String, cascade: Boolean) {
         val key = tableName.lowercase()
         val row = rowOrThrow(tableName)
@@ -906,15 +694,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    /**
-     * Mirrors [kestrel.catalog.Catalog.dropUniqueConstraint]: a FOREIGN KEY's `referencedColumns`
-     * must exactly match one of the parent's enforced-unique key groups to have been accepted in the
-     * first place, so dropping a UNIQUE constraint can silently invalidate any FOREIGN KEY (on this
-     * table itself, via a self-reference, or on any other table) that leans on exactly this column
-     * set for its uniqueness guarantee, UNLESS another remaining group still covers it. RESTRICT
-     * (default) blocks the drop when a real dependent exists; CASCADE strips that FOREIGN KEY right
-     * along with it, mirroring [dropTable]'s own FOREIGN KEY handling.
-     */
     private fun dropUniqueConstraint(tableName: String, unique: UniqueConstraint, cascade: Boolean) {
         val key = tableName.lowercase()
         val schema = rowOrThrow(tableName).table.schema
@@ -944,8 +723,6 @@ class DiskCatalog private constructor(
                 other.table.replaceSchemaMetadata(withForeignKeys(other.table.schema, strippedForeignKeys))
                 persistEntry(otherKey, txn)
             }
-            // Re-fetched: a self-referencing FOREIGN KEY on tableName itself may have just been
-            // rewritten above (dependents is not restricted to OTHER tables).
             val current = rowOrThrow(tableName)
             val newSchema = TableSchema(
                 current.table.schema.name, current.table.schema.columns, current.table.schema.foreignKeys,
@@ -963,15 +740,9 @@ class DiskCatalog private constructor(
     private fun renameInList(names: List<String>, oldName: String, newName: String): List<String> =
         names.map { if (it.equals(oldName, ignoreCase = true)) newName else it }
 
-    /** Convenience for a single-column secondary index; delegates to the general, composite-capable overload below. */
     fun createIndex(tableName: String, indexName: String, columnName: String, unique: Boolean = false): SecondaryIndexHandle =
         createIndex(tableName, indexName, listOf(columnName), unique)
 
-    /**
-     * Creates a secondary index over [columnNames] (more than one entry for a composite,
-     * multi-column index) - see [SecondaryIndexHandle]/[DiskTable] for how a composite key is
-     * encoded and how uniqueness is enforced.
-     */
     fun createIndex(tableName: String, indexName: String, columnNames: List<String>, unique: Boolean = false): SecondaryIndexHandle {
         require(columnNames.isNotEmpty()) { "index must cover at least one column" }
         val key = tableName.lowercase()
@@ -1002,16 +773,6 @@ class DiskCatalog private constructor(
         return handle
     }
 
-    /**
-     * Drops a secondary index by name, searched across every table since `DROP INDEX` names only
-     * the index, not its owning table - mirrors [kestrel.catalog.Catalog.dropIndex]'s flat,
-     * table-less namespace. Unlike [dropColumn]'s CASCADE-guarded removal, this never needs a
-     * dependency check: nothing in this schema (FOREIGN KEY/CHECK/UNIQUE constraint) ever
-     * references an index by name, only by the columns it happens to cover, so
-     * [kestrel.catalog.Catalog.dropIndex] never needed one either. Frees the dropped B+Tree's own
-     * pages back to the shared free list via [DiskTable.dropSecondaryIndexByName], the same
-     * reclamation [dropTable] does for a whole table's storage.
-     */
     fun dropIndex(indexName: String) {
         val (key, row) = rowsByName.entries.firstOrNull { (_, row) ->
             row.table.secondaryIndexes.any { it.name.equals(indexName, ignoreCase = true) }
@@ -1047,11 +808,6 @@ class DiskCatalog private constructor(
 
     fun viewOrNull(name: String): QueryStatement? = viewsByName[name.lowercase()]?.query
 
-    /**
-     * Persists a view's defining [query] as rendered SQL text (see [ViewDirectoryEntry]) - mirrors
-     * [kestrel.catalog.Catalog.createView]'s name-collision rules (a view and a table can never
-     * share a name, `orReplace` only waives the view-already-exists check).
-     */
     fun createView(name: String, query: QueryStatement, orReplace: Boolean) {
         val key = name.lowercase()
         if (rowsByName.containsKey(key)) throw DiskCatalogException("a table named '$name' already exists")
@@ -1065,13 +821,6 @@ class DiskCatalog private constructor(
         viewsByName[key] = ViewRow(rid, entry, query)
     }
 
-    /**
-     * Drops a view, blocked (RESTRICT, the default) by any other view depending on it - directly or
-     * transitively through a chain of views - unless [cascade] is set, in which case the whole
-     * transitive closure of dependents is dropped alongside it. Mirrors
-     * [kestrel.catalog.Catalog.dropView]/`dropDependentViews`'s "diamond-safe" ordering: the closure
-     * is computed once, up front, before anything is removed.
-     */
     fun dropView(name: String, cascade: Boolean = false) {
         val key = name.lowercase()
         if (!viewsByName.containsKey(key)) {
@@ -1093,11 +842,6 @@ class DiskCatalog private constructor(
         viewsByName.remove(key)
     }
 
-    /**
-     * Every view depending on [rootKey] (already lowercase), directly or through another view -
-     * [rootKey] itself may name a table or a view, [DependencyAnalysis] does not care which.
-     * Identical fixed-point walk to [kestrel.catalog.Catalog.transitiveViewDependents].
-     */
     private fun transitiveViewDependents(rootKey: String): Set<String> {
         val found = linkedSetOf<String>()
         var frontier = setOf(rootKey)
@@ -1113,15 +857,6 @@ class DiskCatalog private constructor(
         }
     }
 
-    // ---- SEQUENCE ----
-
-    /**
-     * Rebuilds a live [Sequence] from its persisted definition plus whatever [SequenceDirectoryEntry.
-     * positionPageId] currently holds - the exact `(value, called)` pair [Sequence.snapshotPosition]
-     * last wrote there, so reload reproduces the live instance's internal state precisely rather than
-     * approximating it (see [Sequence.snapshotPosition]'s own doc for why [Sequence.peekNext] is the
-     * wrong thing to persist this way).
-     */
     private fun sequenceFromEntry(entry: SequenceDirectoryEntry): Sequence {
         val definition = SequenceDefinition(entry.name, entry.incrementBy, entry.minValue, entry.maxValue, entry.startValue, entry.cycle)
         val reader = ByteReader(engine.readRawPage(entry.positionPageId))
@@ -1144,10 +879,6 @@ class DiskCatalog private constructor(
 
     fun sequenceOrNull(name: String): Sequence? = sequencesByName[name.lowercase()]?.sequence
 
-    /**
-     * Sequence names deliberately live in their own namespace here, same as
-     * [kestrel.catalog.Catalog.createSequence] - no collision check against [rowsByName]/[viewsByName].
-     */
     fun createSequence(definition: SequenceDefinition): Sequence {
         val key = definition.name.lowercase()
         if (sequencesByName.containsKey(key)) throw DiskCatalogException("sequence '${definition.name}' already exists")
@@ -1165,13 +896,6 @@ class DiskCatalog private constructor(
         return sequence
     }
 
-    /**
-     * Frees the dropped sequence's [SequenceDirectoryEntry.positionPageId] back to the shared page
-     * free list via [StorageEngine.freeRawPage], outside the directory-row transaction - like every
-     * other read/write of that page (see [writeSequencePosition]), freeing it is deliberately not
-     * part of the transactional/WAL-logged path, so an abort of surrounding SQL never resurrects a
-     * page already handed back to the free list.
-     */
     fun dropSequence(name: String) {
         val key = name.lowercase()
         val row = sequencesByName[key] ?: throw DiskCatalogException("no such sequence: $name")
@@ -1182,15 +906,6 @@ class DiskCatalog private constructor(
         sequencesByName.remove(key)
     }
 
-    /**
-     * Mirrors [kestrel.catalog.Catalog.alterSequence]: [Sequence.altered] computes the position ALTER
-     * SEQUENCE leaves the counter at (carried over unchanged, or reset by `RESTART`, see [Sequence]'s
-     * own doc) purely in memory first. Only once the transactional definition update in [directory]
-     * has actually committed is that new position written to the raw counter page - so a failure
-     * building or persisting the new [SequenceDirectoryEntry] (e.g. the sequence vanished from under
-     * a concurrent caller) can never leave the on-disk counter reflecting an ALTER whose definition
-     * change did not itself survive.
-     */
     fun alterSequence(name: String, newDefinition: SequenceDefinition, restartAt: Long?) {
         val key = name.lowercase()
         val row = sequencesByName[key] ?: throw DiskCatalogException("no such sequence: $name")
@@ -1208,17 +923,6 @@ class DiskCatalog private constructor(
         row.sequence = altered
     }
 
-    /**
-     * Advances [name] and durably persists the new position immediately via
-     * [StorageEngine.writeRawPage][kestrel.store.engine.StorageEngine.writeRawPage] - deliberately
-     * outside of any [beginTransaction]/[commit]/[abort], so the advance survives even a ROLLBACK of
-     * whichever statement's transaction called it (see [SequenceDirectoryEntry]'s own doc). Guarded
-     * by a lock on this catalog instance rather than [kestrel.store.txn.LockManager] (which the raw
-     * counter page never goes through at all) - the one piece of this catalog actually exercised by
-     * more than one thread at a time in this codebase (see the concurrent-session BEGIN/COMMIT test),
-     * so two overlapping NEXTVAL calls on the same sequence must not race on [Sequence.next]'s plain,
-     * unsynchronized `var`s.
-     */
     fun nextValue(name: String): Long = synchronized(this) {
         val row = sequencesByName[name.lowercase()] ?: throw DiskCatalogException("no such sequence: $name")
         val value = row.sequence.next()
@@ -1226,29 +930,17 @@ class DiskCatalog private constructor(
         value
     }
 
-    // ---- TRIGGER ----
-
     val triggerNames: List<String> get() = triggersByName.values.map { it.entry.triggerName }
 
-    /** Every trigger definition, in creation order - mirrors [kestrel.catalog.Catalog.triggerDefinitions]. */
     fun triggerDefinitions(): List<TriggerDefinition> = triggersByName.values.map { it.definition }
 
-    /** Whether any trigger (any timing/event) is defined ON [tableName] - mirrors [kestrel.catalog.Catalog.hasTriggers]. */
     fun hasTriggers(tableName: String): Boolean = triggersByName.values.any { it.definition.tableName.equals(tableName, ignoreCase = true) }
 
-    /** Every trigger registered for ([tableName], [timing], [event]), in creation order - mirrors [kestrel.catalog.Catalog.triggersOn]. */
     fun triggersOn(tableName: String, timing: TriggerTiming, event: TriggerEvent): List<TriggerDefinition> =
         triggersByName.values.filter {
             it.definition.tableName.equals(tableName, ignoreCase = true) && it.definition.timing == timing && it.definition.event == event
         }.map { it.definition }
 
-    /**
-     * Persists [definition] as rendered `CREATE TRIGGER ...;` text (see [TriggerDirectoryEntry]) -
-     * mirrors [kestrel.catalog.Catalog.createTrigger]'s name-collision rule. Every other eager check
-     * (the trigger's own table and every body statement's target table exist, the WHEN clause shape)
-     * is [DiskExecutor]'s responsibility, same split as [createView] versus [DiskExecutor.
-     * executeCreateView].
-     */
     fun createTrigger(definition: TriggerDefinition) {
         val key = definition.name.lowercase()
         if (triggersByName.containsKey(key)) throw DiskCatalogException("trigger '${definition.name}' already exists")

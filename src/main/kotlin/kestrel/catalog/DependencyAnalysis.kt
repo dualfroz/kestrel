@@ -36,13 +36,6 @@ import kestrel.sql.ast.UnaryExpression
 import kestrel.sql.ast.WindowExpression
 import kestrel.sql.ast.WithQuery
 
-/**
- * Walks a view's defining query looking for a relation name anywhere it could appear:
- * FROM/JOIN targets, derived tables, CTE bodies, set-operation branches, and every
- * subquery expression (scalar/EXISTS/IN) nested inside WHERE/HAVING/projection/GROUP BY.
- * Used by [Catalog] to find what would break (RESTRICT) or need to cascade (CASCADE)
- * when a table or view is dropped.
- */
 internal object DependencyAnalysis {
     fun referencesRelation(query: QueryStatement, name: String): Boolean = when (query) {
         is SelectStatement -> referencesInSelect(query, name)

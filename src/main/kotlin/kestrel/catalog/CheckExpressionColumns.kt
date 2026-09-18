@@ -23,15 +23,6 @@ import kestrel.sql.ast.ScalarSubqueryExpression
 import kestrel.sql.ast.UnaryExpression
 import kestrel.sql.ast.WindowExpression
 
-/**
- * Walks a CHECK constraint's expression looking for (or renaming) a plain column reference by
- * name. Used by [Catalog] to decide whether dropping a column must also drop a dependent CHECK
- * (`ALTER TABLE ... DROP COLUMN`) and to keep a CHECK in sync when a column is renamed
- * (`ALTER TABLE ... RENAME COLUMN`). The subquery and window-function variants are handled only to
- * keep the `when` exhaustive: `Executor.requireNoSubquery` already rejects any CHECK expression
- * containing a subquery, an aggregate, or a window function at CREATE TABLE time, so those branches
- * are unreachable in practice.
- */
 internal object CheckExpressionColumns {
     fun references(expression: Expression, columnName: String): Boolean = when (expression) {
         is ColumnExpression -> expression.name.equals(columnName, ignoreCase = true)

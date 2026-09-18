@@ -186,15 +186,6 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    /**
-     * Every numeric option (`INCREMENT [BY]`/`MINVALUE`/`MAXVALUE`/`START [WITH]`) may appear at
-     * most once and in any order, matching Postgres; a repeated option silently keeps the last one
-     * written rather than erroring, the same "last one wins" leniency [parseAlterTable] already
-     * gives `ADD`/`DROP`/`RENAME` if written more than once in spirit (though that one can only ever
-     * carry a single action). `NO MINVALUE`/`NO MAXVALUE` here are never distinguished from "not
-     * written at all" - see [CreateSequenceStatement]'s own doc for why that's fine for CREATE
-     * specifically (unlike [AlterSequenceStatement], there is no earlier bound to preserve).
-     */
     private fun parseCreateSequence(): CreateSequenceStatement {
         expect(TokenType.Sequence, "expected SEQUENCE")
         val name = expectIdentifier("expected sequence name")
@@ -231,18 +222,11 @@ class Parser(private val tokens: List<Token>) {
         return CreateSequenceStatement(name, incrementBy, minValue, maxValue, startValue, cycle)
     }
 
-    /** Distinguishes a sequence option's `NO MINVALUE|MAXVALUE|CYCLE` from `ON DELETE NO ACTION`'s unrelated `NO` - both start with the same token. */
     private fun peekIsSequenceNoClause(): Boolean =
         peekAt(1)?.type in setOf(TokenType.Minvalue, TokenType.Maxvalue, TokenType.Cycle)
 
     private fun peekAt(offset: Int): Token? = tokens.getOrNull(position + offset)
 
-    /**
-     * `body` is deliberately restricted to INSERT/UPDATE/DELETE ([parseTriggerBodyStatement]) -
-     * the only statement kinds with a side effect worth firing, matching SQLite's own trigger-body
-     * grammar. The closing `END` here is the trigger body's own terminator, distinct from the `;`
-     * `parseProgram` still expects after the whole CREATE TRIGGER statement.
-     */
     private fun parseCreateTrigger(): CreateTriggerStatement {
         expect(TokenType.Trigger, "expected TRIGGER")
         val triggerName = expectIdentifier("expected trigger name")
@@ -432,16 +416,6 @@ class Parser(private val tokens: List<Token>) {
         return columns
     }
 
-    /**
-     * `CONSTRAINT name FOREIGN KEY (...) | CHECK (...) | UNIQUE (...)` - a named table-level
-     * constraint, standard SQL syntax this engine accepts both inline in `CREATE TABLE` (here) and
-     * via `ALTER TABLE ... ADD` (see [parseAlterTable]'s identical dispatch). `PRIMARY KEY` is
-     * deliberately not accepted after `CONSTRAINT name`: [kestrel.catalog.TableSchema] has no name
-     * field for a table's PRIMARY KEY at all, so there would be nowhere to put it, and
-     * `ALTER TABLE ... DROP CONSTRAINT` never needs to target a PRIMARY KEY (see
-     * [kestrel.catalog.Catalog.dropColumn]'s own doc on why dropping a PRIMARY KEY is out of scope
-     * entirely - redesign it or drop the table instead).
-     */
     private fun parseNamedTableConstraint(
         foreignKeys: MutableList<ForeignKeyConstraint>,
         checks: MutableList<CheckConstraint>,
@@ -509,20 +483,12 @@ class Parser(private val tokens: List<Token>) {
         return Column(columnName, spec.type, notNull, primaryKey, spec.precision, spec.scale, default, generated, collation)
     }
 
-    /** `COLLATE name` on a column definition (`CREATE TABLE`/`ALTER TABLE ADD COLUMN`) - reuses the same name validation as expression-level `expr COLLATE name` (see [parseCollate]). */
     private fun parseColumnCollation(): Collation {
         advance()
         val nameToken = expect(TokenType.Identifier, "expected a collation name after COLLATE")
         return Collation.fromName(nameToken.lexeme) ?: throw error("no such collating sequence: ${nameToken.lexeme}", nameToken)
     }
 
-    /**
-     * `GENERATED ALWAYS AS ( expression ) STORED` - Postgres only ever supports `STORED` (unlike
-     * MySQL/SQLite, which also allow `VIRTUAL`), so this engine matches Postgres exactly rather than
-     * accepting a keyword it would then have to silently reinterpret. `GENERATED`/`ALWAYS`/`STORED`
-     * are contextual (same mechanism as `ROLLUP`/`CUBE`/`FILTER`), not reserved keywords, so a table
-     * can still name a column `generated` without quoting.
-     */
     private fun parseGeneratedClause(): Expression {
         advance()
         if (!isContextualKeyword("ALWAYS")) throw error("expected ALWAYS after GENERATED", peek())
@@ -618,7 +584,6 @@ class Parser(private val tokens: List<Token>) {
 
     private data class TypeSpec(val type: ColumnType, val precision: Int?, val scale: Int?)
 
-    /** Shared by column definitions (`CREATE TABLE`) and `CAST(... AS type)`. */
     private fun parseTypeSpec(): TypeSpec {
         val typeToken = advance()
         val type = when (typeToken.type) {
@@ -642,7 +607,6 @@ class Parser(private val tokens: List<Token>) {
 
     private fun expectIntLiteral(message: String): Int = expect(TokenType.IntLiteral, message).intValue!!.toInt()
 
-    /** A sequence option's bound (MINVALUE/MAXVALUE/START WITH/RESTART WITH) needs the full 64-bit range, unlike [expectIntLiteral]'s callers - and, unlike those, may be negative for a descending sequence. */
     private fun expectLongLiteral(message: String): Long {
         val negative = match(TokenType.Minus)
         val value = expect(TokenType.IntLiteral, message).intValue!!
@@ -729,7 +693,6 @@ class Parser(private val tokens: List<Token>) {
         )
     }
 
-    /** `SELECT [ALL | DISTINCT | DISTINCT ON (expr, ...)] ...` - `ALL` (the default) is accepted and discarded, matching Postgres. */
     private fun parseDistinctClause(): Pair<Boolean, List<Expression>> {
         if (match(TokenType.All)) return false to emptyList()
         if (!match(TokenType.Distinct)) return false to emptyList()
@@ -852,9 +815,6 @@ class Parser(private val tokens: List<Token>) {
                 else -> break
             }
             val lateral = match(TokenType.Lateral)
-            // A LATERAL right-hand side has no independent row set (it is re-evaluated per left
-            // row), so there is nothing to pad with NULLs for an unmatched *right* row - RIGHT/FULL
-            // JOIN LATERAL is therefore meaningless and rejected here rather than at execution time.
             if (lateral && (type == JoinType.Right || type == JoinType.Full)) {
                 throw error("RIGHT/FULL JOIN LATERAL is not supported: LATERAL has no independent right-hand row set", peek())
             }
@@ -863,7 +823,6 @@ class Parser(private val tokens: List<Token>) {
                 throw error("LATERAL is only allowed before a derived table subquery", peek())
             }
             val taggedFrom = if (lateral) (from as SubquerySource).copy(lateral = true) else from
-            // CROSS JOIN has no ON clause at all - matches every left/right pairing unconditionally.
             val on = if (type == JoinType.Cross) {
                 if (check(TokenType.On)) throw error("CROSS JOIN does not take an ON condition", peek())
                 null
@@ -878,15 +837,6 @@ class Parser(private val tokens: List<Token>) {
 
     private data class GroupByClause(val groupBy: List<Expression>, val spec: GroupingSpec?)
 
-    /**
-     * `ROLLUP`/`CUBE`/`GROUPING SETS` are not reserved keywords (matching how most SQL engines treat
-     * them - only meaningful right after `GROUP BY`), so they are recognized here by peeking at an
-     * [TokenType.Identifier]'s text rather than via a dedicated token type; a bare column actually
-     * named e.g. `rollup` is unaffected since the lookahead also requires the following token to open
-     * the parenthesized argument list. Mixing plain columns with one of these in the same clause (SQL
-     * allows it, producing a cross product of sets) is a scope cut - exactly one form fills the whole
-     * clause.
-     */
     private fun parseGroupBy(): GroupByClause {
         if (!match(TokenType.Group)) return GroupByClause(emptyList(), null)
         expect(TokenType.By, "expected BY after GROUP")
@@ -936,7 +886,6 @@ class Parser(private val tokens: List<Token>) {
         return expressions
     }
 
-    /** One element of `GROUPING SETS (...)`: `()` (the grand-total set) or a parenthesized expression list. */
     private fun parseGroupingSetElement(): List<Expression> {
         expect(TokenType.LeftParen, "expected '(' to open a GROUPING SETS element")
         if (match(TokenType.RightParen)) return emptyList()
@@ -953,7 +902,6 @@ class Parser(private val tokens: List<Token>) {
         return if (keys.isEmpty()) null else OrderBy(keys)
     }
 
-    /** Shared by top-level ORDER BY and a window function's `OVER (... ORDER BY ...)` clause. */
     private fun parseOrderKeys(): List<OrderKey> {
         if (!match(TokenType.Order)) return emptyList()
         expect(TokenType.By, "expected BY after ORDER")
@@ -971,12 +919,6 @@ class Parser(private val tokens: List<Token>) {
         return keys
     }
 
-    /**
-     * `NULLS FIRST` / `NULLS LAST`, optional after each ORDER BY key's own `ASC`/`DESC`. Like
-     * `ROLLUP`/`CUBE`/`FILTER`/`GENERATED` elsewhere in this parser, `NULLS`/`FIRST`/`LAST` are not
-     * reserved keywords - a column legitimately named any of the three is unaffected outside this
-     * exact position, since [isContextualKeyword] only fires here, right after an order key.
-     */
     private fun parseOptionalNullsClause(): Boolean? {
         if (!isContextualKeyword("NULLS")) return null
         advance()
@@ -987,12 +929,6 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    /**
-     * `LIMIT`/`OFFSET` may appear in either order (matching Postgres, unlike the standard's
-     * `OFFSET ... FETCH ...`), but not repeated - a second `LIMIT` or `OFFSET` stops the loop and is
-     * left for whatever follows (typically a parse error from the caller, e.g. a stray token before
-     * `;`) rather than silently overwriting the first.
-     */
     private fun parseLimitOffset(): Pair<Int?, Int?> {
         var limit: Int? = null
         var offset: Int? = null
@@ -1038,11 +974,6 @@ class Parser(private val tokens: List<Token>) {
         return assignments
     }
 
-    /**
-     * `MERGE INTO target [[AS] alias] USING source ON condition (WHEN ...)+`. [parseFromItem] is
-     * reused verbatim for the `USING` source: it is exactly a `FROM`-shaped item (bare table name
-     * or a parenthesized, aliased derived-table subquery), not a MERGE-specific grammar production.
-     */
     private fun parseMerge(): MergeStatement {
         expect(TokenType.Merge, "expected MERGE")
         expect(TokenType.Into, "expected INTO after MERGE")
@@ -1069,13 +1000,6 @@ class Parser(private val tokens: List<Token>) {
         else -> null
     }
 
-    /**
-     * `WHEN [NOT] MATCHED [AND condition] THEN action` - the `AND condition` sits between the
-     * MATCHED/NOT MATCHED keyword and THEN in both categories, matching Postgres. A NOT MATCHED
-     * action is always INSERT (there is no target row for NOT MATCHED to UPDATE or DELETE);
-     * [MergeNotMatchedInsert.values] uses the same "bare DEFAULT keyword or expression" per-slot
-     * grammar as plain INSERT's own VALUES list ([parseInsert]).
-     */
     private fun parseMergeWhenClause(): MergeWhenClause {
         val matched = when {
             match(TokenType.Matched) -> true
@@ -1129,11 +1053,6 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    /**
-     * `TRUNCATE [TABLE] t1 [, t2, ...] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
-     * `TABLE` and the identity clause are both optional, matching Postgres (which also defaults to
-     * CONTINUE IDENTITY when neither RESTART nor CONTINUE is written).
-     */
     private fun parseTruncate(): TruncateTableStatement {
         expect(TokenType.Truncate, "expected TRUNCATE")
         match(TokenType.Table)
@@ -1170,11 +1089,6 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    /**
-     * Every option may appear at most once and in any order, same leniency as
-     * [parseCreateSequence]. `NO MINVALUE`/`NO MAXVALUE` here are NOT equivalent to leaving the
-     * option out entirely - see [AlterSequenceStatement]'s own doc.
-     */
     private fun parseAlterSequence(): AlterSequenceStatement {
         expect(TokenType.Sequence, "expected SEQUENCE")
         val name = expectIdentifier("expected sequence name")
@@ -1277,15 +1191,6 @@ class Parser(private val tokens: List<Token>) {
         return AlterTableStatement(tableName, action)
     }
 
-    /**
-     * A deliberately restricted column definition: no PRIMARY KEY/REFERENCES/UNIQUE/CHECK, since
-     * enforcing those against a table that may already hold rows (composite-key interactions,
-     * FK target validation, CASCADE bookkeeping) is out of scope for a single ADD COLUMN - CREATE
-     * UNIQUE INDEX already covers UNIQUE on an existing table, and CREATE TABLE covers the rest.
-     * GENERATED ALWAYS AS is allowed, unlike those - see `Executor.executeAddColumn`/
-     * `DiskExecutor.executeAddColumn` for why it does not share that "out of scope" reasoning
-     * (it backfills by evaluating the expression per existing row, not by writing one constant).
-     */
     private fun parseAlterAddColumnDefinition(): Column {
         val columnName = expectIdentifier("expected column name")
         val spec = parseTypeSpec()
@@ -1433,14 +1338,6 @@ class Parser(private val tokens: List<Token>) {
         return left
     }
 
-    /**
-     * `expr COLLATE name` - sits between unary and multiplicative in precedence, matching
-     * SQLite's own grammar (binds tighter than every arithmetic/comparison operator, but looser
-     * than unary `-`/`NOT`, so `-x COLLATE NOCASE` is `(-x) COLLATE NOCASE` and
-     * `a || b COLLATE NOCASE` would apply to `b` alone). Left-associative chaining
-     * (`x COLLATE A COLLATE B`) is accepted like SQLite accepts it - only the last one written
-     * has any effect, since each wraps the previous [CollateExpression] as its own operand.
-     */
     private fun parseCollate(): Expression {
         var expression = parseUnary()
         while (match(TokenType.Collate)) {
@@ -1489,10 +1386,6 @@ class Parser(private val tokens: List<Token>) {
             TokenType.Case -> parseCase()
             TokenType.Exists -> parseExists()
             TokenType.Cast -> parseCast()
-            // LEFT/RIGHT are otherwise reserved (LEFT/RIGHT JOIN), but LEFT(str, n)/RIGHT(str, n) are
-            // real, commonly expected scalar functions - only valid here as a call, never as a bare
-            // column reference, so a missing '(' is unconditionally an error rather than falling back
-            // to ColumnExpression like the TokenType.Identifier branch below does.
             TokenType.Left -> {
                 advance()
                 if (check(TokenType.LeftParen)) parseFunctionCall(token.lexeme) else throw error("expected '(' after LEFT", peek())
@@ -1578,9 +1471,6 @@ class Parser(private val tokens: List<Token>) {
             } while (match(TokenType.Comma))
         }
         expect(TokenType.RightParen, "expected ')' after function arguments")
-        // `FILTER` is not a reserved keyword either (same reasoning as ROLLUP/CUBE/GROUPING above) -
-        // only meaningful right after an aggregate call's closing paren when immediately followed by
-        // `(`, so a column or table legitimately named `filter` is unaffected.
         var filter: Expression? = null
         if (isContextualKeyword("FILTER") && peekNext().type == TokenType.LeftParen) {
             if (!isAggregate) throw error("FILTER can only be used with an aggregate function", peek())
@@ -1612,17 +1502,6 @@ class Parser(private val tokens: List<Token>) {
         return CallExpression(name, arguments)
     }
 
-    /**
-     * `STRING_AGG(value, separator [ORDER BY key [ASC|DESC], ...])` - shaped nothing like the rest of
-     * [AGGREGATE_FUNCTIONS] (two required arguments, no `*` form, an optional ORDER BY *inside* the
-     * parens that sorts values within each group independently of the query's own ORDER BY), so it
-     * gets its own parse path called before `(` is even consumed for the generic aggregate branch.
-     * The left paren was already consumed by [parseFunctionCall]. Never valid with `OVER` - unlike
-     * COUNT/SUM/AVG/MIN/MAX, [kestrel.engine.AggregateFunctions] has no per-row windowed form for it
-     * (concatenation order inside a sliding frame is a separate, unimplemented feature), so `OVER`
-     * right after the closing `)` is rejected here with a clear message instead of falling through to
-     * a generic "expected ';'" parse error later.
-     */
     private fun parseStringAggCall(name: String): Expression {
         val value = parseExpression()
         expect(TokenType.Comma, "expected ',' after STRING_AGG value argument")
@@ -1633,14 +1512,6 @@ class Parser(private val tokens: List<Token>) {
         return FunctionExpression(name, value, star = false, separator = separator, orderBy = orderBy)
     }
 
-    /**
-     * Unlike every other function call, [arguments] must be exactly one string literal - the
-     * sequence's name is resolved once here, at parse time, rather than carried as a general
-     * [Expression] evaluated per row (see [NextValueExpression]'s own doc for why). A bad argument
-     * (wrong count, wrong shape - a column reference, another call, ...) is a parse-time error here
-     * rather than something [kestrel.engine.Evaluator] discovers later, matching how this parser
-     * already treats e.g. a non-identifier index/table name elsewhere.
-     */
     private fun parseSequenceFunctionCall(name: String, upperName: String, arguments: List<Expression>): Expression {
         val sequenceNameArgument = arguments.singleOrNull() as? LiteralExpression
         val sequenceName = (sequenceNameArgument?.value as? Value.TextValue)?.value
@@ -1648,14 +1519,6 @@ class Parser(private val tokens: List<Token>) {
         return if (upperName == "NEXTVAL") NextValueExpression(sequenceName) else CurrentValueExpression(sequenceName)
     }
 
-    /**
-     * `name(args) OVER (...)`, reached once `name(args)` is already parsed and `OVER` is next.
-     * Ranking functions (ROW_NUMBER/RANK/DENSE_RANK) take no arguments at all; the aggregate
-     * vocabulary (COUNT/SUM/AVG/MIN/MAX) is exactly the [AGGREGATE_FUNCTIONS] set, reused here with
-     * per-row windowed semantics instead of collapsing a group. LAG/LEAD take 1-3 arguments (value,
-     * offset, default); FIRST_VALUE/LAST_VALUE/NTILE take exactly one. Any other name before OVER is
-     * a clear error rather than silently falling back to a plain (non-window) call.
-     */
     private fun parseWindowExpression(
         name: String,
         upperName: String,
@@ -1697,11 +1560,6 @@ class Parser(private val tokens: List<Token>) {
         return WindowExpression(name, kind, argument, star, partitionBy, orderBy, offset, defaultValue, frame)
     }
 
-    /**
-     * `ROWS|RANGE|GROUPS BETWEEN <bound> AND <bound>`, or the shorthand `ROWS|RANGE|GROUPS <bound>`
-     * (equivalent to `... BETWEEN <bound> AND CURRENT ROW`, exactly like every other SQL engine's
-     * shorthand).
-     */
     private fun parseWindowFrame(): WindowFrame? {
         val unit = when {
             match(TokenType.Rows) -> FrameUnit.Rows
@@ -1723,11 +1581,6 @@ class Parser(private val tokens: List<Token>) {
         return WindowFrame(unit, start, end, parseFrameExclude())
     }
 
-    /**
-     * `EXCLUDE CURRENT ROW | EXCLUDE GROUP | EXCLUDE TIES | EXCLUDE NO OTHERS`, optional and always
-     * following the frame's bounds. Absent entirely is [FrameExclude.NoOthers], identical to writing
-     * `EXCLUDE NO OTHERS` out - SQL engines never require it and this parser accepts either.
-     */
     private fun parseFrameExclude(): FrameExclude {
         if (!match(TokenType.Exclude)) return FrameExclude.NoOthers
         return when {

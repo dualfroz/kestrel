@@ -3,14 +3,6 @@ package kestrel.store.sql
 import kestrel.store.codec.ByteReader
 import kestrel.store.codec.ByteWriter
 
-/**
- * Encodes a [SequenceDirectoryEntry] as a self-contained byte payload, mirroring
- * [DirectoryEntryCodec]/[ViewDirectoryEntryCodec]. Every numeric field uses [ByteWriter.writeZigZag]
- * rather than [ByteWriter.writeFixedLong] because MINVALUE/MAXVALUE/START WITH routinely hold
- * negative values (a descending sequence's default MAXVALUE is `-1`, and either bound can be
- * [Long.MIN_VALUE]/[Long.MAX_VALUE]) - zigzag keeps the common case (small increments, page ids)
- * compact while still round-tripping the full `Long` range.
- */
 object SequenceDirectoryEntryCodec {
     fun encode(entry: SequenceDirectoryEntry): ByteArray {
         val writer = ByteWriter()

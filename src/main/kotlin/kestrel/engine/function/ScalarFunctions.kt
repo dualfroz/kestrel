@@ -99,9 +99,6 @@ object ScalarFunctions {
         register("MOD", 2) { args -> mod(args[0], args[1]) }
         register("SIGN", 1) { args -> Value.IntegerValue(sign(args[0]).toLong()) }
         register("TRUNC", 1, 2) { args -> trunc(args) }
-        // Any NULL argument already short-circuited to NULL above (nullPropagating, the default),
-        // so by the time the body runs every argument is non-NULL and args is non-empty (min 2) -
-        // maxWith/minWith can never return null here despite the nullable Comparator.compare contract.
         register("GREATEST", 2, Int.MAX_VALUE) { args -> args.maxWith(ValueOrdering) }
         register("LEAST", 2, Int.MAX_VALUE) { args -> args.minWith(ValueOrdering) }
 
@@ -161,19 +158,12 @@ object ScalarFunctions {
         return Value.TextValue(if (start >= end) "" else source.substring(start, end))
     }
 
-    /** `LEFT(str, n)`/`RIGHT(str, n)`: the first/last `n` characters, clamped to `[0, str.length]` (a non-positive `n` is empty, an `n` past the string's length is the whole string). */
     private fun edge(args: List<Value>, function: String, fromStart: Boolean): String {
         val source = text(args[0], function)
         val count = integer(args[1], function).coerceIn(0, source.length.toLong()).toInt()
         return if (fromStart) source.substring(0, count) else source.substring(source.length - count)
     }
 
-    /**
-     * MySQL-compatible LPAD/RPAD: the result is always exactly [target length][Value.IntegerValue]
-     * characters (never longer) - a source already at or past that length is truncated to it (from
-     * the start, regardless of which side would have been padded), and a source shorter than it is
-     * padded by cycling [padString] (default a single space) until the target length is reached.
-     */
     private fun pad(args: List<Value>, function: String, left: Boolean): Value {
         val source = text(args[0], function)
         val targetLength = integer(args[1], function)
@@ -189,7 +179,6 @@ object ScalarFunctions {
         return Value.TextValue(if (left) padding + source else source + padding)
     }
 
-    /** Two INTEGER operands with a non-negative exponent stay exact (repeated Long multiplication); anything else - a negative exponent or a REAL operand on either side - falls back to `Math.pow`. */
     private fun power(base: Value, exponent: Value): Value {
         if (base is Value.IntegerValue && exponent is Value.IntegerValue && exponent.value >= 0) {
             var result = 1L
@@ -199,7 +188,6 @@ object ScalarFunctions {
         return Value.RealValue(number(base, "POWER").pow(number(exponent, "POWER")))
     }
 
-    /** Two INTEGER operands use exact `Long` remainder; a REAL operand on either side uses floating-point remainder instead. */
     private fun mod(dividend: Value, divisor: Value): Value {
         if (dividend is Value.IntegerValue && divisor is Value.IntegerValue) {
             if (divisor.value == 0L) throw KestrelException("division by zero")
@@ -232,7 +220,6 @@ object ScalarFunctions {
         else -> throw KestrelException("function SIGN requires a numeric argument but got ${value.typeName}")
     }
 
-    /** Same digit-count/type handling as [round], but truncates toward zero (`RoundingMode.DOWN`) instead of rounding half-up. */
     private fun trunc(args: List<Value>): Value {
         val digits = if (args.size == 2) {
             (args[1] as? Value.IntegerValue)?.value?.toInt()

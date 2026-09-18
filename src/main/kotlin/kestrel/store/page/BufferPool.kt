@@ -4,13 +4,6 @@ import kestrel.KestrelException
 
 class BufferPoolExhaustedException(message: String) : KestrelException(message)
 
-/**
- * Fixed-capacity page cache in front of a [DiskManager], using clock
- * (second-chance) replacement: each frame has a reference bit set on access,
- * and eviction sweeps frames clearing bits before reclaiming an unpinned,
- * unreferenced frame. Dirty pages are written back on eviction or explicit
- * flush.
- */
 class BufferPool(private val diskManager: DiskManager, private val capacity: Int) : PageStore {
     init {
         require(capacity > 0) { "buffer pool capacity must be positive" }
@@ -68,19 +61,11 @@ class BufferPool(private val diskManager: DiskManager, private val capacity: Int
         }
     }
 
-    /** Removes a page from the cache and the backing file. Caller must not hold a pin on it. */
     override fun deletePage(pageId: Long) {
         dropFromCache(pageId)
         diskManager.freePage(pageId)
     }
 
-    /**
-     * Drops a page from the cache without writing it back or freeing it on
-     * disk, so the next [fetchPage] re-reads whatever is currently on disk.
-     * Used after [kestrel.store.wal.RecoveryManager] restores a before-image
-     * directly through the [DiskManager], bypassing this cache: without an
-     * invalidation the pool would keep serving the stale, rolled-back copy.
-     */
     fun invalidate(pageId: Long) {
         dropFromCache(pageId)
     }

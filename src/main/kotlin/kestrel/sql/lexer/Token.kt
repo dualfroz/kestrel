@@ -23,7 +23,6 @@ enum class TokenType {
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Plus, Minus, Star, Slash, Dot,
     LeftParen, RightParen, Comma, Semicolon,
-    /** `$1`, `$2`, ... - see [kestrel.sql.ast.ParameterExpression]. [Token.intValue] carries the 1-based index. */
     Parameter,
     EndOfInput
 }

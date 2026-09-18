@@ -3,7 +3,6 @@ package kestrel.store.sql
 import kestrel.store.codec.ByteReader
 import kestrel.store.codec.ByteWriter
 
-/** Encodes a [TriggerDirectoryEntry] as a self-contained byte payload, mirroring [ViewDirectoryEntryCodec]. */
 object TriggerDirectoryEntryCodec {
     fun encode(entry: TriggerDirectoryEntry): ByteArray {
         val writer = ByteWriter()

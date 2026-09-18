@@ -7,16 +7,6 @@ import kestrel.store.page.PageStore
 
 class BTreeCorruptionException(message: String) : KestrelException(message)
 
-/**
- * A disk-backed B+Tree mapping order-preserving byte keys (see [KeyCodec]) to
- * row pointers. Nodes live on [Page]s fetched through a [BufferPool]; leaves
- * are linked for ordered range scans. Insert splits an overflowing node and
- * propagates a promoted separator key upward, growing the root when needed.
- * Delete removes the entry and, when a node drops below
- * [UNDERFLOW_THRESHOLD], redistributes an entry from a sibling with spare
- * capacity or merges with one, shrinking the root when it is left with a
- * single child.
- */
 class BPlusTree private constructor(private val bufferPool: PageStore, rootPageId: Long) {
     companion object {
         private const val UNDERFLOW_THRESHOLD = Page.PAGE_SIZE / 4
@@ -85,7 +75,6 @@ class BPlusTree private constructor(private val bufferPool: PageStore, rootPageI
         return found
     }
 
-    /** Every page belonging to this tree: every internal node and every leaf, reached by a full traversal from the root. */
     fun allPageIds(): List<Long> {
         val ids = mutableListOf<Long>()
         val pending = ArrayDeque<Long>()
@@ -100,7 +89,6 @@ class BPlusTree private constructor(private val bufferPool: PageStore, rootPageI
         return ids
     }
 
-    /** Ordered scan over `[from, to]` (or `[from, to)` when [toInclusive] is false). Null bounds are open. */
     fun rangeScan(from: ByteArray? = null, to: ByteArray? = null, toInclusive: Boolean = false): Iterator<Pair<ByteArray, Long>> {
         val startLeafId = leftmostLeafFor(from)
         return iterator {

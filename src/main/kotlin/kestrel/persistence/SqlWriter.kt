@@ -218,13 +218,6 @@ object SqlWriter {
         append(";")
     }
 
-    /**
-     * Bakes the sequence's CURRENT position into `START WITH`, rather than dumping
-     * [SequenceDefinition.startValue] as written at CREATE time, so a reload resumes NEXTVAL
-     * exactly where this session left off instead of reissuing already-handed-out values - see
-     * [Sequence]'s own doc on why the counter (unlike the CREATE/DROP/ALTER SEQUENCE structure
-     * every other part of [dump] is free to just replay literally) needs this special treatment.
-     */
     private fun sequenceDumpText(sequence: Sequence): String {
         val definition = sequence.definition
         val cycle = if (definition.cycle) " CYCLE" else ""
@@ -234,18 +227,11 @@ object SqlWriter {
 
     fun dump(catalog: Catalog): String {
         val builder = StringBuilder()
-        // Sequences are dumped FIRST, strictly before every table - a table's own column DEFAULT
-        // can read `NEXTVAL('seq')` (see kestrel.engine.Executor.executeCreateTable's eager
-        // `catalog.sequence(...)` existence check), so replaying that CREATE TABLE on reload would
-        // fail with "no such sequence" if the sequence it names did not already exist yet.
         for (definition in catalog.sequenceDefinitions()) {
             builder.append("${sequenceDumpText(catalog.sequence(definition.name))}\n")
         }
         for (tableName in catalog.tableNames) {
             val table = catalog.table(tableName)
-            // A TEMP/TEMPORARY table (see kestrel.catalog.TableSchema.temporary) is session-scoped by
-            // definition - dumping it (or its rows below) into a checkpoint would make it survive a
-            // reload, which is exactly what "temporary" promises it never does.
             if (table.schema.temporary) continue
             builder.append("CREATE TABLE ${table.schema.name} (")
             builder.append(
@@ -260,12 +246,6 @@ object SqlWriter {
             builder.append(");\n")
             for (row in table.rows) {
                 builder.append("INSERT INTO ${table.schema.name} VALUES (")
-                // A GENERATED column's position is dumped as the literal `DEFAULT` keyword rather
-                // than its already-computed value - the executor rejects an explicit value for a
-                // GENERATED column outright (see Executor.rejectGeneratedAssignment), and `DEFAULT`
-                // here triggers the exact same fresh-recompute path an omitted column would, which
-                // reproduces the same value on replay since the expression is a pure function of
-                // this row's other (literal, already-dumped) columns.
                 builder.append(
                     row.values.mapIndexed { index, value ->
                         if (table.schema.columns[index].generated != null) "DEFAULT" else literal(value)
@@ -275,34 +255,17 @@ object SqlWriter {
             }
         }
         for (definition in catalog.indexDefinitions()) {
-            // An index defined on a TEMP table never gets a CREATE TABLE to attach to above, so
-            // dumping it would replay as "no such table" - skip it right along with its table.
             if (catalog.tableOrNull(definition.tableName)?.schema?.temporary == true) continue
             builder.append(
                 "CREATE ${if (definition.unique) "UNIQUE " else ""}INDEX ${definition.name} ON " +
                     "${definition.tableName} (${definition.columnDisplayName});\n"
             )
         }
-        // A VIEW whose query reads a TEMP table is NOT specially excluded here (unlike the index/
-        // trigger cases above, its dependency can be buried arbitrarily deep in a join/subquery, not
-        // one flat tableName field) - dumping it and replaying it against a reload that never
-        // recreated that TEMP table fails loudly with "no such table", the same honest failure mode
-        // this engine already accepts for e.g. a prepared statement that does not survive reopen,
-        // rather than silently materializing an empty or wrong view.
         for (viewName in catalog.viewNames) {
             val view = catalog.viewOrNull(viewName)!!
             builder.append("CREATE VIEW ${view.name} AS ${queryText(view.query)};\n")
         }
-        // Triggers are dumped LAST, strictly after every row above has already been inserted as
-        // plain data - a trigger created before its table's INSERTs would re-fire (duplicating an
-        // AFTER trigger's side effects, or re-running a BEFORE trigger's validation) the moment
-        // this very dump is replayed on reload, since replay re-executes each of these statements
-        // for real. Creating the trigger only once the table is already fully populated means
-        // those historical rows never pass through it, while every INSERT/UPDATE/DELETE a user
-        // issues after reload still does.
         for (definition in catalog.triggerDefinitions()) {
-            // Same reasoning as the index skip above: a trigger ON a TEMP table has no table left to
-            // attach to after reload.
             if (catalog.tableOrNull(definition.tableName)?.schema?.temporary == true) continue
             builder.append("${triggerText(definition)}\n")
         }
@@ -347,12 +310,6 @@ object SqlWriter {
         return "DELETE FROM ${statement.tableName}$where;"
     }
 
-    /**
-     * Persisted literally like every other DML statement (see [writeInsert]/[writeUpdate]): by the
-     * time this redo-log entry replays, every earlier statement - including whatever populated a
-     * table-shaped `USING` source - has already replayed too, so re-running the exact same MERGE
-     * text against the freshly rebuilt catalog reproduces the same result deterministically.
-     */
     private fun writeMerge(statement: MergeStatement): String {
         val targetAlias = statement.targetAlias?.let { " AS $it" } ?: ""
         val whenClauses = statement.whenClauses.joinToString(" ") { mergeWhenClauseText(it) }
@@ -471,21 +428,10 @@ object SqlWriter {
         is WindowExpression -> "${expression.name}(${windowArgumentsText(expression)}) OVER (${overClauseText(expression)})"
         is NextValueExpression -> "NEXTVAL(${literal(Value.TextValue(expression.sequenceName))})"
         is CurrentValueExpression -> "CURRVAL(${literal(Value.TextValue(expression.sequenceName))})"
-        // Unreachable in practice: writeMerge never emits statement.returning at all (RETURNING is
-        // dropped from every persisted DML statement - see writeInsert/writeUpdate/writeDelete's own
-        // callers), so MERGE_ACTION() - only ever legal inside a MERGE's RETURNING - never reaches
-        // this writer. Kept here only to keep `when` exhaustive.
         is MergeActionExpression -> "MERGE_ACTION()"
-        // Never actually reaches here in practice - canPersist excludes PREPARE/EXECUTE/DEALLOCATE
-        // outright (see its own doc), and resolveExecute always substitutes every ParameterExpression
-        // for a literal before the concrete INSERT/UPDATE/DELETE/SELECT it resolved to is ever handed
-        // to this writer. Kept only so `when` stays exhaustive, and so a `$1` typed directly into a
-        // persistable statement outside PREPARE (structurally legal, just meaningless - Evaluator
-        // throws on it) still round-trips its own text faithfully rather than being silently mangled.
         is ParameterExpression -> "\$${expression.index}"
     }
 
-    /** STRING_AGG's `separator`/`orderBy` and DISTINCT are the only [FunctionExpression] fields beyond `argument`/`star` - every other aggregate falls through the `?: ""` exactly as before. */
     private fun functionArgumentsText(function: FunctionExpression): String {
         if (function.star) return "*"
         val distinctPrefix = if (function.distinct) "DISTINCT " else ""
@@ -497,7 +443,6 @@ object SqlWriter {
         return "$distinctPrefix$value, ${expression(separator)}$orderBy"
     }
 
-    /** `DESC`/`NULLS FIRST`/`NULLS LAST` are omitted when unspecified, so a plain ascending key with the engine's own default null ordering dumps exactly as written, matching every other optional-clause writer in this file. */
     private fun orderKeySuffix(key: OrderKey): String {
         val direction = if (key.descending) " DESC" else ""
         val nulls = when (key.nullsFirst) {
@@ -508,7 +453,6 @@ object SqlWriter {
         return direction + nulls
     }
 
-    /** Without this, a view with `COUNT(x) FILTER (WHERE ...)` would dump as plain `COUNT(x)` and silently drop the predicate on reopen. */
     private fun filterClauseText(function: FunctionExpression): String =
         function.filter?.let { " FILTER (WHERE ${expression(it)})" } ?: ""
 
@@ -652,15 +596,6 @@ object SqlWriter {
         }
     }
 
-    /**
-     * DECIMAL/DATE values render as `CAST('...' AS type)` (not a bare quoted string)
-     * because column coercion is strict everywhere else in this engine (no implicit
-     * TEXT-to-DECIMAL/DATE on INSERT/UPDATE) - the CAST is what actually converts the
-     * text back on replay. The re-cast uses the value's own scale (already the column's
-     * declared scale, since it can only have gotten here via coercion or CAST) with a
-     * generous precision, so it reproduces the exact BigDecimal rather than rounding
-     * through a Double the way a bare numeric literal would.
-     */
     private fun literal(value: Value): String = when (value) {
         is Value.IntegerValue -> value.value.toString()
         is Value.RealValue -> realText(value.value)

@@ -5,20 +5,6 @@ import kestrel.store.page.Page
 
 class HeapPageException(message: String) : KestrelException(message)
 
-/**
- * Slotted-page layout for heap-organized storage.
- *
- * ```
- * [ header (12B) | slot directory, grows down | free space | tuple bytes, grow up ]
- * ```
- *
- * The header holds the id of the next page in the heap's page chain, the
- * slot count, and the offset where tuple bytes currently begin. Each slot
- * directory entry is `[offset:u16][length:u16]`; a length of
- * [TOMBSTONE_LENGTH] marks a deleted slot. Deleting a record only tombstones
- * its slot so the [RecordId] stays stable; [compact] later reclaims the
- * space by repacking live tuples against the end of the page.
- */
 object HeapPage {
     private const val HEADER_SIZE = 12
     private const val SLOT_SIZE = 4
@@ -64,7 +50,6 @@ object HeapPage {
         return page.data.copyOfRange(offset, offset + length)
     }
 
-    /** Returns the new slot id, or null if [bytes] does not fit even after [compact]. */
     fun insert(page: Page, bytes: ByteArray): Int? {
         require(bytes.size <= MAX_RECORD_SIZE) { "record of ${bytes.size} bytes exceeds page capacity" }
         if (!fits(page, bytes.size)) {
@@ -89,7 +74,6 @@ object HeapPage {
         page.isDirty = true
     }
 
-    /** Overwrites a slot in place. [bytes] must be no larger than the slot's current length. */
     fun overwrite(page: Page, slotId: Int, bytes: ByteArray) {
         val entry = slotEntryOffset(page, slotId)
         val length = readShort(page, entry + 2)
@@ -101,7 +85,6 @@ object HeapPage {
         page.isDirty = true
     }
 
-    /** Repacks live tuples against the end of the page, discarding tombstoned bytes. */
     fun compact(page: Page) {
         val count = slotCount(page)
         val live = ArrayList<Pair<Int, ByteArray>>(count)

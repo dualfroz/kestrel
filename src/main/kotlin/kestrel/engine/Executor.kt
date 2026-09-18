@@ -104,25 +104,10 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
     private var transactionSnapshot: CatalogSnapshot? = null
     private val savepoints = mutableListOf<Pair<String, CatalogSnapshot>>()
 
-    /** Guards against a trigger whose body (directly or transitively) fires itself forever. */
     private var triggerDepth = 0
 
-    /**
-     * Postgres' CURRVAL is scoped to "the current session" - this engine's closest equivalent is
-     * one [Executor] instance. Keyed by [Sequence] identity rather than by name so that ALTER
-     * SEQUENCE (which always installs a new [Sequence] instance, see [Sequence.altered]) or a
-     * DROP+CREATE of the same name invalidates any remembered value instead of silently handing
-     * back a value that belonged to a different configuration of "the same" name - a deliberately
-     * conservative choice over trying to decide case by case which ALTERs should or shouldn't
-     * preserve it.
-     */
     private val lastSequenceValues = HashMap<Sequence, Long>()
 
-    /**
-     * Session-scoped, deliberately outside [catalog] - see [PrepareStatement]'s own doc for why a
-     * prepared statement is not part of the transactional snapshot/restore every other catalog
-     * object participates in.
-     */
     private val preparedStatements = linkedMapOf<String, PreparableStatement>()
 
     val preparedStatementNames: List<String> get() = preparedStatements.keys.toList()
@@ -180,15 +165,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return PrepareResult(statement.name)
     }
 
-    /**
-     * Looks [statement]'s name up, evaluates every argument expression as a CONSTANT (a bare
-     * `Evaluator()` with no [ColumnResolver]/[SubqueryRunner]/[SequenceAccess] - a column reference,
-     * subquery, or NEXTVAL/CURRVAL in an EXECUTE argument throws exactly like one would in a DEFAULT
-     * expression, for the same reason: there is no row to resolve any of them against), and
-     * substitutes the results for every `$1`, `$2`, ... in the prepared statement. The result is
-     * always a concrete [PreparableStatement] - never [ExecuteStatement] itself - ready to run
-     * through [execute] like any statement typed directly.
-     */
     fun resolveExecute(statement: ExecuteStatement): Statement {
         val target = preparedStatements[statement.name.lowercase()]
             ?: throw KestrelException("no such prepared statement: ${statement.name}")
@@ -235,12 +211,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return RollbackResult
     }
 
-    /**
-     * A savepoint that reuses an already-established name is intentionally allowed (matches
-     * Postgres): it shadows the earlier one, and RELEASE/ROLLBACK TO always target the most
-     * recently established savepoint of that name via [indexOfLastSavepoint], leaving the older,
-     * shadowed one addressable again once the newer one is released or rolled back past.
-     */
     private fun executeSavepoint(statement: SavepointStatement): StatementResult {
         if (!inTransaction) throw KestrelException("SAVEPOINT can only be used inside a transaction")
         savepoints.add(statement.name to catalog.snapshot())
@@ -300,12 +270,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return CreateTableResult(statement.tableName)
     }
 
-    /**
-     * A table-level `PRIMARY KEY (a, b, ...)` implies NOT NULL on every listed column, exactly
-     * like the inline `col TYPE PRIMARY KEY` spelling already does - applied here (rather than in
-     * the parser) because the parser builds [Column]s one at a time and has no view of the whole
-     * table-level clause yet when it does.
-     */
     private fun applyCompositePrimaryKey(statement: CreateTableStatement): List<Column> {
         if (statement.compositePrimaryKey.isEmpty()) return statement.columns
         val declared = statement.compositePrimaryKey.map { it.lowercase() }.toSet()
@@ -332,12 +296,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A self-reference (a FK on the table pointing back at itself, e.g. an employee/manager
-     * hierarchy) is checked against a [TableSchema] built from [columns] (already normalized by
-     * [applyCompositePrimaryKey]) rather than the catalog, because the table doesn't exist there
-     * yet while it's being created.
-     */
     private fun validateForeignKeyDefinitions(statement: CreateTableStatement, columns: List<Column>) {
         for (fk in statement.foreignKeys) {
             if (fk.columns.size != fk.referencedColumns.size) {
@@ -408,17 +366,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A GENERATED column's expression is recomputed from this row's OTHER column values on every
-     * INSERT/UPDATE (see [applyGeneratedColumns]) - it must therefore be a pure function of that
-     * row's own columns: [checkColumns] rejects a reference to a nonexistent column plus any
-     * aggregate/window function, [requireNoSubquery] rejects a subquery and NEXTVAL/CURRVAL/
-     * MERGE_ACTION() on top of that (same two-function combination [validateCheckDefinitions] uses
-     * for CHECK), and [requireNoGeneratedColumnReference] additionally forbids referencing another
-     * GENERATED column - not because it's unsound in general, but because allowing it would need a
-     * dependency-ordered evaluation pass instead of the current single independent pass over every
-     * GENERATED column (see [applyGeneratedColumns]), matching Postgres's own restriction.
-     */
     private fun validateGeneratedDefinitions(columns: List<Column>) {
         val schema = TableSchema("", columns)
         val generatedNames = columns.filter { it.generated != null }.map { it.name.lowercase() }.toSet()
@@ -471,21 +418,12 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             }
             is CastExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
             is CollateExpression -> requireNoGeneratedColumnReference(expression.operand, generatedNames, ownerColumn)
-            // Already rejected earlier in validateGeneratedDefinitions by checkColumns/requireNoSubquery -
-            // kept here only so this `when` stays exhaustive.
             is FunctionExpression, is WindowExpression, is ScalarSubqueryExpression, is ExistsExpression,
             is InSubqueryExpression, is NextValueExpression, is CurrentValueExpression, is MergeActionExpression,
             is ParameterExpression -> Unit
         }
     }
 
-    /**
-     * Recomputes every GENERATED column in [values] from its expression, in place - safe to call
-     * any time after every non-GENERATED column has its final value for this row (explicit
-     * assignment, DEFAULT, or otherwise), because [validateGeneratedDefinitions] guarantees a
-     * GENERATED expression only ever reads a non-GENERATED column of the same row, never another
-     * GENERATED one - so evaluation order among multiple GENERATED columns never matters.
-     */
     private fun applyGeneratedColumns(schema: TableSchema, values: MutableList<Value>) {
         if (schema.columns.none { it.generated != null }) return
         val evaluator = Evaluator(schema, Row(values), subqueryRunner)
@@ -495,20 +433,12 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /** Standard SQL forbids assigning a GENERATED column's value directly - it is always derived, never set. */
     private fun rejectGeneratedAssignment(column: Column, explicitValueGiven: Boolean) {
         if (explicitValueGiven && column.generated != null) {
             throw KestrelException("cannot assign an explicit value to GENERATED column ${column.name}")
         }
     }
 
-    /**
-     * [NextValueExpression] skips the generic "evaluate once to see what type comes back" check
-     * [validateDefaultDefinitions] otherwise uses, because evaluating it for real would mean a bare
-     * `CREATE TABLE` actually consumes a sequence value before a single row exists - instead this
-     * checks the two things that actually matter statically: the sequence is real, and the column it
-     * defaults can hold what NEXTVAL returns.
-     */
     private fun validateNextValueDefault(default: NextValueExpression, column: Column) {
         catalog.sequence(default.sequenceName)
         if (column.type != ColumnType.Integer) {
@@ -516,15 +446,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A DEFAULT must be a constant expression: no column reference (there is no row to read one
-     * from when a value is missing at INSERT time, or none at all yet when backfilling ALTER
-     * TABLE ADD COLUMN), no subquery, and no aggregate. [NextValueExpression] is the one exception -
-     * see [validateNextValueDefault] - because unlike everything else here it names an external,
-     * mutable counter rather than something computable from the expression alone.
-     * [CurrentValueExpression] is rejected outright: CURRVAL only ever means something after a prior
-     * NEXTVAL in the same session, which can never be true yet at CREATE TABLE/ADD COLUMN time.
-     */
     private fun validateConstantDefault(expression: Expression) {
         when (expression) {
             is ColumnExpression -> throw KestrelException("DEFAULT expression cannot reference a column")
@@ -631,12 +552,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return DropTableResult(statement.tableName)
     }
 
-    /**
-     * TRUNCATE never fires a row-level trigger (Postgres/SQLite both only ever fire TRUNCATE-shaped
-     * statement-level triggers this engine has no equivalent of) and never runs a FOREIGN KEY's
-     * `onDelete` action row by row - see [kestrel.catalog.Catalog.truncateTables]'s own doc for why
-     * its RESTRICT/CASCADE handling is structurally different from [ForeignKeyEnforcer.cascadeDelete].
-     */
     private fun executeTruncate(statement: TruncateTableStatement): StatementResult {
         val truncated = catalog.truncateTables(statement.tableNames, statement.mode == DropMode.Cascade, statement.restartIdentity)
         return TruncateTableResult(truncated)
@@ -664,13 +579,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name CHECK (...)` - validated exactly like a CREATE TABLE-time
-     * CHECK ([validateCheckDefinitions]: known columns only, no subquery), PLUS - since this table
-     * may already hold rows a brand new CREATE TABLE never has to worry about - every existing row
-     * is evaluated against it up front, the same per-row logic [enforceChecks] already runs on every
-     * future INSERT/UPDATE.
-     */
     private fun executeAddCheckConstraint(tableName: String, check: CheckConstraint) {
         val schema = catalog.table(tableName).schema
         check.name?.let { requireUniqueConstraintName(schema, it) }
@@ -686,12 +594,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         catalog.addCheckConstraint(tableName, check)
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name UNIQUE (...)` - every existing row is checked for a
-     * duplicate combination of [unique]'s columns before the constraint is installed, the same
-     * [collationFoldedUniquenessKey]-folded, NULL-exempt logic [enforceUniqueConstraints] already
-     * runs on every future INSERT/UPDATE, just run once up front here against rows that already exist.
-     */
     private fun executeAddUniqueConstraint(tableName: String, unique: UniqueConstraint) {
         val schema = catalog.table(tableName).schema
         unique.name?.let { requireUniqueConstraintName(schema, it) }
@@ -716,17 +618,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         catalog.addUniqueConstraint(tableName, unique)
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...` - validated the same way
-     * [validateForeignKeyDefinitions] validates one at CREATE TABLE time (unknown column, referenced
-     * table/column existence, enforced uniqueness of the referenced column group), PLUS every
-     * existing row of [tableName] is checked against it via [ForeignKeyEnforcer.validateRow] before
-     * the constraint is installed - run against a throwaway [TableSchema] carrying [foreignKey]
-     * alongside every FOREIGN KEY [tableName] already has, so a self-referencing FOREIGN KEY
-     * (`referencedTable == tableName`) can find its own sibling rows the same way
-     * [validateForeignKeyDefinitions] does for a genuinely new table, except those "siblings" here
-     * are the table's own already-committed rows rather than an uncommitted INSERT batch.
-     */
     private fun executeAddForeignKeyConstraint(tableName: String, foreignKey: ForeignKeyConstraint) {
         val schema = catalog.table(tableName).schema
         foreignKey.name?.let { requireUniqueConstraintName(schema, it) }
@@ -769,19 +660,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         catalog.addForeignKey(tableName, foreignKey)
     }
 
-    /**
-     * `ALTER TABLE t ALTER COLUMN col TYPE newtype [USING expression]` - deliberately RESTRICT-only
-     * (no CASCADE option, unlike [kestrel.catalog.Catalog.dropColumn]): a column that is part of
-     * the PRIMARY KEY, any FOREIGN KEY (this table's own, or another table's referencing it), a
-     * UNIQUE constraint, or a secondary index is rejected outright rather than threading a type
-     * change through every one of those structures too - drop the dependency first, exactly like
-     * `ALTER TABLE ADD COLUMN` already refuses to declare one of those inline
-     * ([kestrel.sql.parser.Parser.parseAlterAddColumnDefinition]). A GENERATED column is rejected
-     * for a related but distinct reason: its value is always freshly recomputed from its own
-     * expression, never carried over from an OLD value the way [ChangeColumnType.using] (or its
-     * implicit "recompute this column as its own old value" default) assumes - changing its type
-     * means dropping and re-adding it with a new expression instead.
-     */
     private fun executeChangeColumnType(tableName: String, action: ChangeColumnType) {
         val schema = catalog.table(tableName).schema
         val columnIndex = schema.columnIndex(action.columnName)
@@ -848,11 +726,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             schema.checks, schema.uniqueConstraints, schema.compositePrimaryKey, schema.temporary
         )
 
-        // Every row's new value is computed and validated against newSchema BEFORE any of them is
-        // handed to the catalog, so a mid-batch NOT NULL/CHECK failure never leaves the table
-        // schema pointing at the new type while some rows still hold values coerced for the old
-        // one - either every row passes and the whole table is replaced atomically, or none of it
-        // is (see Catalog.changeColumnType's own doc on this contract).
         val using = action.using ?: ColumnExpression(action.columnName)
         val newRows = catalog.table(tableName).rows.map { row ->
             val values = row.values.toMutableList()
@@ -865,7 +738,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         catalog.changeColumnType(tableName, action.columnName, newColumn, newRows)
     }
 
-    /** A constraint name must be unique among every named CHECK/UNIQUE/FOREIGN KEY already on [schema]'s table (case-insensitive) - mirrors Postgres, which keeps one namespace of constraint names per table. */
     private fun requireUniqueConstraintName(schema: TableSchema, name: String) {
         val taken = schema.foreignKeys.any { it.name?.equals(name, ignoreCase = true) == true } ||
             schema.checks.any { it.name?.equals(name, ignoreCase = true) == true } ||
@@ -873,15 +745,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         if (taken) throw KestrelException("constraint '$name' already exists on table ${schema.name}")
     }
 
-    /**
-     * A NOT NULL column added to a table that already has rows must carry a DEFAULT (there is no
-     * value to backfill existing rows with otherwise) - an empty table has no such requirement,
-     * matching the same rule this engine already applies at the row level via [validateNotNull].
-     * GENERATED ALWAYS AS sidesteps that requirement entirely (see [addGeneratedColumnValue]): it
-     * backfills by evaluating the expression fresh against each row's own other columns, so a NOT
-     * NULL GENERATED column can be added to a non-empty table with no DEFAULT at all - it only fails,
-     * per row, if that row's own expression happens to evaluate to NULL.
-     */
     private fun executeAddColumn(tableName: String, column: Column) {
         val table = catalog.table(tableName)
         if (column.generated != null) {
@@ -890,12 +753,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             return
         }
         column.default?.let { validateConstantDefault(it) }
-        // Unlike CREATE TABLE, ADD COLUMN backfills every existing row with ONE already-evaluated
-        // Value (Catalog.addColumn's contract - see its own doc), not a fresh per-row expression
-        // evaluation. A NEXTVAL DEFAULT would therefore hand every pre-existing row the exact same
-        // value instead of a growing sequence, silently defeating the one thing NEXTVAL is for -
-        // rejected outright rather than allowed to produce that surprising result. INSERT's DEFAULT
-        // has no such problem (see buildInsertRow, which evaluates fresh per row).
         if (column.default is NextValueExpression) {
             throw KestrelException(
                 "NEXTVAL cannot be used as an ADD COLUMN DEFAULT - it would give every existing row " +
@@ -911,15 +768,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         catalog.addColumn(tableName, column) { defaultValue }
     }
 
-    /**
-     * Validates a GENERATED ALWAYS AS expression being added via ALTER TABLE ADD COLUMN against the
-     * table's CURRENT [schema] (before the new column exists) - the same rules
-     * [validateGeneratedDefinitions] applies at CREATE TABLE time (no unknown column, no aggregate/
-     * window function, no subquery, no reference to another GENERATED column), just checked one
-     * column at a time against an already-existing schema instead of a freshly-declared column list.
-     * A self-reference is rejected for free: the new column is not part of [schema] yet, so
-     * [checkColumns] already reports it as "no such column".
-     */
     private fun validateAddGeneratedColumn(schema: TableSchema, column: Column) {
         val generated = column.generated!!
         checkColumns(generated, schema)
@@ -928,13 +776,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         requireNoGeneratedColumnReference(generated, generatedNames, column.name)
     }
 
-    /**
-     * Backfills GENERATED ALWAYS AS for one pre-existing [row], evaluated against the table's OLD
-     * [schema] (the new column is not part of it yet, matching what [validateAddGeneratedColumn]
-     * already checked against). Enforces NOT NULL the same way INSERT/UPDATE do post-
-     * [applyGeneratedColumns] via [validateNotNull] - inlined here instead, since there is no
-     * full new-shape row to hand that function until after this value is appended.
-     */
     private fun addGeneratedColumnValue(schema: TableSchema, column: Column, row: Row): Value {
         val value = coerceForColumn(Evaluator(schema, row).evaluate(column.generated!!), column)
         if (column.notNull && value is Value.NullValue) {
@@ -966,19 +807,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return DropViewResult(statement.viewName)
     }
 
-    /**
-     * Body statements are deliberately NOT deep-validated here (no eager check that every column
-     * referenced in a body statement's WHERE/SET/VALUES actually exists) - unlike CREATE VIEW's
-     * eager `selectRunner.explain`, a trigger body can target a different table per statement and
-     * SQLite itself defers exactly this kind of check to the moment the trigger actually fires.
-     * What IS checked eagerly, matching this codebase's usual "catch it before it's the user's
-     * runtime problem" bar for constraint-shaped input: the trigger's own table and every body
-     * statement's target table both exist right now, and the WHEN clause - evaluated directly by
-     * this method rather than through a nested statement executor, so nothing else will ever
-     * validate it - contains no subquery/aggregate and only ever references NEW/OLD columns that
-     * both exist on this table and are actually available for this trigger's event (NEW is not
-     * available on DELETE, OLD is not available on INSERT).
-     */
     private fun executeCreateTrigger(statement: CreateTriggerStatement): StatementResult {
         val schema = catalog.table(statement.tableName).schema
         statement.whenClause?.let { whenClause ->
@@ -1003,7 +831,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /** A trigger body statement's own [runTriggerBody] discards whatever [StatementResult] it returns, so a RETURNING clause there would compute output nobody could ever see - rejected eagerly, matching [validateTriggerRowReferences]'s "structurally without sense" bar. */
     private fun rejectReturning(returning: Projection?) {
         if (returning != null) {
             throw KestrelException("RETURNING is not allowed in a trigger body statement - its result would never be visible to anything")
@@ -1073,13 +900,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return DropTriggerResult(statement.triggerName)
     }
 
-    /**
-     * Resolves the parser's "not written" `null`s into Postgres' own ascending/descending
-     * defaults - MINVALUE 1/MAXVALUE `Long.MAX_VALUE`/START WITH MINVALUE for a positive
-     * INCREMENT BY (1 if not given either), the mirror image for a negative one - then validates
-     * the combination as a whole via [SequenceDefinition]'s own `init` plus the one check it can't
-     * make itself: START WITH must actually fall within [MINVALUE, MAXVALUE].
-     */
     private fun executeCreateSequence(statement: CreateSequenceStatement): StatementResult {
         val incrementBy = statement.incrementBy ?: 1L
         if (incrementBy == 0L) throw KestrelException("sequence '${statement.sequenceName}' INCREMENT BY cannot be zero")
@@ -1104,14 +924,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return DropSequenceResult(statement.sequenceName)
     }
 
-    /**
-     * Unlike [executeCreateSequence], an option left `null`/`false` here means "keep whatever this
-     * sequence already has" rather than "apply a default" - only [AlterSequenceStatement.clearMinValue]/
-     * [AlterSequenceStatement.clearMaxValue] (Postgres' `NO MINVALUE`/`NO MAXVALUE`) recompute a bound
-     * from [SequenceDefinition.incrementBy]'s sign the way a fresh CREATE SEQUENCE would.
-     * [SequenceDefinition.startValue] is never touched by this method (see its own doc) regardless
-     * of what RESTART is asked for.
-     */
     private fun executeAlterSequence(statement: AlterSequenceStatement): StatementResult {
         val existing = catalog.sequence(statement.sequenceName).definition
         val incrementBy = statement.incrementBy ?: existing.incrementBy
@@ -1140,13 +952,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return AlterSequenceResult(statement.sequenceName)
     }
 
-    /**
-     * Fires every trigger registered for ([schema], [timing], [event]) in creation order, once per
-     * (oldRow, newRow) pair in [rows] - INSERT passes `null` for oldRow, DELETE passes `null` for
-     * newRow, UPDATE passes both. A `WHEN` clause that evaluates to false or NULL skips only that
-     * trigger for that row, exactly like a plain WHERE clause would; it never skips other triggers
-     * on the same event, and never affects the firing statement itself.
-     */
     private fun fireRowTriggers(schema: TableSchema, timing: TriggerTiming, event: TriggerEvent, rows: List<Pair<Row?, Row?>>) {
         val triggers = catalog.triggersOn(schema.name, timing, event)
         if (triggers.isEmpty()) return
@@ -1185,13 +990,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Resolves `NEW.col`/`OLD.col` against [trigger] first (when both the qualifier and that side
-     * of the row are present); everything else - including a bare column with no qualifier at
-     * all - falls through to [base] exactly as it would with no trigger in play, so passing
-     * `trigger = null` (or a [TriggerRowContext] that never matches) reproduces today's behavior
-     * without change.
-     */
     private fun composeResolver(base: ColumnResolver?, trigger: TriggerRowContext?): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value =
             if (trigger != null && trigger.matches(expression)) trigger.resolve(expression)
@@ -1202,7 +1000,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             else base?.declaredCollation(expression)
     }
 
-    /** Reproduces the (schema, row) convenience constructor on [Evaluator], as a [ColumnResolver] that [composeResolver] can layer a [TriggerRowContext] on top of. */
     private fun rowResolver(schema: TableSchema, row: Row): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value {
             val index = schema.columnIndex(expression.name)
@@ -1213,17 +1010,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         override fun declaredCollation(expression: ColumnExpression): Collation? = schema.column(expression.name)?.collation
     }
 
-    /**
-     * Evaluates an INSERT/UPDATE/DELETE statement's `RETURNING` clause against the rows it actually
-     * affected. [rows] is always the image RETURNING should see for that statement kind: the freshly
-     * inserted or updated row for INSERT/UPDATE (there is nothing else to show), the pre-deletion row
-     * for DELETE (it no longer exists in the table afterward). Column references resolve against
-     * [schema] alone - never NEW/OLD, since [rejectReturning] already keeps RETURNING out of every
-     * trigger body statement, so this is always the outermost, non-nested call. [checkColumns] runs
-     * over every projected expression up front (not just lazily via [rowResolver] while evaluating
-     * row by row) so a bad column name or a stray aggregate is reported even when zero rows matched -
-     * matching how every other schema-shaped clause in this engine is validated regardless of data.
-     */
     private fun evaluateReturning(schema: TableSchema, rows: List<Row>, projection: Projection): SelectResult {
         val columns = when (projection) {
             is StarProjection -> schema.columns.map { it.name }
@@ -1253,19 +1039,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             else -> "column${index + 1}"
         }
 
-    /**
-     * Without this, a BEFORE trigger's own INSERT/UPDATE/DELETE would survive even when the
-     * statement that fired it goes on to fail its own constraint check (or an AFTER trigger fails
-     * after the row already landed) - a real database treats a whole statement plus everything its
-     * triggers do as one atomic unit, and this reuses the exact snapshot/restore machinery
-     * [executeRollback]/[executeRollbackToSavepoint] already rely on to do the same. Only the
-     * OUTERMOST statement in a trigger cascade takes the snapshot ([triggerContext] is null exactly
-     * there): [catalog.snapshot] captures the WHOLE catalog, not just [tableName], so restoring it
-     * once at the top undoes every table any nested trigger body touched, not only this one - a
-     * nested call skips wrapping itself again, and skips it entirely when [tableName] has no
-     * trigger at all, so the overwhelmingly common trigger-free INSERT/UPDATE/DELETE pays no
-     * snapshot cost.
-     */
     private fun <T> withStatementAtomicity(tableName: String, triggerContext: TriggerRowContext?, block: () -> T): T {
         if (triggerContext != null || !catalog.hasTriggers(tableName)) return block()
         val snapshot = catalog.snapshot()
@@ -1292,13 +1065,7 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         val newRows = statement.rows.map { rawRow -> buildInsertRow(schema, targetIndices, rawRow, evaluator) }
         val onConflict = statement.onConflict
         if (onConflict == null) {
-            // Fires before any constraint is even checked, matching SQLite/Postgres: a BEFORE
-            // trigger can reject the whole statement (by having its body throw) before this
-            // engine's own NOT NULL/CHECK/FOREIGN KEY/UNIQUE validation ever runs.
             fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Insert, newRows.map { null to it })
-            // Validated as a whole batch (not inline while building newRows above) so that a
-            // self-referencing FK can see sibling rows from the same multi-row INSERT regardless
-            // of their order, exactly like enforcePrimaryKeyUniqueness below already does.
             for (row in newRows) {
                 ForeignKeyEnforcer.validateRow(catalog, schema, row.values, uncommittedSiblings = newRows)
                 enforceChecks(schema, row)
@@ -1330,18 +1097,12 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         val touched = BooleanArray(schema.columns.size)
         for ((position, expression) in rawRow.withIndex()) {
             val columnIndex = targetIndices[position]
-            // A literal DEFAULT in the VALUES list is left untouched here, exactly like a
-            // column missing from an explicit INSERT column list - both fall through to the
-            // same default-filling loop below, matching UPDATE ... SET col = DEFAULT semantics.
             if (expression != null) {
                 rejectGeneratedAssignment(schema.columns[columnIndex], explicitValueGiven = true)
                 values[columnIndex] = coerceForColumn(evaluator.evaluate(expression), schema.columns[columnIndex])
                 touched[columnIndex] = true
             }
         }
-        // A column omitted from an explicit INSERT column list falls back to its DEFAULT
-        // (evaluated fresh per row); one that was supplied - even an explicit NULL - never
-        // does, matching standard SQL DEFAULT semantics.
         for ((index, column) in schema.columns.withIndex()) {
             val default = column.default
             if (!touched[index] && default != null) {
@@ -1372,7 +1133,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return keys
     }
 
-    /** Empty [targetColumns] (bare `ON CONFLICT DO ...`) matches against any of [keys]. */
     private fun resolveConflictTargetKeys(schema: TableSchema, targetColumns: List<String>, keys: List<UniqueKey>): List<UniqueKey> {
         if (targetColumns.isEmpty()) return keys
         val targetIndices = targetColumns.map { name ->
@@ -1387,7 +1147,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return listOf(matched)
     }
 
-    /** NULLs never collide with each other (standard SQL), mirroring enforceUniqueConstraints/enforceUniqueIndexes above. */
     private fun findConflictingRow(existingRows: List<Row>, candidate: List<Value>, keys: List<UniqueKey>): Row? {
         for (existing in existingRows) {
             for (key in keys) {
@@ -1400,21 +1159,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return null
     }
 
-    /**
-     * Processes each candidate row as its own micro-insert against the table's CURRENT state
-     * (rather than batch-validating the whole VALUES list like the no-conflict path above), so
-     * a later row in the same multi-row INSERT correctly sees an earlier row's insert or update -
-     * exactly how Postgres/SQLite define ON CONFLICT for multi-row VALUES. A row landing with no
-     * conflict fires an INSERT trigger pair, exactly like the no-conflict path in [executeInsertInner];
-     * a row resolved by DO UPDATE fires an UPDATE trigger pair instead, matching that the row's own
-     * data ends up changed by an UPDATE rather than a fresh INSERT (mirroring Postgres: the proposed
-     * row that lost the race is folded into an update of the pre-existing one). DO NOTHING fires no
-     * trigger at all, since nothing about the table actually changed for that row. When [schema] has
-     * at least one trigger, [catalog.reindexTable] runs right after each row's own mutation - before
-     * that row's AFTER trigger, rather than once for the whole statement like the batch paths do - so a
-     * trigger body's own query against this table never observes a stale index for a row this very
-     * statement already landed; a trigger-free table keeps the original single-reindex-at-the-end cost.
-     */
     private fun executeInsertWithConflictHandling(
         schema: TableSchema,
         table: Table,
@@ -1425,15 +1169,8 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
     ): StatementResult {
         val keys = uniqueKeysOf(schema)
         val targetKeys = resolveConflictTargetKeys(schema, onConflict.targetColumns, keys)
-        // Reindexing per row (rather than once for the whole statement like the batch INSERT/UPDATE
-        // paths) is only needed so a trigger body's own query against this table never sees a stale
-        // index for a row this very statement already landed - skipped entirely, preserving the
-        // original single-reindex-at-the-end cost, when this table has no trigger to fire at all.
         val hasTriggers = catalog.hasTriggers(schema.name)
         var affected = 0
-        // DO NOTHING contributes no row (nothing about the table changed for it); a DO UPDATE row
-        // whose WHERE guard fails `continue`s before ever reaching the append below, same as DO
-        // NOTHING - both are absent from RETURNING exactly like Postgres.
         val returnedRows = mutableListOf<Row>()
         for (row in candidateRows) {
             val conflicting = findConflictingRow(table.rows, row.values, targetKeys)
@@ -1455,9 +1192,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
                 ConflictDoNothing -> Unit
                 is ConflictDoUpdate -> {
                     val resolver = composeResolver(excludedAwareResolver(schema, conflicting, row), triggerContext)
-                    // NEXTVAL/CURRVAL are deliberately usable in the assignment values below but not
-                    // in this WHERE-shaped guard - same "not in WHERE" rule as everywhere else, kept
-                    // airtight here by using a second Evaluator instance rather than one shared one.
                     val conditionEvaluator = Evaluator(resolver, subqueryRunner)
                     if (action.where != null && !isTrue(conditionEvaluator.evaluate(action.where))) continue
                     val assignmentEvaluator = Evaluator(resolver, subqueryRunner, this)
@@ -1476,9 +1210,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
                     applyGeneratedColumns(schema, values)
                     validateNotNull(schema, values)
                     val updated = Row(values)
-                    // Fires before any constraint below is checked, same as executeUpdate's own BEFORE
-                    // trigger - a BEFORE UPDATE trigger's body can reject this row's update before this
-                    // engine's own validation ever runs.
                     fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, listOf(conflicting to updated))
                     ForeignKeyEnforcer.validateRow(catalog, schema, updated.values, uncommittedSiblings = emptyList())
                     enforceChecks(schema, updated)
@@ -1486,9 +1217,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
                     enforcePrimaryKeyUniqueness(schema, others + updated)
                     enforceUniqueConstraints(schema, others + updated)
                     enforceUniqueIndexes(schema, others + updated)
-                    // Same as executeUpdate: any table with a FK pointing at one of this table's
-                    // enforced-unique key groups needs a cascade/RESTRICT pass when that group's
-                    // value actually changes, not just the PRIMARY KEY.
                     for (group in schema.enforcedUniqueKeyGroups()) {
                         val columnIndices = group.map { schema.columnIndex(it)!! }
                         val oldKey = columnIndices.map { conflicting.values[it] }
@@ -1508,11 +1236,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return InsertResult(affected, returning?.let { evaluateReturning(schema, returnedRows, it) })
     }
 
-    /**
-     * Bare column names resolve against [target] (the existing conflicting row, matching plain
-     * UPDATE semantics), while `EXCLUDED.column` resolves against [excluded] (the row proposed by
-     * this INSERT that failed to land) - the same pseudo-table Postgres exposes in DO UPDATE.
-     */
     private fun excludedAwareResolver(schema: TableSchema, target: Row, excluded: Row): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value {
             val qualifier = expression.qualifier
@@ -1576,18 +1299,12 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
 
         var updated = 0
         val oldRows = table.rows.toList()
-        // Every row actually matched by WHERE, paired old-to-new - fires an UPDATE trigger for
-        // every row WHERE selects, regardless of whether any assigned value actually differs from
-        // what was already there (matching standard SQL: WHERE selects the affected rows, not the
-        // changed ones).
         val touchedRows = mutableListOf<Pair<Row, Row>>()
         val newRows = oldRows.map { row ->
             val matches = statement.where == null ||
                 isTrue(Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueryRunner).evaluate(statement.where))
             if (!matches) return@map row
             val values = row.values.toMutableList()
-            // NEXTVAL/CURRVAL are allowed in SET's assignment values (below), not in WHERE (above) -
-            // a separate Evaluator per clause, same reasoning as executeInsertWithConflictHandling.
             val evaluator = Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueryRunner, this)
             for ((index, expression) in assignments) {
                 val column = schema.columns[index]
@@ -1604,12 +1321,7 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             touchedRows.add(row to newRow)
             newRow
         }
-        // Fires before any constraint below is checked, same as executeInsert's BEFORE trigger -
-        // a BEFORE UPDATE trigger's body can reject the whole statement before this engine's own
-        // validation ever runs.
         fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, touchedRows)
-        // Same whole-batch validation as executeInsert: a self-referencing FK must see every row's
-        // final value for this statement, not just rows already committed to the table.
         for (row in newRows) {
             ForeignKeyEnforcer.validateRow(catalog, schema, row.values, uncommittedSiblings = newRows)
             enforceChecks(schema, row)
@@ -1617,9 +1329,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         enforcePrimaryKeyUniqueness(schema, newRows)
         enforceUniqueConstraints(schema, newRows)
         enforceUniqueIndexes(schema, newRows)
-        // Every enforced-unique key group (the PRIMARY KEY, single-column or composite, plus each
-        // UNIQUE constraint) is a valid FOREIGN KEY target, so each group needs its own
-        // cascade/RESTRICT pass on UPDATE - not just the PRIMARY KEY.
         for (group in schema.enforcedUniqueKeyGroups()) {
             val columnIndices = group.map { schema.columnIndex(it)!! }
             val changedPairs = oldRows.indices.map { i ->
@@ -1638,32 +1347,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
     private fun executeMerge(statement: MergeStatement): StatementResult =
         withStatementAtomicity(statement.targetTable, null) { executeMergeInner(statement) }
 
-    /**
-     * The `ON` join is matched against [originalTargetRows] - a snapshot of the target table taken
-     * once before any mutation - not the live, mutating `table.rows`: this is what makes "a target
-     * row matched by two different source rows" a well-defined, detectable condition at all (see
-     * below), and matches how a real MERGE's source/target join reads one consistent view of the
-     * target rather than re-joining against its own in-flight writes. A row this MERGE inserts is
-     * therefore never itself matched by a later source row (it never enters the snapshot), and a
-     * row this MERGE updates/deletes keeps its ORIGINAL identity for join purposes even after the
-     * live table's copy of it changes underneath - [applyMergeUpdate]/[applyMergeDelete] are handed
-     * that same original [Row] object and use `===` against it to find their spot in the live table.
-     *
-     * For each source row, every target row (from the snapshot) satisfying [MergeStatement.onCondition]
-     * is a MATCHED pair: the first [MergeMatchedUpdate]/[MergeMatchedDelete] clause (in
-     * [MergeStatement.whenClauses] written order - MATCHED and NOT MATCHED clauses can be
-     * interleaved, but a given pair only ever considers its own category) whose own `AND` condition
-     * also holds runs; if none holds, that pair is left untouched, matching Postgres. A target row
-     * already affected earlier in this same statement by a different matched pair throws rather than
-     * silently applying a second action - the same "MERGE command cannot affect a row a second time"
-     * guarantee Postgres gives, needed here because this engine has no snapshot isolation to make
-     * that outcome well-defined otherwise. A source row matched by zero target rows is NOT MATCHED:
-     * the first [MergeNotMatchedInsert] whose own condition holds (evaluated against the source row
-     * alone - there is no target row to reference) inserts one new row; [checkColumns]-equivalent
-     * validation for every clause happens up front via [checkMergeColumns], even when zero source
-     * rows exist, matching this engine's usual eager-validation bar for every other schema-shaped
-     * clause.
-     */
     private fun executeMergeInner(statement: MergeStatement): StatementResult {
         val table = catalog.table(statement.targetTable)
         val schema = table.schema
@@ -1729,18 +1412,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return MergeResult(inserted, updated, deleted, returning)
     }
 
-    /**
-     * Evaluates a MERGE statement's RETURNING clause against every row an action of this MERGE
-     * actually touched - the post-image for an inserted/updated row, the pre-deletion image for a
-     * deleted one (same "nothing else to show" reasoning as [evaluateReturning]) - in the exact order
-     * [executeMergeInner] applied those actions in (source-row order, and within a single source row's
-     * multiple matched target rows, the order [executeMergeInner]'s own inner loop visits them).
-     * [actionedRow]'s second element is `"INSERT"`/`"UPDATE"`/`"DELETE"`, bound to that row's
-     * [Evaluator] as [MergeActionExpression]'s value so `MERGE_ACTION()` can appear in the projection -
-     * the one context where it is actually legal. Column references resolve against [schema] (the
-     * MERGE's target table) alone, same as [evaluateReturning] - RETURNING never sees the source row,
-     * only what ended up true of the target.
-     */
     private fun evaluateMergeReturning(schema: TableSchema, actionedRows: List<Pair<Row, String>>, projection: Projection): SelectResult {
         val columns = when (projection) {
             is StarProjection -> schema.columns.map { it.name }
@@ -1805,7 +1476,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return updatedRow
     }
 
-    /** Returns [targetRow] itself - the pre-deletion image, matching plain DELETE's own RETURNING (see [evaluateReturning]'s doc). */
     private fun applyMergeDelete(schema: TableSchema, table: Table, targetRow: Row, hasTriggers: Boolean): Row {
         fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Delete, listOf(targetRow to null))
         ForeignKeyEnforcer.cascadeDelete(catalog, schema.name, listOf(targetRow))
@@ -1837,12 +1507,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         return row
     }
 
-    /**
-     * Resolves a MERGE `ON`/`WHEN MATCHED` column reference against whichever of [targetRow]/
-     * [sourceRow] its qualifier names ([targetLabel]/[sourceLabel] - alias if given, bare name
-     * otherwise); an unqualified reference must exist on exactly one side, matching standard SQL's
-     * "ambiguous column" rule for a two-relation scope.
-     */
     private fun mergeResolver(
         targetSchema: TableSchema,
         targetLabel: String,
@@ -1889,7 +1553,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /** A `WHEN NOT MATCHED` clause has no target row to read - a qualifier naming the target throws rather than silently resolving to nothing. */
     private fun notMatchedResolver(
         sourceSchema: TableSchema,
         sourceLabel: String,
@@ -1911,7 +1574,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         override fun declaredCollation(expression: ColumnExpression): Collation? = sourceSchema.column(expression.name)?.collation
     }
 
-    /** Upfront validation for every clause of a MERGE statement, run even when the source produces zero rows - matching [evaluateReturning]'s own reasoning for why RETURNING is checked before knowing how many rows will actually match. */
     private fun checkMergeColumns(
         statement: MergeStatement,
         targetSchema: TableSchema,
@@ -1991,14 +1653,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             is InSubqueryExpression -> recurse(expression.operand)
             is CastExpression -> recurse(expression.operand)
             is CollateExpression -> recurse(expression.operand)
-            // Structurally harmless here too (no column reference to check) - none of ON/WHEN's
-            // AND-condition/assignments/INSERT values are where MERGE_ACTION() is ever legal (only
-            // this statement's own RETURNING is, see evaluateMergeReturning), and it is never handed
-            // a bound action there, so evaluation itself throws - same division of labor as
-            // checkColumns's own NEXTVAL/CURRVAL branch. A parameter reference IS legitimately allowed
-            // here (MERGE is one of PreparableStatement's own kinds) - by the time this runs it has
-            // already been substituted for a literal by resolveExecute, so this branch only ever sees
-            // one directly typed outside PREPARE, which is just as harmless structurally.
             is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
         }
     }
@@ -2081,10 +1735,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A row where any constrained column is NULL is exempt (standard SQL: NULLs never collide
-     * with each other), so such rows are simply skipped rather than added to [seen].
-     */
     private fun enforceUniqueConstraints(schema: TableSchema, rows: List<Row>) {
         for (unique in schema.uniqueConstraints) {
             val columnIndices = unique.columns.map { schema.columnIndex(it)!! }
@@ -2101,21 +1751,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A `CREATE UNIQUE INDEX` is a way to attach a uniqueness guarantee to a table AFTER it
-     * already exists (the engine has no ALTER TABLE), so it is checked the same way as a
-     * declarative UNIQUE constraint - against the whole candidate row set, before any row is
-     * written - rather than relying on `SortedIndex.add` to reject a duplicate during the
-     * post-write `catalog.reindexTable` rebuild, which would leave the table already mutated.
-     * This key is folded through [collationFoldedUniquenessKey] for the same reason
-     * [enforcePrimaryKeyUniqueness]/[enforceUniqueConstraints] are: since `SortedIndex`'s own
-     * comparator is *also* collation-aware (see [kestrel.catalog.IndexKeyOrdering]), skipping the
-     * fold here would not merely miss the duplicate - `table.rows.addAll`/`.add` would already have
-     * run by the time `reindexTable` calls `SortedIndex.add` and throws on the same duplicate, and
-     * for a trigger-free table [withStatementAtomicity] takes no snapshot, so that later throw would
-     * leave the just-inserted duplicate permanently stuck in `table.rows`, indexed nowhere - a real,
-     * reproduced-during-development corruption mode, not a hypothetical one.
-     */
     private fun enforceUniqueIndexes(schema: TableSchema, rows: List<Row>) {
         for (definition in catalog.indexDefinitions()) {
             if (!definition.unique || !definition.tableName.equals(schema.name, ignoreCase = true)) continue
@@ -2132,12 +1767,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
         }
     }
 
-    /**
-     * `triggerContext` lets a `NEW.col`/`OLD.col` reference inside a trigger body statement pass
-     * validation against the trigger's OWN table (via [TriggerRowContext.checkColumnExists])
-     * instead of being checked - wrongly - against [schema], the body statement's own target
-     * table, which is often a different table entirely.
-     */
     private fun checkColumns(expression: Expression, schema: TableSchema, triggerContext: TriggerRowContext? = null) {
         when (expression) {
             is ColumnExpression -> if (triggerContext != null && triggerContext.matches(expression)) {
@@ -2181,17 +1810,6 @@ class Executor(private val catalog: Catalog) : SequenceAccess {
             is InSubqueryExpression -> checkColumns(expression.operand, schema, triggerContext)
             is CastExpression -> checkColumns(expression.operand, schema, triggerContext)
             is CollateExpression -> checkColumns(expression.operand, schema, triggerContext)
-            // Structurally harmless either way (no column reference to check) - whether NEXTVAL/
-            // CURRVAL is actually legal at this particular call site (SET assignments: yes; WHERE:
-            // no, see Evaluator's SequenceAccess doc) is enforced by whether the Evaluator this
-            // feeds into was actually given a SequenceAccess, not by this column-existence pass.
-            // MERGE_ACTION() is the same story: this generic checkColumns also backs plain INSERT/
-            // UPDATE/DELETE's own RETURNING (evaluateReturning), where it is never legal - but that is
-            // enforced by evaluateReturning's Evaluator never being handed a mergeAction, exactly like
-            // evaluateMergeReturning is the one call site that does. A parameter reference is
-            // legitimately allowed anywhere this generic pass runs (INSERT/UPDATE/DELETE/SELECT are
-            // all PreparableStatement kinds) - already substituted for a literal by the time a real
-            // EXECUTE reaches here.
             is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
         }
     }

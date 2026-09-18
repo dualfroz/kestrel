@@ -15,7 +15,6 @@ sealed class PrimaryAccess {
     class IndexScan(val indexName: String, val description: String, val rowIndices: List<Int>) : PrimaryAccess()
 }
 
-/** An [IndexScan] candidate together with how many of the index's columns it actually pinned down, used to pick the most selective option among several usable indexes. */
 private class ScoredScan(val boundColumns: Int, val scan: PrimaryAccess.IndexScan)
 
 class IndexAccessPlanner(private val catalog: Catalog) {
@@ -33,16 +32,6 @@ class IndexAccessPlanner(private val catalog: Catalog) {
             ?: PrimaryAccess.FullScan
     }
 
-    /**
-     * Tries to serve [byColumn] from a single [index], preferring (in order): an exact match
-     * that binds every column of the index by equality; a range scan (<, <=, >, >=) on the
-     * column right after the longest leading equality run (works even with an empty run, i.e.
-     * a plain range on the index's very first column); or a pure equality prefix scan that
-     * binds a leading run of columns with the rest left entirely free. A composite index whose
-     * leading columns aren't bound at all (e.g. only its second column appears in the WHERE
-     * clause) is skipped - it cannot narrow the scan, since the index is sorted by its first
-     * column first.
-     */
     private fun planIndex(index: SortedIndex, byColumn: Map<String, List<Pair<BinaryOperator, Value>>>): ScoredScan? {
         val definition = index.definition
         val columns = definition.columnNames
@@ -64,7 +53,6 @@ class IndexAccessPlanner(private val catalog: Catalog) {
             if (scan != null) return scan
         }
         if (equalityValues.isEmpty()) return null
-        // A pure equality prefix: every bound column matched by "=", nothing further constrained.
         val candidates = index.rangeOf(equalityValues, true, equalityValues, true).sorted()
         return ScoredScan(equalityValues.size, PrimaryAccess.IndexScan(definition.name, descriptionParts.joinToString(" AND "), candidates))
     }

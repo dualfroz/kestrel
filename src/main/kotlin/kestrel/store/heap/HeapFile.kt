@@ -6,15 +6,6 @@ import kestrel.store.page.PageStore
 
 class HeapFileException(message: String) : KestrelException(message)
 
-/**
- * A heap-organized collection of variable-length records spanning a singly
- * linked chain of [HeapPage]s. The chain head lives in a dedicated header
- * page whose id ([headerPageId]) callers persist to reopen the same heap
- * later, mirroring how [kestrel.store.btree.BPlusTree] exposes its root page
- * id. Insert walks the chain looking for a page with enough free space,
- * newest first, before allocating and linking a fresh page; this reuses
- * space freed by deletes ahead of growing the file.
- */
 class HeapFile private constructor(private val bufferPool: PageStore, val headerPageId: Long) {
     companion object {
         fun create(bufferPool: PageStore): HeapFile {
@@ -82,14 +73,6 @@ class HeapFile private constructor(private val bufferPool: PageStore, val header
         bufferPool.unpinPage(rid.pageId, true)
     }
 
-    /**
-     * Replaces the record at [rid]. When [bytes] fits within the slot's
-     * current capacity it is overwritten in place and [rid] is returned
-     * unchanged; otherwise the old slot is deleted and the record is
-     * re-inserted, possibly moving to a different page, and the new
-     * [RecordId] is returned. Callers that index this heap must update any
-     * stored [RecordId] with the return value.
-     */
     fun update(rid: RecordId, bytes: ByteArray): RecordId {
         val page = bufferPool.fetchPage(rid.pageId)
         val capacity = HeapPage.lengthOf(page, rid.slotId)
@@ -103,7 +86,6 @@ class HeapFile private constructor(private val bufferPool: PageStore, val header
         return insert(bytes)
     }
 
-    /** Every page belonging to this heap: [headerPageId] plus every page in the data-page chain. */
     fun allPageIds(): List<Long> {
         val ids = mutableListOf(headerPageId)
         val header = bufferPool.fetchPage(headerPageId)
@@ -119,7 +101,6 @@ class HeapFile private constructor(private val bufferPool: PageStore, val header
         return ids
     }
 
-    /** Iterates every live record in page-chain order. Deleted slots are skipped. */
     fun scan(): Sequence<Pair<RecordId, ByteArray>> = sequence {
         val header = bufferPool.fetchPage(headerPageId)
         var pageId = readFirstDataPage(header)

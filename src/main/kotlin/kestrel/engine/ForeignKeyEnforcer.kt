@@ -8,30 +8,8 @@ import kestrel.storage.Row
 import kestrel.storage.Table
 import kestrel.storage.Value
 
-/**
- * Runtime enforcement for FOREIGN KEY constraints: existence checks on INSERT/UPDATE of the
- * referencing (child) table, and ON DELETE/ON UPDATE actions on the referenced (parent) table.
- * `referencedColumns` is always a column group with an enforced uniqueness guarantee in the
- * parent (its PRIMARY KEY, single-column or composite, or a UNIQUE constraint), so cascades track
- * a whole key tuple (`List<Value>`, one entry per column, positionally paired with `columns`) at
- * a time rather than a single value - this is what lets a single-column FK and a multi-column FK
- * share every code path below unchanged.
- *
- * Cascades are computed as a plan first and only mutate afterwards (see [CascadeStep]) so that a
- * RESTRICT violation discovered in one child table can never leave an earlier, unrelated child
- * table half-cascaded - either the whole cascade applies, or nothing does.
- */
 object ForeignKeyEnforcer {
 
-    /**
-     * [uncommittedSiblings] covers a self-referencing FK (`referencedTable == schema.name`, e.g. an
-     * employee/manager hierarchy) inside a multi-row INSERT/UPDATE statement: those sibling rows
-     * are being validated as part of the very same statement and aren't in the catalog's table yet,
-     * so without this a later row couldn't reference an earlier row from the same batch.
-     *
-     * Follows MATCH SIMPLE (the SQL default): if *any* column of the FK is NULL in this row, the
-     * whole constraint is skipped for that row - not just the null column.
-     */
     fun validateRow(
         catalog: Catalog,
         schema: TableSchema,
@@ -70,12 +48,6 @@ object ForeignKeyEnforcer {
         applySteps(catalog, planDelete(catalog, parentTableName, deletedRows))
     }
 
-    /**
-     * [referencedColumns] is the full column group whose values changed together (a PRIMARY KEY or
-     * UNIQUE key group) and [changedPairs] holds the old/new key tuple for every row of the parent
-     * table, positionally aligned with [referencedColumns] - a matching FK may declare its own
-     * `referencedColumns` in a different order, so [planUpdate] re-projects each tuple by name.
-     */
     fun cascadeUpdate(
         catalog: Catalog,
         parentTableName: String,
@@ -129,8 +101,6 @@ object ForeignKeyEnforcer {
             for (fk in child.schema.foreignKeys) {
                 if (!fk.referencedTable.equals(parentTableName, ignoreCase = true)) continue
                 if (fk.referencedColumns.size != referencedColumns.size) continue
-                // Re-project the tuple by name: this FK's referencedColumns may list the same key
-                // group in a different order than the one changedPairs was built from.
                 val positions = fk.referencedColumns.map { refCol ->
                     referencedColumns.indexOfFirst { it.equals(refCol, ignoreCase = true) }
                 }

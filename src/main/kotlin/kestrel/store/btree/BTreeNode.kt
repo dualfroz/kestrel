@@ -15,7 +15,6 @@ sealed class BTreeNode {
         var nextLeaf: Long
     ) : BTreeNode()
 
-    /** `children.size` is always `keys.size + 1`: `children[0]` holds keys below `keys[0]`. */
     class Internal(
         override val pageId: Long,
         val keys: MutableList<ByteArray>,
@@ -23,7 +22,6 @@ sealed class BTreeNode {
     ) : BTreeNode()
 }
 
-/** Serializes [BTreeNode]s onto/from a fixed-size [Page]. */
 object NodeCodec {
     private const val TYPE_LEAF = 0
     private const val TYPE_INTERNAL = 1

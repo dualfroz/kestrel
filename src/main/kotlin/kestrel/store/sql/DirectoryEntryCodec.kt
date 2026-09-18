@@ -16,23 +16,6 @@ import kestrel.store.codec.CodecException
 import kestrel.storage.Collation
 import kestrel.storage.ColumnType
 
-/**
- * Encodes a [TableDirectoryEntry] as a self-contained byte payload so it can
- * live as a single row in [DiskCatalog]'s directory heap. Unlike
- * [kestrel.store.codec.TupleCodec] this is not a generic row format: it is
- * shaped exactly around the fields a directory entry has, including nested
- * column and index-definition lists. A column's [Column.default] and
- * [Column.generated] are each stored as rendered SQL text and re-parsed through
- * a throwaway `SELECT (<expr>) FROM ...` (via the same [writeDefault]/[readDefault]
- * helpers - the wire shape is identical, an optional expression rendered as text)
- * the same way [DiskCatalog.parseCheckExpressionText] resolves a
- * [CheckConstraintEntry] - the alternative, a bespoke binary codec for
- * [Expression], would have to mirror the whole AST hierarchy for what is
- * always a constant-only (DEFAULT) or own-table-column-only (GENERATED)
- * expression in practice. [Column.collation] itself needs no such trick - a plain byte, its
- * [kestrel.storage.Collation] enum ordinal - since it is never anything but one of the three
- * built-in sequences.
- */
 object DirectoryEntryCodec {
     private const val NO_PAGE = -1L
     private const val NO_PRECISION = -1L

@@ -5,12 +5,6 @@ import java.math.BigDecimal
 object ValueOrdering : Comparator<Value> {
     override fun compare(left: Value, right: Value): Int = compare(left, right, Collation.Binary)
 
-    /**
-     * Same ordering as the plain two-argument [compare], except two [Value.TextValue]s are
-     * compared through [collation] instead of always using [String.compareTo] - see
-     * [kestrel.engine.compareOrderKeyValues], the only caller that ever passes a non-[Collation.Binary]
-     * value (an explicit `ORDER BY ... COLLATE name`).
-     */
     fun compare(left: Value, right: Value, collation: Collation): Int = when {
         left is Value.NullValue && right is Value.NullValue -> 0
         left is Value.NullValue -> -1
@@ -32,7 +26,6 @@ object ValueOrdering : Comparator<Value> {
         else -> 0.0
     }
 
-    /** Falls back to [rank] ordering (never throws) when one side isn't itself numeric. */
     private fun compareAsDecimal(left: Value, right: Value): Int {
         val a = asBigDecimalOrNull(left) ?: return rank(left).compareTo(rank(right))
         val b = asBigDecimalOrNull(right) ?: return rank(left).compareTo(rank(right))

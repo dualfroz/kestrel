@@ -155,142 +155,13 @@ import kestrel.storage.typeName
 
 class DiskExecutorException(message: String) : KestrelException(message)
 
-/**
- * Executes a deliberately narrow subset of the SQL AST directly against
- * [DiskCatalog]/[DiskTable]: CREATE/DROP TABLE, INSERT, SELECT (WHERE/ORDER
- * BY/LIMIT/GROUP BY/HAVING/aggregates, window functions (ROW_NUMBER/RANK/
- * DENSE_RANK/aggregate/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE OVER
- * PARTITION BY/ORDER BY, including an explicit ROWS/RANGE/GROUPS frame with
- * EXCLUDE), INNER/LEFT/RIGHT/FULL/CROSS JOIN across any number of table, derived-table
- * (`FROM (SELECT ...) AS alias`) or LATERAL derived-table sources,
- * scalar/EXISTS/IN subqueries anywhere an expression is allowed - including
- * correlated to an outer row - UNION/UNION ALL/INTERSECT/INTERSECT ALL/
- * EXCEPT/EXCEPT ALL and WITH/WITH RECURSIVE (CTE, fixed-point with an
- * iteration limit)), UPDATE and DELETE, each top-level statement running inside its own disk
- * transaction (commit on success, abort on any exception so a failure never
- * leaves a partially applied statement); a subquery or nested query (set
- * operation branch, CTE definition) runs inside the same transaction as the
- * statement that contains it rather than opening one of its own.
- *
- * This is additive, not a replacement for [kestrel.engine.Executor]: it
- * reuses the same AST ([kestrel.sql.ast]), the same [Evaluator] and its
- * [SubqueryRunner] hook, the same [GroupAggregation]/[AggregateFunctions]
- * (both operate purely on `List<Value>` rows, so they need no disk-specific
- * counterpart), the same [StatementResult] types and the same
- * [Column]/[TableSchema] the in-memory engine already uses (both
- * [DiskCatalog] and [DiskTable] were built against those exact types for
- * this reason), so no translation layer sits between the parser and this
- * executor - a query that resolves against the disk backend evaluates
- * expressions with exactly the same semantics as the in-memory one. Window
- * function evaluation itself (frame resolution, peer groups, RANGE distance
- * search) is deliberately duplicated from [kestrel.engine.SelectRunner]
- * rather than shared, for the same free-standing-isolation reason as every
- * other validation this executor duplicates (see [validateUniqueDefinitions]).
- * `CREATE [OR REPLACE] VIEW`/`DROP VIEW [CASCADE]` are supported (materialized fresh on every
- * reference - as a plain FROM/JOIN source, inside a CTE body, or on either side of a set operation,
- * since all three already resolve a name through the same [resolveFromSource] - view-over-view,
- * recursive-definition and RESTRICT/CASCADE dependent-view detection, mirroring
- * [kestrel.engine.Executor]/[kestrel.catalog.Catalog]'s own view handling; see
- * [DiskCatalog.createView]/[DiskCatalog.dropView]). A derived table (`FROM (SELECT ...) AS alias`,
- * see [resolveFromItem]) runs eagerly, once, since it cannot correlate to anything; a LATERAL derived
- * table (`JOIN LATERAL (SELECT ...) AS alias ON ...`) is instead re-run once per row already
- * accumulated from earlier FROM/JOIN sources, correlated to that row exactly like a WHERE-clause
- * correlated subquery (see [executeLateralJoin]) - mirroring [kestrel.engine.SelectRunner]'s own
- * handling of both.
- * Table-level composite PRIMARY KEY, UNIQUE (inline/table-level `UNIQUE`
- * constraints, any number of columns), `CREATE [UNIQUE] INDEX`
- * (single-column or composite), column-level/table-level CHECK constraints (validated column
- * references/no subquery-aggregate-window at CREATE TABLE time via [validateCheckDefinitions],
- * enforced on every INSERT/UPDATE via [enforceChecks], persisted as rendered expression text - see
- * [CheckConstraintEntry]), and column-level/table-level FOREIGN KEY constraints - including
- * composite keys, self-reference, and `ON DELETE`/`ON UPDATE` `CASCADE`/`SET NULL`/`RESTRICT` (default
- * `NO ACTION` behaves like `RESTRICT`), enforced via [DiskForeignKeyEnforcer] and blocking `DROP
- * TABLE` (RESTRICT by default, `CASCADE` strips the constraint from every referencing table without
- * dropping it - see [DiskCatalog.dropTable]) - are supported, mirroring
- * [kestrel.engine.Executor]'s own handling of them. `ALTER TABLE ... ADD/DROP/RENAME COLUMN/RENAME
- * TO` (see [executeAlterTable]/[DiskCatalog.addColumn]/[DiskCatalog.dropColumn]/
- * [DiskCatalog.renameColumn]/[DiskCatalog.renameTable]) is supported with the same RESTRICT/CASCADE
- * and FOREIGN KEY/UNIQUE/CHECK/index propagation rules as [kestrel.engine.Executor]/
- * [kestrel.catalog.Catalog]. `ALTER TABLE ... ADD CONSTRAINT name CHECK/UNIQUE/FOREIGN KEY` and
- * `DROP CONSTRAINT name` (see [executeAddConstraint]/[DiskCatalog.dropConstraint]) validate every
- * existing row before installing a new constraint (via a probe transaction, mirroring
- * [executeAddColumn]'s own `probeTxn`) and give a UNIQUE constraint the same RESTRICT/CASCADE
- * treatment against a dependent FOREIGN KEY that [DiskCatalog.dropTable] already gives a whole table,
- * and so is `DROP TABLE ... CASCADE` itself (see [executeDropTable]),
- * which additionally drops every transitively dependent view - no DDL mode remains unsupported.
- * `BEGIN`/`COMMIT`/`ROLLBACK` (see [executeBegin]/[executeCommit]/
- * [executeRollback]) group any number of INSERT/SELECT/UPDATE/DELETE statements into one disk
- * transaction with one commit/abort boundary, backed directly by the storage engine's own WAL/2PL
- * transaction rather than a copy of [kestrel.engine.Executor]'s whole-catalog snapshot/restore -
- * DDL is deliberately rejected while a transaction is open (see [isDdl] in [execute]) because there
- * is no equivalent way to undo a [DiskCatalog] schema change by aborting a storage-engine
- * transaction. `CREATE`/`DROP`/`ALTER SEQUENCE` and `NEXTVAL`/`CURRVAL` (see [executeCreateSequence]/
- * [executeDropSequence]/[executeAlterSequence]/[nextValue]/[currentValue]) are supported with the
- * same Postgres-mirroring semantics as [kestrel.engine.Executor] - NEXTVAL alone survives a ROLLBACK
- * that undoes everything else the rolled-back statement did (see [DiskCatalog.nextValue]), CURRVAL is
- * scoped to this [DiskExecutor] instance the same way it is scoped to one [kestrel.engine.Executor],
- * and both are restricted to exactly the same three positions (INSERT VALUES/DEFAULT, UPDATE SET/
- * DEFAULT) for the same volatile-function reason - CHECK constraints and `WHERE` reject them outright.
- * `SAVEPOINT`/`RELEASE [SAVEPOINT]`/`ROLLBACK TO SAVEPOINT` (see [executeSavepoint]/
- * [executeReleaseSavepoint]/[executeRollbackToSavepoint]) are supported inside an explicit transaction,
- * with the same stack semantics (reusing a name shadows the older savepoint of that name; releasing or
- * rolling back to one forgets every savepoint established after it, but rolling back keeps the target
- * itself usable again) as [kestrel.engine.Executor]. Unlike that whole-catalog-snapshot
- * implementation, this one partially rolls back the storage engine's own WAL transaction - see
- * [kestrel.store.wal.LogRecord.CompensationUpdate] and [kestrel.store.wal.RecoveryManager.rollbackTo]
- * for the ARIES-style compensation log records that make undoing only a suffix of a transaction safe
- * to repeat and safe to crash through, and [kestrel.store.engine.StorageEngine.savepoint]/
- * [kestrel.store.engine.StorageEngine.rollbackToSavepoint] for how a B+Tree's root pointer (plain
- * in-memory state no log record tracks) and the buffer pool's cache of pages the undo just overwrote
- * on disk are kept in sync with it.
- * `CREATE`/`DROP TRIGGER` `BEFORE`/`AFTER INSERT`/`UPDATE`/`DELETE FOR EACH ROW` (see
- * [executeCreateTrigger]/[executeDropTrigger]/[fireRowTriggers]/[runTriggerBody]) mirror
- * [kestrel.engine.Executor]'s own trigger semantics 1:1 (optional `WHEN`, `NEW`/`OLD` resolved via
- * the shared [kestrel.engine.TriggerRowContext], cascading fires across tables up to
- * [MAX_TRIGGER_DEPTH]) with one deliberate difference in how atomicity is achieved: instead of a
- * whole-catalog snapshot/restore, a whole statement plus every trigger it cascades into is undone by
- * [withTriggerAtomicity] taking one internal storage-engine savepoint (see [DiskCatalog.savepoint])
- * at the outermost call and rolling back to it on any failure - reusing the exact same primitive
- * `SAVEPOINT` is built on, just invisibly. `INSERT ... ON CONFLICT` on a table with a trigger defined
- * fires that table's own INSERT triggers for a row that lands fresh and its own UPDATE triggers for a
- * row folded into `DO UPDATE` (never both for the same row, and never anything for `DO NOTHING`) - see
- * [executeInsertWithConflictHandling] - mirroring the in-memory engine's own resolution of the same gap.
- * `TRUNCATE TABLE t1 [, t2, ...] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]` (see
- * [executeTruncate]/[DiskCatalog.truncateTables]) empties every listed table - and, under CASCADE,
- * every table transitively reaching it via a FOREIGN KEY - without firing a single row-level trigger
- * or consulting any FOREIGN KEY's `onDelete` action, sharing the calling statement's transaction
- * exactly like a WHERE-less DELETE; `RESTART IDENTITY` additionally restarts every sequence backing a
- * `DEFAULT NEXTVAL(...)` column of a truncated table, the one part of this statement that is NOT
- * covered by that same transaction - see [executeTruncate]'s own doc for why, mirroring
- * [DiskCatalog.nextValue]'s already-established non-transactional sequence position.
- * `MERGE INTO target USING source ON onCondition WHEN [NOT] MATCHED [AND cond] THEN ...` (see
- * [executeMerge]/[executeMergeInner]) mirrors [kestrel.engine.Executor]'s own MERGE 1:1 - `source` is
- * a table or derived-table subquery resolved once, up front, into a fixed snapshot via
- * [resolveMergeSource]/[resolveFromItem], `ON` is matched against a snapshot of the target table taken
- * before any mutation (not the live, mutating [DiskTable]), and a target row already affected earlier
- * in the same statement throws rather than silently applying a second action - the one difference from
- * the in-memory engine is that "already affected"/"this pair's target row" is tracked by
- * [kestrel.store.heap.RecordId] rather than [Row] object identity, since a disk row is decoded fresh
- * on every read and so is never `===` to an earlier read of "the same" row.
- * `PREPARE name AS <SELECT|INSERT|UPDATE|DELETE|MERGE>`/`EXECUTE name(args...)`/`DEALLOCATE [PREPARE]
- * name|ALL` (see [executePrepare]/[resolveExecute]/[executeDeallocate]) are ported 1:1 from
- * [kestrel.engine.Executor]'s own registry - session-scoped, kept outside [DiskCatalog] for the same
- * reason ([explicitTxn] `COMMIT`/`ROLLBACK` never touches it), sharing the same [ParameterSubstitution]
- * walkers so `$1`, `$2`, ... resolve identically on both engines.
- */
 class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
     private val accessPlanner = DiskIndexAccessPlanner()
     private val activeCtes = mutableListOf<CteScope>()
     private val expandingViews = mutableSetOf<String>()
 
-    /** Guards against a trigger whose body (directly or transitively) fires itself forever - mirrors [kestrel.engine.Executor.triggerDepth]. */
     private var triggerDepth = 0
 
-    /**
-     * Postgres-session-scoped CURRVAL cache, ported 1:1 from [kestrel.engine.Executor.
-     * lastSequenceValues] - see that field's own doc for why it is keyed by [Sequence] identity
-     * rather than by name.
-     */
     private val lastSequenceValues = HashMap<Sequence, Long>()
 
     override fun nextValue(sequenceName: String): Long {
@@ -304,42 +175,16 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             ?: throw DiskExecutorException("currval of sequence '$sequenceName' is not yet defined in this session - call NEXTVAL first")
     }
 
-    /**
-     * Session-scoped, ported 1:1 from [kestrel.engine.Executor.preparedStatements] - deliberately
-     * outside [DiskCatalog], since a prepared statement carries no data of its own to undo: it is
-     * unaffected by `COMMIT`/`ROLLBACK` on [explicitTxn] the same way it is unaffected by
-     * catalog-snapshot rollback on the in-memory engine.
-     */
     private val preparedStatements = linkedMapOf<String, PreparableStatement>()
 
     val preparedStatementNames: List<String> get() = preparedStatements.keys.toList()
 
-    /** The disk transaction opened by a `BEGIN` still awaiting `COMMIT`/`ROLLBACK`, or null outside one. */
     private var explicitTxn: Long? = null
 
-    /** Whether an explicit `BEGIN` is currently open - mirrors [kestrel.engine.Executor.inTransaction]. */
     val inTransaction: Boolean get() = explicitTxn != null
 
-    /**
-     * Named savepoints established inside the currently open [explicitTxn], oldest first, each paired
-     * with the storage engine LSN [DiskCatalog.savepoint] captured for it - mirrors
-     * [kestrel.engine.Executor]'s own `savepoints` stack (catalog snapshots there, WAL positions here)
-     * including reuse-shadows-the-older-one-of-the-same-name semantics via [indexOfLastSavepoint].
-     */
     private val savepoints = mutableListOf<Pair<String, Long>>()
 
-    /**
-     * A temp table's rows live in a plain [Table.rows] list outside [DiskCatalog]'s own WAL/2PL
-     * transaction (see [DiskCatalog]'s KDoc on [DiskCatalog.temporaryTableValues]), so `ROLLBACK`/
-     * `ROLLBACK TO SAVEPOINT` cannot undo a temp table's INSERT/UPDATE/DELETE the way they undo a
-     * real [DiskTable]'s writes just by aborting/rewinding [explicitTxn] - this stack is what makes
-     * them do it anyway. Index 0 is the snapshot taken at `BEGIN`; index `i + 1` is the snapshot
-     * taken when `savepoints[i]` was established, so `ROLLBACK` restores index 0 and `ROLLBACK TO
-     * SAVEPOINT` restores `temporaryTableSnapshots[index + 1]` - kept in lockstep with [savepoints]
-     * by every method below. Only *row contents* ever need restoring, never which temp tables exist:
-     * `CREATE`/`DROP TEMPORARY TABLE` are DDL, already rejected inside an explicit transaction (see
-     * [isDdl]), so the set of temp tables is fixed for the whole lifetime of one [explicitTxn].
-     */
     private val temporaryTableSnapshots = mutableListOf<Map<Table, List<Row>>>()
 
     private fun snapshotTemporaryTables(): Map<Table, List<Row>> =
@@ -414,13 +259,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return PrepareResult(statement.name)
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.resolveExecute] - looks [ExecuteStatement.name] up,
-     * evaluates every argument as a CONSTANT (a bare [Evaluator] with no resolver/subquery/sequence
-     * access, exactly like a DEFAULT expression), and substitutes the results for every `$1`, `$2`,
-     * ... via the same [ParameterSubstitution] both engines share. The result is always a concrete
-     * [PreparableStatement] - never [ExecuteStatement] itself.
-     */
     fun resolveExecute(statement: ExecuteStatement): Statement {
         val target = preparedStatements[statement.name.lowercase()]
             ?: throw DiskExecutorException("no such prepared statement: ${statement.name}")
@@ -473,13 +311,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return RollbackResult
     }
 
-    /**
-     * Establishing a savepoint costs nothing beyond capturing the storage engine's current WAL
-     * position and every open index's root pointer (see [DiskCatalog.savepoint]) plus a temp table
-     * row snapshot (see [temporaryTableSnapshots]) - unlike [kestrel.engine.Executor], there is no
-     * whole-CATALOG snapshot to take, since DDL (the only thing that mutates [catalog] itself rather
-     * than a table's data) is already rejected inside an explicit transaction on this executor.
-     */
     private fun executeSavepoint(statement: SavepointStatement): StatementResult {
         val txn = explicitTxn ?: throw DiskExecutorException("SAVEPOINT can only be used inside a transaction")
         savepoints.add(statement.name to catalog.savepoint(txn))
@@ -487,7 +318,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return SavepointResult(statement.name)
     }
 
-    /** Forgets the named savepoint and every savepoint established after it, without undoing anything. */
     private fun executeReleaseSavepoint(statement: ReleaseSavepointStatement): StatementResult {
         val txn = explicitTxn ?: throw DiskExecutorException("RELEASE SAVEPOINT can only be used inside a transaction")
         val index = indexOfLastSavepoint(statement.name)
@@ -499,11 +329,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return ReleaseSavepointResult(statement.name)
     }
 
-    /**
-     * Undoes every write made since the named savepoint, but - matching [kestrel.engine.Executor] and
-     * real SQL savepoint semantics - keeps that savepoint itself usable for a later rollback, only
-     * discarding the ones established after it.
-     */
     private fun executeRollbackToSavepoint(statement: RollbackToSavepointStatement): StatementResult {
         val txn = explicitTxn ?: throw DiskExecutorException("ROLLBACK TO SAVEPOINT can only be used inside a transaction")
         val index = indexOfLastSavepoint(statement.name)
@@ -523,16 +348,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return index
     }
 
-    /**
-     * Runs [block] against the transaction opened by a `BEGIN` still in progress so several
-     * statements share one commit/abort boundary, or against a fresh transaction scoped to just this
-     * statement (committed on success, aborted on failure via [runInTransaction]) when there isn't
-     * one - the same per-statement auto-commit [kestrel.engine.Executor] gets for free from running
-     * directly against an in-memory [kestrel.catalog.Catalog] with no transaction concept at all.
-     * Locks taken by [block] are held by the shared transaction until that later COMMIT/ROLLBACK per
-     * strict two-phase locking (see [kestrel.store.txn.LockManager]), so a SELECT inside an open
-     * transaction can block a concurrent writer the way a real multi-statement transaction should.
-     */
     private fun <T> withStatementTransaction(block: (Long) -> T): T {
         val active = explicitTxn
         if (active != null) return block(active)
@@ -540,19 +355,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return runInTransaction(txn) { block(txn) }
     }
 
-    /**
-     * Savepoint-based analog of [kestrel.engine.Executor.withStatementAtomicity]: without this, a
-     * BEFORE trigger's own INSERT/UPDATE/DELETE would survive even when the statement that fired it
-     * goes on to fail its own constraint check (or an AFTER trigger fails after the row already
-     * landed) - a real database treats a whole statement plus everything its triggers do as one
-     * atomic unit. Only the OUTERMOST statement in a trigger cascade takes the savepoint
-     * ([triggerContext] is null exactly there, mirroring the in-memory engine's own `triggerContext ==
-     * null` check): [catalog.savepoint]/[catalog.rollbackToSavepoint] are keyed purely by WAL LSN,
-     * entirely independent of - and safely nestable inside - the executor's own named `SAVEPOINT`
-     * stack ([savepoints]), so this composes with an explicit transaction the user is already inside
-     * without disturbing it. Skipped entirely when [tableName] has no trigger at all, so the
-     * overwhelmingly common trigger-free INSERT/UPDATE/DELETE pays no savepoint cost.
-     */
     private fun <T> withTriggerAtomicity(tableName: String, txn: Long, triggerContext: TriggerRowContext?, block: () -> T): T {
         if (triggerContext != null || !catalog.hasTriggers(tableName)) return block()
         val savepointLsn = catalog.savepoint(txn)
@@ -567,12 +369,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return result
     }
 
-    /**
-     * Resolves `NEW.col`/`OLD.col` against [trigger] first (when both the qualifier and that side of
-     * the row are present); everything else - including a bare column with no qualifier at all -
-     * falls through to [base] exactly as it would with no trigger in play. Ported 1:1 from
-     * [kestrel.engine.Executor.composeResolver], just with [DiskExecutorException] for the fallthrough.
-     */
     private fun composeResolver(base: ColumnResolver?, trigger: TriggerRowContext?): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value =
             if (trigger != null && trigger.matches(expression)) trigger.resolve(expression)
@@ -583,7 +379,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             else base?.declaredCollation(expression)
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.rowResolver] - a [ColumnResolver] [composeResolver] can layer a [TriggerRowContext] on top of. */
     private fun rowResolver(schema: TableSchema, row: Row): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value {
             val index = schema.columnIndex(expression.name) ?: throw DiskExecutorException("no such column: ${expression.name}")
@@ -593,13 +388,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         override fun declaredCollation(expression: ColumnExpression): Collation? = schema.column(expression.name)?.collation
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.evaluateReturning]: evaluates an INSERT/UPDATE/
-     * DELETE statement's `RETURNING` clause against the rows it actually affected - the freshly
-     * inserted/updated row for INSERT/UPDATE, the pre-deletion row for DELETE. [checkReturningColumns]
-     * validates every projected expression up front so a bad column name is reported even when zero
-     * rows matched, not just lazily the first time [rowResolver] happens to see one.
-     */
     private fun evaluateReturning(schema: TableSchema, rows: List<Row>, projection: Projection, subqueries: SubqueryRunner): SelectResult {
         val columns = when (projection) {
             is StarProjection -> schema.columns.map { it.name }
@@ -620,11 +408,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return SelectResult(columns, resultRows)
     }
 
-    /**
-     * Fires every trigger registered for ([schema], [timing], [event]) in creation order, once per
-     * (oldRow, newRow) pair in [rows] - mirrors [kestrel.engine.Executor.fireRowTriggers] exactly,
-     * including that a `WHEN` clause evaluating to false/NULL skips only that trigger for that row.
-     */
     private fun fireRowTriggers(schema: TableSchema, timing: TriggerTiming, event: TriggerEvent, rows: List<Pair<Row?, Row?>>, txn: Long) {
         val triggers = catalog.triggersOn(schema.name, timing, event)
         if (triggers.isEmpty()) return
@@ -642,14 +425,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Runs a fired trigger's body statements in order, directly against [txn] - NOT through
-     * [executeInsert]/[executeUpdate]/[executeDelete] (which would re-select a transaction via
-     * [withStatementTransaction] and re-take a trigger-atomicity savepoint via
-     * [withTriggerAtomicity]) - so the whole cascade shares exactly one disk transaction and exactly
-     * one savepoint, taken once by the outermost caller. Mirrors [kestrel.engine.Executor.
-     * runTriggerBody], including [MAX_TRIGGER_DEPTH].
-     */
     private fun runTriggerBody(trigger: TriggerDefinition, context: TriggerRowContext, txn: Long) {
         if (triggerDepth >= MAX_TRIGGER_DEPTH) {
             throw DiskExecutorException(
@@ -699,11 +474,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return DropIndexResult(statement.indexName)
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.executeCreateSequence] - see that method's own doc
-     * for the ascending/descending default resolution and the one thing [SequenceDefinition]'s own
-     * `init` cannot check itself (START WITH falling inside [MINVALUE, MAXVALUE]).
-     */
     private fun executeCreateSequence(statement: CreateSequenceStatement): StatementResult {
         val incrementBy = statement.incrementBy ?: 1L
         if (incrementBy == 0L) throw DiskExecutorException("sequence '${statement.sequenceName}' INCREMENT BY cannot be zero")
@@ -728,7 +498,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return DropSequenceResult(statement.sequenceName)
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.executeAlterSequence] - see that method's own doc. */
     private fun executeAlterSequence(statement: AlterSequenceStatement): StatementResult {
         val existing = catalog.sequence(statement.sequenceName).definition
         val incrementBy = statement.incrementBy ?: existing.incrementBy
@@ -757,12 +526,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return AlterSequenceResult(statement.sequenceName)
     }
 
-    /**
-     * Runs [CreateViewStatement.query] once, discarding the result, purely to fail fast on a bad
-     * column/table reference before anything is persisted - mirrors [kestrel.engine.Executor.
-     * executeCreateView] calling `selectRunner.explain` for the same reason, just via a real
-     * execution rather than a plan-only walk (this executor has no `explain`).
-     */
     private fun executeCreateView(statement: CreateViewStatement): StatementResult {
         val txn = catalog.beginTransaction()
         runInTransaction(txn) { runQuery(statement.query, txn, outer = null) }
@@ -775,17 +538,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return DropViewResult(statement.viewName)
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.executeCreateTrigger]: body statements are
-     * deliberately NOT deep-validated here (no eager check that every column referenced in a body
-     * statement's WHERE/SET/VALUES actually exists) - a trigger body can target a different table per
-     * statement, and this executor already defers exactly this kind of check to the moment the
-     * trigger actually fires, same as SQLite. What IS checked eagerly: the trigger's own table and
-     * every body statement's target table both exist right now, and the WHEN clause - evaluated
-     * directly by this executor rather than through a nested statement run, so nothing else will ever
-     * validate it - contains no subquery/aggregate and only ever references NEW/OLD columns that both
-     * exist on this table and are actually available for this trigger's event.
-     */
     private fun executeCreateTrigger(statement: CreateTriggerStatement): StatementResult {
         val schema = catalog.table(statement.tableName).schema
         statement.whenClause?.let { whenClause ->
@@ -808,14 +560,12 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.rejectReturning]: a trigger body statement's own [runTriggerBody] discards whatever [StatementResult] it returns, so a RETURNING clause there would compute output nobody could ever see. */
     private fun rejectReturning(returning: Projection?) {
         if (returning != null) {
             throw DiskExecutorException("RETURNING is not allowed in a trigger body statement - its result would never be visible to anything")
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.validateTriggerRowReferences]. */
     private fun validateTriggerRowReferences(expression: Expression, event: TriggerEvent, schema: TableSchema) {
         when (expression) {
             is ColumnExpression -> {
@@ -905,19 +655,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return CreateTableResult(statement.tableName)
     }
 
-    /**
-     * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` - the disk-backed executor's counterpart of
-     * [executeCreateTable], but building a [kestrel.storage.Table] via [DiskCatalog.createTemporaryTable]
-     * instead of a [DiskTable]: a real, live table for the rest of this process's lifetime (INSERT/
-     * SELECT/UPDATE/DELETE, WHERE/JOIN/ORDER BY/subqueries, NOT NULL/PRIMARY KEY/UNIQUE/CHECK/DEFAULT/
-     * GENERATED all enforced exactly like a permanent table - see [executeTemporaryInsert]/
-     * [executeTemporaryUpdate]/[executeTemporaryDelete] and [resolveFromSource]), simply never
-     * touching the pager/WAL and never surviving a reopen. FOREIGN KEY is rejected outright rather
-     * than silently ignored: [DiskForeignKeyEnforcer] and its cascade bookkeeping are wired to
-     * [DiskTable]/[DiskCatalog]'s directory, which a temp table deliberately has no entry in, so
-     * honoring the constraint would need a parallel enforcement path this session scoped out - a
-     * named, documented scope-cut rather than a constraint that looks declared but is never checked.
-     */
     private fun executeCreateTemporaryTable(statement: CreateTableStatement): StatementResult {
         if (statement.foreignKeys.isNotEmpty()) {
             throw DiskExecutorException("FOREIGN KEY on a temporary table is not supported by the disk-backed executor yet")
@@ -949,11 +686,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return CreateTableResult(statement.tableName)
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.validateNextValueDefault]: checked statically rather
-     * than by evaluating the DEFAULT for real, since a bare `CREATE TABLE` must not itself consume a
-     * sequence value before a single row exists.
-     */
     private fun validateNextValueDefault(default: NextValueExpression, column: Column) {
         catalog.sequence(default.sequenceName)
         if (column.type != ColumnType.Integer) {
@@ -961,13 +693,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Deliberately duplicated from [kestrel.engine.Executor.validateForeignKeyDefinitions] (same
-     * reasoning as [coerceForColumn]): [columns] is already normalized by [applyCompositePrimaryKey],
-     * matching the in-memory engine's own call order. A self-reference (`referencedTable` equal to
-     * the table being created) is checked against a [TableSchema] built from [columns] rather than
-     * the catalog, because the table doesn't exist there yet while it's being created.
-     */
     private fun validateForeignKeyDefinitions(statement: CreateTableStatement, columns: List<Column>) {
         for (fk in statement.foreignKeys) {
             if (fk.columns.size != fk.referencedColumns.size) {
@@ -1013,13 +738,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Deliberately duplicated from [kestrel.engine.Executor.validateCheckDefinitions] (same
-     * reasoning as [coerceForColumn]): every CHECK expression must only reference a real column of
-     * the table being created and must contain no subquery, aggregate, or window function - there is
-     * no row yet to run one against, and this executor's [Evaluator] has no aggregation pass of its
-     * own outside [GroupAggregation].
-     */
     private fun validateCheckDefinitions(statement: CreateTableStatement) {
         val schema = TableSchema(statement.tableName, statement.columns)
         for (check in statement.checks) {
@@ -1028,7 +746,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.checkColumns] - see [validateCheckDefinitions]. */
     private fun checkColumns(expression: Expression, schema: TableSchema) {
         when (expression) {
             is ColumnExpression -> if (schema.columnIndex(expression.name) == null) {
@@ -1077,13 +794,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.checkColumns] (the general-purpose variant used for
-     * WHERE/SET/RETURNING) - NOT [checkColumns] above, which is CHECK-constraint specific and
-     * rejects NEXTVAL/CURRVAL outright. Used only by [evaluateReturning]: validates every column
-     * reference in a RETURNING projection item exists on [schema] and that no aggregate/window
-     * function sneaks in.
-     */
     private fun checkReturningColumns(expression: Expression, schema: TableSchema) {
         when (expression) {
             is ColumnExpression -> if (schema.columnIndex(expression.name) == null) {
@@ -1125,16 +835,10 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             is InSubqueryExpression -> checkReturningColumns(expression.operand, schema)
             is CastExpression -> checkReturningColumns(expression.operand, schema)
             is CollateExpression -> checkReturningColumns(expression.operand, schema)
-            // Structurally harmless (no column reference to check) - whether MERGE_ACTION() is
-            // actually legal at this particular call site (MERGE's own RETURNING: yes; plain INSERT/
-            // UPDATE/DELETE's RETURNING: no) is enforced by whether the Evaluator this feeds into was
-            // actually given a mergeAction, exactly like NEXTVAL/CURRVAL is enforced by SequenceAccess -
-            // see evaluateMergeReturning, the one call site that binds one.
             is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.requireNoSubquery] - see [validateCheckDefinitions]. */
     private fun requireNoSubquery(expression: Expression) {
         when (expression) {
             is ScalarSubqueryExpression, is ExistsExpression, is InSubqueryExpression ->
@@ -1179,7 +883,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.validateGeneratedDefinitions] - see that method's own doc. */
     private fun validateGeneratedDefinitions(columns: List<Column>) {
         val schema = TableSchema("", columns)
         val generatedNames = columns.filter { it.generated != null }.map { it.name.lowercase() }.toSet()
@@ -1194,7 +897,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.requireNoGeneratedColumnReference]. */
     private fun requireNoGeneratedColumnReference(expression: Expression, generatedNames: Set<String>, ownerColumn: String) {
         when (expression) {
             is ColumnExpression -> if (expression.name.lowercase() in generatedNames) {
@@ -1239,7 +941,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.applyGeneratedColumns]. */
     private fun applyGeneratedColumns(schema: TableSchema, values: MutableList<Value>, subqueries: SubqueryRunner) {
         if (schema.columns.none { it.generated != null }) return
         val evaluator = Evaluator(schema, Row(values), subqueries)
@@ -1249,18 +950,12 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.rejectGeneratedAssignment]. */
     private fun rejectGeneratedAssignment(column: Column, explicitValueGiven: Boolean) {
         if (explicitValueGiven && column.generated != null) {
             throw DiskExecutorException("cannot assign an explicit value to GENERATED column ${column.name}")
         }
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.enforceChecks]: a CHECK expression that evaluates to
-     * SQL `FALSE` rejects the row; `TRUE` or `NULL` (three-valued "unknown", e.g. a comparison against
-     * a NULL column) both accept it, per standard SQL.
-     */
     private fun enforceChecks(schema: TableSchema, row: Row, subqueries: SubqueryRunner) {
         for (check in schema.checks) {
             val result = Evaluator(schema, row, subqueries).evaluate(check.expression)
@@ -1271,12 +966,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * NOT NULL enforcement for a temp table row - [DiskTable.insert]/[DiskTable.update] get this for
-     * free from their own private `requireArity`, but a temp table's plain [kestrel.storage.Table]
-     * has no such gate, so [executeTemporaryInsert]/[executeTemporaryUpdate] call this directly.
-     * Ported 1:1 from [kestrel.engine.Executor.validateNotNull].
-     */
     private fun validateTemporaryNotNull(schema: TableSchema, values: List<Value>) {
         for ((index, column) in schema.columns.withIndex()) {
             if (column.notNull && values[index] is Value.NullValue) {
@@ -1285,13 +974,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * PRIMARY KEY uniqueness for a temp table, checked by full scan over [rows] (the whole candidate
-     * set post-mutation, not just the newly touched rows - same reasoning as
-     * [kestrel.engine.Executor.enforcePrimaryKeyUniqueness]) since a temp table has no B+Tree to
-     * enforce it structurally the way [DiskTable.rejectDuplicatePrimaryKey] does. Ported 1:1 from
-     * that same in-memory method, [DiskExecutorException] aside.
-     */
     private fun enforceTemporaryPrimaryKeyUniqueness(schema: TableSchema, rows: List<Row>) {
         val indices = schema.primaryKeyIndices
         if (indices.isEmpty()) return
@@ -1305,7 +987,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** UNIQUE-constraint counterpart of [enforceTemporaryPrimaryKeyUniqueness] - ported 1:1 from [kestrel.engine.Executor.enforceUniqueConstraints]. */
     private fun enforceTemporaryUniqueConstraints(schema: TableSchema, rows: List<Row>) {
         for (unique in schema.uniqueConstraints) {
             val columnIndices = unique.columns.map { schema.columnIndex(it)!! }
@@ -1322,12 +1003,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Deliberately duplicated from [kestrel.engine.Executor.validateUniqueDefinitions] (same
-     * reasoning as [coerceForColumn]): only checks that every referenced column exists, mirroring
-     * the in-memory engine exactly - it does not reject a constraint naming the same column twice
-     * (`UNIQUE (a, a)`), because the in-memory engine does not either.
-     */
     private fun validateUniqueDefinitions(statement: CreateTableStatement) {
         for (unique in statement.uniqueConstraints) {
             for (columnName in unique.columns) {
@@ -1338,14 +1013,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * A table-level `PRIMARY KEY (a, b, ...)` implies NOT NULL on every listed column, exactly
-     * like the inline `col TYPE PRIMARY KEY` spelling already does. Deliberately duplicated from
-     * [kestrel.engine.Executor.applyCompositePrimaryKey] (same reasoning as [coerceForColumn]):
-     * this executor reuses the in-memory engine's AST/types but must stay free-standing so a
-     * change to the in-memory engine's error handling can never silently affect the disk-backed
-     * path or vice versa.
-     */
     private fun applyCompositePrimaryKey(statement: CreateTableStatement): List<Column> {
         if (statement.compositePrimaryKey.isEmpty()) return statement.columns
         val declared = statement.compositePrimaryKey.map { it.lowercase() }.toSet()
@@ -1371,18 +1038,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return DropTableResult(statement.tableName)
     }
 
-    /**
-     * Deliberately NOT in [isDdl] - like DELETE, TRUNCATE's row-clearing is fully covered by the
-     * storage engine's own WAL/2PL transaction, so it may run inside an explicit `BEGIN` and roll
-     * back cleanly with everything else that transaction did. `RESTART IDENTITY` is the one
-     * exception: [DiskCatalog.alterSequence] always opens and commits its own transaction (mirroring
-     * [DiskCatalog.nextValue]'s already-non-transactional sequence position - see that method's own
-     * doc), so a sequence restarted here stays restarted even if the enclosing statement transaction
-     * later rolls back. This is a deliberate, bounded asymmetry with [kestrel.engine.Executor]'s
-     * in-memory engine, where RESTART IDENTITY *is* undone by ROLLBACK because ALTER SEQUENCE there
-     * mutates a map entry covered by the whole-catalog snapshot/restore (see
-     * [kestrel.catalog.Catalog.truncateTables]).
-     */
     private fun executeTruncate(statement: TruncateTableStatement): StatementResult {
         val truncated = withStatementTransaction { txn ->
             catalog.truncateTables(txn, statement.tableNames, statement.mode == DropMode.Cascade)
@@ -1393,7 +1048,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return TruncateTableResult(truncated)
     }
 
-    /** Ported 1:1 from [kestrel.catalog.Catalog.restartOwnedSequences] - see that method's own doc for why a NEXTVAL DEFAULT is this engine's only signal for "this column is identity-backed". */
     private fun restartOwnedSequences(schema: TableSchema) {
         for (column in schema.columns) {
             val default = column.default
@@ -1418,7 +1072,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return AlterTableResult(resultName)
     }
 
-    /** Mirrors [kestrel.engine.Executor.executeAddConstraint] - see that method's own doc. */
     private fun executeAddConstraint(tableName: String, added: AddedConstraint) {
         when (added) {
             is AddedCheck -> executeAddCheckConstraint(tableName, added.check)
@@ -1427,13 +1080,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name CHECK (...)` - mirrors
-     * [kestrel.engine.Executor.executeAddCheckConstraint]: validated exactly like a CREATE TABLE-time
-     * CHECK ([validateCheckDefinitions]: known columns only, no subquery), PLUS every existing row is
-     * evaluated against it up front (under its own probe transaction, mirroring [executeAddColumn]'s
-     * `probeTxn`) before the constraint is installed via [DiskCatalog.addCheckConstraint].
-     */
     private fun executeAddCheckConstraint(tableName: String, check: CheckConstraint) {
         val table = catalog.table(tableName)
         val schema = table.schema
@@ -1454,12 +1100,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         catalog.addCheckConstraint(tableName, check)
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name UNIQUE (...)` - mirrors
-     * [kestrel.engine.Executor.executeAddUniqueConstraint]: every existing row is checked for a
-     * duplicate combination of [unique]'s columns (folded through [collationFoldedUniquenessKey], NULL
-     * exempt per standard SQL) under its own probe transaction before the constraint is installed.
-     */
     private fun executeAddUniqueConstraint(tableName: String, unique: UniqueConstraint) {
         val table = catalog.table(tableName)
         val schema = table.schema
@@ -1488,14 +1128,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         catalog.addUniqueConstraint(tableName, unique)
     }
 
-    /**
-     * `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY (...) REFERENCES ...` - mirrors
-     * [kestrel.engine.Executor.executeAddForeignKeyConstraint]: validated the same way
-     * [validateForeignKeyDefinitions] validates one at CREATE TABLE time, PLUS every existing row of
-     * [tableName] is checked against it via [DiskForeignKeyEnforcer.validateRow] (under its own probe
-     * transaction) against a throwaway [TableSchema] carrying [foreignKey] alongside every FOREIGN KEY
-     * [tableName] already has, so a self-referencing FOREIGN KEY can find its own sibling rows.
-     */
     private fun executeAddForeignKeyConstraint(tableName: String, foreignKey: ForeignKeyConstraint) {
         val table = catalog.table(tableName)
         val schema = table.schema
@@ -1541,16 +1173,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         catalog.addForeignKey(tableName, foreignKey)
     }
 
-    /**
-     * Mirrors [kestrel.engine.Executor.executeChangeColumnType] - same RESTRICT-only dependency
-     * checks (PRIMARY KEY/FOREIGN KEY on either side/UNIQUE constraint/secondary index/GENERATED,
-     * all rejected outright rather than threading a type change through them) and the same DEFAULT
-     * compatibility pre-check. The one structural difference: [DiskCatalog.changeColumnType]'s
-     * `valueForRow` callback runs DURING the real per-row rewrite (via [DiskTable.rewriteRows]), not
-     * before it - see that method's own doc for why a NOT NULL/CHECK failure discovered mid-rewrite
-     * is still safe (transaction abort unwinds it), the same contract a NOT NULL `GENERATED ALWAYS
-     * AS` backfill already relies on.
-     */
     private fun executeChangeColumnType(tableName: String, action: ChangeColumnType) {
         val table = catalog.table(tableName)
         val schema = table.schema
@@ -1634,7 +1256,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Mirrors [kestrel.engine.Executor.requireUniqueConstraintName] - see that method's own doc. */
     private fun requireUniqueConstraintName(schema: TableSchema, name: String) {
         val taken = schema.foreignKeys.any { it.name?.equals(name, ignoreCase = true) == true } ||
             schema.checks.any { it.name?.equals(name, ignoreCase = true) == true } ||
@@ -1642,15 +1263,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         if (taken) throw DiskExecutorException("constraint '$name' already exists on table ${schema.name}")
     }
 
-    /**
-     * A NOT NULL column added to a table that already has rows must carry a DEFAULT (there is no
-     * value to backfill existing rows with otherwise) - an empty table has no such requirement.
-     * Mirrors [kestrel.engine.Executor.executeAddColumn] (same reasoning as [coerceForColumn]):
-     * duplicated rather than shared, since this executor's [DiskTable] has no equivalent of the
-     * in-memory engine's `Table.rows` to check emptiness against without a transaction of its own.
-     * GENERATED ALWAYS AS sidesteps the NOT NULL/DEFAULT requirement entirely - see
-     * [addGeneratedColumnValue].
-     */
     private fun executeAddColumn(tableName: String, column: Column) {
         val table = catalog.table(tableName)
         if (column.generated != null) {
@@ -1670,7 +1282,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         catalog.addColumn(tableName, column) { defaultValue }
     }
 
-    /** Mirrors [kestrel.engine.Executor.validateAddGeneratedColumn] - see that method's own doc. */
     private fun validateAddGeneratedColumn(schema: TableSchema, column: Column) {
         val generated = column.generated!!
         checkColumns(generated, schema)
@@ -1679,7 +1290,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         requireNoGeneratedColumnReference(generated, generatedNames, column.name)
     }
 
-    /** Mirrors [kestrel.engine.Executor.addGeneratedColumnValue] - see that method's own doc. */
     private fun addGeneratedColumnValue(schema: TableSchema, column: Column, row: Row): Value {
         val value = coerceForColumn(Evaluator(schema, row).evaluate(column.generated!!), column)
         if (column.notNull && value is Value.NullValue) {
@@ -1688,12 +1298,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return value
     }
 
-    /**
-     * A DEFAULT must be a constant expression: no column reference (there is no row to read one
-     * from when backfilling `ALTER TABLE ... ADD COLUMN`), no subquery, and no aggregate. Ported
-     * 1:1 from [kestrel.engine.Executor.validateConstantDefault] - see [checkColumns] for why this
-     * executor duplicates rather than shares this kind of validation.
-     */
     private fun validateConstantDefault(expression: Expression) {
         when (expression) {
             is ColumnExpression -> throw DiskExecutorException("DEFAULT expression cannot reference a column")
@@ -1743,12 +1347,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Builds every row's final values first (in [newRows], none written yet) and only then validates
-     * and inserts them one at a time - not inline in a single pass - so that a self-referencing FK
-     * can see sibling rows from the same multi-row INSERT regardless of their order in the statement,
-     * exactly like [kestrel.engine.Executor.executeInsert]'s own `uncommittedSiblings = newRows`.
-     */
     private fun executeInsert(statement: InsertStatement, triggerContext: TriggerRowContext? = null): StatementResult {
         catalog.temporaryTableOrNull(statement.tableName)?.let { return executeTemporaryInsert(statement, it) }
         val table = catalog.table(statement.tableName)
@@ -1760,17 +1358,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * INSERT into a temp table's plain [Table.rows] list - ported from the same validate-the-whole-
-     * batch-before-mutating-anything shape as [executeInsertInTxn]/[kestrel.engine.Executor.
-     * executeInsertInner], minus [DiskForeignKeyEnforcer]/trigger firing (both rejected outright at
-     * `CREATE TEMP TABLE` time - see [executeCreateTemporaryTable]) and minus ON CONFLICT (a separate,
-     * documented scope-cut: [executeInsertWithConflictHandling]'s `findConflictingRow` scans a live
-     * [DiskTable] via [DiskTable.scan], which a temp table has none of). Still opens a real disk
-     * transaction via [withStatementTransaction] purely so a DEFAULT/CHECK/GENERATED expression's
-     * scalar subquery (via [subqueryRunnerFor]) or a NEXTVAL default can read/advance the disk
-     * catalog consistently - nothing about the temp table's own row list ever touches it.
-     */
     private fun executeTemporaryInsert(statement: InsertStatement, table: Table): StatementResult {
         if (statement.onConflict != null) {
             throw DiskExecutorException("INSERT ... ON CONFLICT on a temporary table is not supported by the disk-backed executor yet")
@@ -1848,9 +1435,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             Row(values)
         }
         if (onConflict == null) {
-            // Fires before any constraint is even checked, matching SQLite/Postgres: a BEFORE
-            // trigger can reject the whole statement (by having its body throw) before this
-            // executor's own FOREIGN KEY/CHECK/UNIQUE validation ever runs.
             fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Insert, newRows.map { null to it }, txn)
             for (row in newRows) {
                 DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, row.values, uncommittedSiblings = newRows)
@@ -1866,7 +1450,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
 
     private class DiskUniqueKey(val columnIndices: List<Int>, val columnNames: List<String>)
 
-    /** Ported 1:1 from [kestrel.engine.Executor.uniqueKeysOf]: PRIMARY KEY, then every declared UNIQUE constraint, then every UNIQUE secondary index - the same three sources a conflict target may name. */
     private fun diskUniqueKeysOf(schema: TableSchema, table: DiskTable): List<DiskUniqueKey> {
         val keys = mutableListOf<DiskUniqueKey>()
         val pkIndices = schema.primaryKeyIndices
@@ -1882,7 +1465,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return keys
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.resolveConflictTargetKeys]: empty [targetColumns] (bare `ON CONFLICT DO ...`) matches against any of [keys]. */
     private fun resolveConflictTargetKeys(schema: TableSchema, targetColumns: List<String>, keys: List<DiskUniqueKey>): List<DiskUniqueKey> {
         if (targetColumns.isEmpty()) return keys
         val targetIndices = targetColumns.map { name ->
@@ -1897,14 +1479,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return listOf(matched)
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.findConflictingRow], but scanning the live
-     * [DiskTable] (via [DiskTable.scan]) rather than an in-memory `List<Row>` snapshot - the
-     * transactional heap already reflects any row this same statement inserted or updated
-     * earlier in [executeInsertWithConflictHandling]'s per-row loop, giving the same
-     * read-your-own-writes semantics the in-memory engine gets from folding sibling rows into
-     * its candidate list by hand. NULLs never collide with each other (standard SQL).
-     */
     private fun findConflictingRow(txn: Long, table: DiskTable, candidate: List<Value>, keys: List<DiskUniqueKey>): Pair<RecordId, Row>? {
         for ((existingRid, existing) in table.scan(txn)) {
             for (key in keys) {
@@ -1917,22 +1491,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return null
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.executeInsertWithConflictHandling]: each candidate
-     * row is processed as its own micro-insert against the table's current state (not a
-     * batch-validated snapshot), so a later row in the same multi-row INSERT correctly sees an
-     * earlier row's insert or update. [triggerContext] can be non-null here for two independent
-     * reasons: [schema] itself may have triggers of its own (fired per row below, exactly like
-     * [kestrel.engine.Executor] does), and/or this INSERT ... ON CONFLICT may itself be a trigger
-     * body statement targeting a *different* table, so `NEW`/`OLD` from the outer firing trigger
-     * must still resolve in its DO UPDATE assignment values - both compose without conflict since
-     * [fireRowTriggers] below builds its own fresh [TriggerRowContext] from [schema]'s own triggers,
-     * independent of [triggerContext]. Unlike the batch INSERT/UPDATE paths, no separate reindex step
-     * is needed around trigger firing here: [DiskTable]'s secondary indexes are B+Trees maintained
-     * incrementally by [table.insert]/[table.update] themselves, not rebuilt in a batch pass like
-     * [kestrel.catalog.Catalog.reindexTable], so a trigger body's own query against this table always
-     * sees a consistent index the instant this row's own mutation returns.
-     */
     private fun executeInsertWithConflictHandling(
         schema: TableSchema,
         table: DiskTable,
@@ -1946,9 +1504,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         val keys = diskUniqueKeysOf(schema, table)
         val targetKeys = resolveConflictTargetKeys(schema, onConflict.targetColumns, keys)
         var affected = 0
-        // DO NOTHING contributes no row, and a DO UPDATE row whose WHERE guard fails `continue`s
-        // before reaching the append below - both absent from RETURNING, matching Postgres, same
-        // as the in-memory engine.
         val returnedRows = mutableListOf<Row>()
         for (row in candidateRows) {
             val conflict = findConflictingRow(txn, table, row.values, targetKeys)
@@ -1967,8 +1522,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
                 ConflictDoNothing -> Unit
                 is ConflictDoUpdate -> {
                     val resolver = composeResolver(excludedAwareResolver(schema, conflictingRow, row), triggerContext)
-                    // NEXTVAL/CURRVAL are deliberately usable in the assignment values below but not
-                    // in this WHERE-shaped guard, matching the in-memory engine's own two-Evaluator split.
                     val conditionEvaluator = Evaluator(resolver, subqueries)
                     if (action.where != null && !isTrue(conditionEvaluator.evaluate(action.where))) continue
                     val assignmentEvaluator = Evaluator(resolver, subqueries, this)
@@ -1986,15 +1539,9 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
                     }
                     applyGeneratedColumns(schema, values, subqueries)
                     val updated = Row(values)
-                    // Fires before any constraint below is checked, same as executeUpdateInTxn's own
-                    // BEFORE trigger - a BEFORE UPDATE trigger's body can reject this row's update
-                    // before this executor's own validation ever runs.
                     fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, listOf(conflictingRow to updated), txn)
                     DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, updated.values, uncommittedSiblings = emptyList())
                     enforceChecks(schema, updated, subqueries)
-                    // Same as executeUpdate: any table with a FK pointing at one of this table's
-                    // enforced-unique key groups needs a cascade/RESTRICT pass when that group's
-                    // value actually changes, not just the PRIMARY KEY.
                     for (group in schema.enforcedUniqueKeyGroups()) {
                         val columnIndices = group.map { schema.columnIndex(it)!! }
                         val oldKey = columnIndices.map { conflictingRow.values[it] }
@@ -2011,12 +1558,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return InsertResult(affected, returning?.let { evaluateReturning(schema, returnedRows, it, subqueries) })
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.excludedAwareResolver]: bare column names resolve
-     * against [target] (the existing conflicting row, matching plain UPDATE semantics), while
-     * `EXCLUDED.column` resolves against [excluded] (the row proposed by this INSERT that failed
-     * to land) - the same pseudo-table Postgres exposes in DO UPDATE.
-     */
     private fun excludedAwareResolver(schema: TableSchema, target: Row, excluded: Row): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value {
             val qualifier = expression.qualifier
@@ -2043,39 +1584,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
     private fun executeQuery(statement: QueryStatement): StatementResult =
         withStatementTransaction { txn -> runQuery(statement, txn, outer = null) }
 
-    /**
-     * Closes the "this executor has no `explain`" scope cut documented on [executeCreateView]:
-     * describes the plan [runSelect]/[runQuery] would use for [statement.select] without running
-     * it, mirroring [kestrel.engine.SelectRunner.explain]'s shape (Seq Scan/Index Scan header per
-     * driving source, Nested Loop per JOIN, GroupAggregate/Aggregate, Sort, Limit, CTE/UNION/WITH
-     * RECURSIVE nesting) with two differences forced by this executor's disk-backed row supply
-     * rather than the in-memory engine's already-resident rows:
-     *
-     * - A materialized CTE, a VIEW, or a non-LATERAL derived table in FROM still runs its defining
-     *   query for real via [resolveFromItem]/[buildCteScope] (exactly what [runSelect] itself would
-     *   do, and exactly what [kestrel.engine.SelectRunner.explain] does too through `resolveSource`)
-     *   since only running it produces a real schema/row set to plan further nesting against. The
-     *   query's own driving table(s) are never scanned this way, though: [resolveFromItem] only
-     *   wraps a real [DiskTable] in a [DiskTableSource] (schema/index metadata, no I/O) - the
-     *   [DiskTableSource.scan] a real [runSelect] would call to actually read rows is deliberately
-     *   never invoked here, so `EXPLAIN SELECT * FROM huge_table` costs nothing proportional to
-     *   `huge_table`'s size the way `SELECT * FROM huge_table` would.
-     * - [applyJoin] has no hash-join optimization at all (see its own doc), so "Nested Loop" is the
-     *   only join header this ever prints - "Hash Join" (which the in-memory engine's EXPLAIN can
-     *   print for an equality ON condition) never appears here.
-     *
-     * Deliberately narrower than [kestrel.engine.SelectRunner.explain] in one respect: it reuses
-     * every validation [runSelect] performs *structurally*, independent of row data - duplicate
-     * alias detection ([buildJoinSources]), window-function placement ([rejectWindowFunction]/
-     * [validateWindows]), and GROUP BY/aggregate correctness ([validateAggregation], itself
-     * structural since [resolveIndex] only consults [JoinSource.schema], never row data) - but does
-     * NOT eagerly resolve WHERE/ON column references the way [kestrel.engine.SelectRunner.explain]'s
-     * `Plan.validate()` does. [runSelect] itself only resolves those against real row data inside
-     * `combined.filter { ... }`/[applyJoin], so on an empty table a bad WHERE/ON column reference
-     * never surfaces there either (a pre-existing, documented gap versus the in-memory engine, not
-     * a new one introduced here) - EXPLAIN staying exactly as permissive keeps its guarantees no
-     * stronger than what actually running the statement would give you.
-     */
     private fun executeExplain(statement: ExplainStatement): StatementResult =
         withStatementTransaction { txn -> ExplainResult(explainQuery(statement.select, txn)) }
 
@@ -2085,7 +1593,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         is WithQuery -> explainWith(query, txn)
     }
 
-    /** Title-case labels for an EXPLAIN header - deliberately separate from [setOperatorKeyword]'s ALL-CAPS SQL-keyword text used in error messages. */
     private fun explainOperatorLabel(operator: SetOperator): String = when (operator) {
         SetOperator.Union -> "Union"
         SetOperator.UnionAll -> "Union All"
@@ -2106,13 +1613,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return lines
     }
 
-    /**
-     * Materializes every CTE for real via [buildCteScope] (needed so a query nested under this WITH
-     * can itself be explained against a real schema/row set), then re-walks each CTE's own query a
-     * second time purely to render its plan text - the same double pass [kestrel.engine.SelectRunner.
-     * explainWith] already accepts for the in-memory engine, including the same cost of re-running a
-     * *nested* recursive CTE's fixed point twice over if one WITH RECURSIVE is nested inside another.
-     */
     private fun explainWith(query: WithQuery, txn: Long): List<String> {
         var pushed = 0
         try {
@@ -2184,7 +1684,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return lines
     }
 
-    /** The driving source's scan line: an indexed [DiskAccessPlan] when there is no JOIN and it is a real disk table, a full scan otherwise - mirrors [initialRows]'s own choice of when to push down. */
     private fun explainScanLine(statement: SelectStatement, fromSource: DiskFromSource): String {
         if (statement.joins.isEmpty() && fromSource is DiskTableSource) {
             val alias = (statement.from as? TableSource)?.alias
@@ -2249,7 +1748,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
     private fun describe(expression: ColumnExpression): String =
         expression.qualifier?.let { "$it.${expression.name}" } ?: expression.name
 
-    /** Ported 1:1 from [kestrel.engine.SelectRunner.describeExpression] - renders any expression as SQL text for an EXPLAIN header (currently only GROUP BY keys reach this). */
     private fun describeExpression(expression: Expression): String = when (expression) {
         is ColumnExpression -> describe(expression)
         is LiteralExpression -> literalText(expression.value)
@@ -2320,16 +1818,8 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         is Value.NullValue -> "NULL"
     }
 
-    /** Runs [select] within [txn] and hands the result straight back to whichever [Evaluator] asked for it. */
     private fun subqueryRunnerFor(txn: Long): SubqueryRunner = SubqueryRunner { select, outer -> runSelect(select, txn, outer) }
 
-    /**
-     * Dispatches [query] to the runner matching its concrete shape, mirroring
-     * [kestrel.engine.SelectRunner.runQuery] 1:1: a plain SELECT runs directly, a
-     * UNION/INTERSECT/EXCEPT chain combines two independently-run sides, and a WITH/WITH RECURSIVE
-     * query first materializes its common table expressions (visible only for the duration of this
-     * call, via [activeCtes]) before running its body.
-     */
     private fun runQuery(query: QueryStatement, txn: Long, outer: ColumnResolver?): SelectResult = when (query) {
         is SelectStatement -> runSelect(query, txn, outer)
         is SetOperationStatement -> runSetOperation(query, txn, outer)
@@ -2345,15 +1835,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         SetOperator.ExceptAll -> "EXCEPT ALL"
     }
 
-    /**
-     * Deliberately mirrors [kestrel.engine.SelectRunner]'s own `runSetOperation`: both sides run
-     * independently (each may itself be a nested set operation, WITH query, or plain SELECT), then
-     * combined by multiset/set semantics (UNION/INTERSECT/EXCEPT dedupe via `List<Value>` structural
-     * equality, the `ALL` variants preserve duplicate counts through [multisetFilter]), with ORDER
-     * BY/LIMIT applying only to the combined result - never to either side individually, which is
-     * why [kestrel.sql.parser.Parser] never lets an inner SELECT-core in a compound query own its own
-     * ORDER BY/LIMIT.
-     */
     private fun runSetOperation(statement: SetOperationStatement, txn: Long, outer: ColumnResolver?): SelectResult {
         val left = runQuery(statement.left, txn, outer)
         val right = runQuery(statement.right, txn, outer)
@@ -2399,24 +1880,9 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return SelectResult(left.columns, rows)
     }
 
-    /**
-     * Mirrors [kestrel.engine.SelectRunner]'s own `declaredSetOperationCollation` 1:1 (separate
-     * copy, historical reasons like the rest of this class): the declared `COLLATE` of a set
-     * operation's combined output column, traced back to a real table column in [statement]'s LEFT
-     * branch only, resolving only for a plain `SELECT ... FROM realTable [JOIN realTable ...]` with
-     * no CTE, view, or derived table anywhere in its FROM clause. Everything else - an expression,
-     * a nested set operation, a subquery source - reports no declared collation, same as before this
-     * function existed.
-     */
     private fun declaredSetOperationCollation(statement: SetOperationStatement, columns: List<String>): (ColumnExpression) -> Collation? =
         (statement.left as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
 
-    /**
-     * Mirrors [kestrel.engine.SelectRunner]'s own `declaredCollationForSelectOutput` 1:1 (separate
-     * copy, historical reasons like the rest of this class): factored out of
-     * [declaredSetOperationCollation] so [declaredRecursiveCteCollation] can apply the identical
-     * "plain SELECT over real tables" resolution to a recursive CTE's own anchor (base) term.
-     */
     private fun declaredCollationForSelectOutput(select: SelectStatement, columns: List<String>): (ColumnExpression) -> Collation? {
         val items = listOf(select.from) + select.joins.map { it.from }
         val sources = items.map { item ->
@@ -2449,7 +1915,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Mirrors [kestrel.engine.SelectRunner]'s own `declaredRecursiveCteCollation` 1:1 (separate copy, historical reasons like the rest of this class). */
     private fun declaredRecursiveCteCollation(base: QueryStatement, columns: List<String>): (ColumnExpression) -> Collation? =
         (base as? SelectStatement)?.let { declaredCollationForSelectOutput(it, columns) } ?: { null }
 
@@ -2491,7 +1956,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             result
         }
 
-    /** Resolves ORDER BY columns of a combined UNION/INTERSECT/EXCEPT result purely by output column name (never qualified). */
     private fun evaluateOutputRow(columns: List<String>, expression: Expression, row: List<Value>, txn: Long): Value {
         val resolver = ColumnResolver { column ->
             if (column.qualifier != null) throw DiskExecutorException("no such column: ${column.qualifier}.${column.name}")
@@ -2502,12 +1966,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return Evaluator(resolver, subqueryRunnerFor(txn)).evaluate(expression)
     }
 
-    /**
-     * Pushes every CTE of [query] onto [activeCtes] (in definition order, so a later CTE may
-     * reference an earlier one, mirroring [kestrel.engine.SelectRunner.runWith]), runs [query]'s
-     * body, then pops them back off - a CTE is scoped to the single query that defines it, unlike a
-     * VIEW, which lives in the catalog.
-     */
     private fun runWith(query: WithQuery, txn: Long, outer: ColumnResolver?): SelectResult {
         var pushed = 0
         try {
@@ -2521,14 +1979,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Materializes one CTE's rows. A non-recursive CTE just runs its query once. A recursive one
-     * (`WITH RECURSIVE name AS (base UNION [ALL] recursiveTerm)`, split by [splitRecursiveCte])
-     * repeatedly re-runs [RecursiveCtePlan.recursiveTerm] with [CteScope.rows] set to only the
-     * *previous iteration's new rows* (the standard fixed-point working-set semantics, not the
-     * whole accumulated set - mirrors [kestrel.engine.SelectRunner.buildCteScope] exactly, including
-     * the [MAX_RECURSION_ITERATIONS] safety cap against a query that never reaches a fixed point).
-     */
     private fun buildCteScope(recursive: Boolean, cte: CommonTableExpression, txn: Long): CteScope {
         val recursivePlan = if (recursive) splitRecursiveCte(cte) else null
         if (recursivePlan == null) {
@@ -2575,13 +2025,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
 
     private data class RecursiveCtePlan(val base: QueryStatement, val operator: SetOperator, val recursiveTerm: QueryStatement)
 
-    /**
-     * Recognizes `base UNION [ALL] recursiveTerm` where exactly one side names [cte] in its own
-     * FROM/JOIN - structurally, on the AST, without running anything - mirroring
-     * [kestrel.engine.SelectRunner.splitRecursiveCte] 1:1. Both sides referencing it, or neither,
-     * are rejected/treated as a plain (non-recursive) compound respectively, exactly like the
-     * in-memory engine.
-     */
     private fun splitRecursiveCte(cte: CommonTableExpression): RecursiveCtePlan? {
         val query = cte.query
         if (query !is SetOperationStatement) return null
@@ -2620,12 +2063,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return derivedSchema(cte.name, result, labels)
     }
 
-    /**
-     * A synthetic schema for a CTE's materialized rows: same idea as
-     * [kestrel.engine.SelectRunner.derivedSchema] - each column's type is inferred from the first
-     * non-NULL value seen in it (defaulting to TEXT when every row is NULL there), since a CTE has
-     * no backing [TableSchema] of its own to borrow one from.
-     */
     private fun derivedSchema(name: String, result: SelectResult, labels: List<String> = result.columns): TableSchema {
         val columns = labels.mapIndexed { index, columnName ->
             val type = result.rows.asSequence().map { it[index] }.firstOrNull { !it.isNull }?.type ?: ColumnType.Text
@@ -2636,7 +2073,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
 
     private class CteScope(val name: String, val schema: TableSchema, var rows: List<List<Value>>)
 
-    /** One FROM/JOIN source's row supply: either a real disk table or a CTE's already-materialized rows. */
     private sealed interface DiskFromSource {
         val schema: TableSchema
         fun scan(txn: Long): List<List<Value>>
@@ -2651,22 +2087,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         override fun scan(txn: Long): List<List<Value>> = rows
     }
 
-    /**
-     * Resolves one FROM/JOIN [name] to its row supply: an active CTE shadows a same-named real
-     * table or view (checked innermost-first via [MutableList.lastOrNull], exactly like
-     * [kestrel.engine.SelectRunner.resolveNamedSource]'s own CTE lookup), then a temp table, then a
-     * real disk table, and only then a view - materialized fresh by running its defining query
-     * inside the same [txn], with [expandingViews] guarding against a view (directly or
-     * transitively) referencing itself, mirroring [kestrel.engine.SelectRunner.resolveNamedSource]
-     * exactly. A temp table's current rows are captured into a [CteRowSource] snapshot exactly like
-     * a CTE's or view's - a plain SELECT never mutates its own FROM source mid-query, so this is
-     * exactly as fresh as scanning a live [DiskTable] would be, and it is what gives a temp table
-     * full JOIN/subquery/aggregate participation for free instead of needing its own parallel query
-     * pipeline. A name that is neither falls through to [DiskCatalog.table], solely for its
-     * "no such table" [DiskCatalogException] - already confirmed absent from
-     * [DiskCatalog.temporaryTableOrNull]/[DiskCatalog.tableOrNull]/[DiskCatalog.viewOrNull], so this
-     * always throws, preserving the exact exception type callers relied on before views existed.
-     */
     private fun resolveFromSource(name: String, txn: Long): DiskFromSource {
         activeCtes.lastOrNull { it.name.equals(name, ignoreCase = true) }?.let { return CteRowSource(it.schema, it.rows) }
         catalog.temporaryTableOrNull(name)?.let { return CteRowSource(it.schema, it.rows.map { row -> row.values }) }
@@ -2684,17 +2104,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Resolves one FROM/JOIN [item] to its row supply, mirroring
-     * [kestrel.engine.SelectRunner.resolveSource]/`buildSources`: a [TableSource] falls through to
-     * [resolveFromSource] by name (CTE/table/view, unchanged); a non-LATERAL [SubquerySource] (a
-     * derived table) runs its query eagerly, right here, inside the same [txn] - it cannot correlate
-     * to anything, so its rows are fixed for the whole statement, exactly like a materialized view. A
-     * LATERAL [SubquerySource] is different: its rows depend on whichever row of an earlier FROM/JOIN
-     * source it correlates with, which does not exist yet at this point - only its column *names* are
-     * needed here (via [lateralSchema], computed structurally from the AST without running anything)
-     * for offset bookkeeping; its real rows are produced later, per left row, in [executeLateralJoin].
-     */
     private fun resolveFromItem(item: FromItem, txn: Long): DiskFromSource = when (item) {
         is TableSource -> resolveFromSource(item.name, txn)
         is SubquerySource ->
@@ -2712,11 +2121,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return TableSchema(item.alias, columns)
     }
 
-    /**
-     * The output column names of [query], derived purely from its AST (no execution, no catalog row
-     * data) - needed to give a LATERAL derived table a stable schema before any row of the source it
-     * correlates with is known. Mirrors [kestrel.engine.SelectRunner.structuralColumnNames] 1:1.
-     */
     private fun structuralColumnNames(query: QueryStatement, localCtes: Map<String, List<String>> = emptyMap()): List<String> =
         when (query) {
             is SelectStatement -> when (val projection = query.projection) {
@@ -2749,15 +2153,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             is SubquerySource -> structuralColumnNames(item.select, localCtes)
         }
 
-    /**
-     * Runs [statement] against the disk backend inside the already-open [txn]. [outer] is
-     * non-null exactly when this call is itself a scalar/EXISTS/IN subquery nested inside another
-     * statement's expression, reached through [Evaluator]'s [SubqueryRunner] hook - it lets a
-     * column [statement]'s own FROM/JOIN sources cannot resolve fall back to the row of whichever
-     * statement contains it, mirroring [kestrel.engine.SelectRunner.run]'s own `outer` parameter.
-     * A subquery therefore runs inside the same disk transaction as its containing statement
-     * rather than opening (and committing/aborting) one of its own.
-     */
     private fun runSelect(statement: SelectStatement, txn: Long, outer: ColumnResolver?): SelectResult {
         val fromItems = listOf(statement.from) + statement.joins.map { it.from }
         val fromSources = fromItems.map { item -> resolveFromItem(item, txn) }
@@ -2848,13 +2243,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return SelectResult(columns, resultRows)
     }
 
-    /**
-     * `ORDER BY` may name a `SELECT`-list alias instead of repeating its expression (e.g.
-     * `SELECT SUM(amount) AS total ... ORDER BY total`) - resolved here, once, before either
-     * [GroupAggregation] or [sortCombinedRows] ever sees the order keys, mirroring
-     * [kestrel.engine.SelectRunner]'s own `resolveOrderAlias`. A qualified column
-     * (`ORDER BY t.total`) can never be an alias reference, so it is left untouched.
-     */
     private fun resolvedOrderKeys(statement: SelectStatement): List<OrderKey> =
         statement.orderBy?.keys.orEmpty().map { key -> OrderKey(resolveOrderAlias(statement.projection, key.expression), key.descending, key.nullsFirst) }
 
@@ -2866,7 +2254,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return expression
     }
 
-    /** One joined table's schema plus the offset of its first column within a combined `List<Value>` row. */
     private class JoinSource(val alias: String, val schema: TableSchema, val offset: Int)
 
     private fun buildJoinSources(fromItems: List<FromItem>, schemas: List<TableSchema>): List<JoinSource> {
@@ -2888,17 +2275,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         is SubquerySource -> item.alias
     }
 
-    /**
-     * The candidate rows a query's FIRST source starts from: an indexed lookup narrowed by WHERE
-     * via [candidateRows] when there is no JOIN and the source is a real disk table (preserving the
-     * same pushdown a plain single-table SELECT already gets), or a full scan otherwise - mirroring
-     * [kestrel.engine.SelectRunner]'s own choice to fall back to a full scan for the driving table
-     * as soon as more than one source is involved, since WHERE may combine columns from sources
-     * that are not open yet at this point in the plan. A CTE-backed source has no index to push
-     * down into regardless of JOIN, so it always scans its already-materialized rows; either way
-     * [statement.where] is re-applied in full immediately after by the caller, so skipping pushdown
-     * here only costs performance, never correctness.
-     */
     private fun initialRows(statement: SelectStatement, txn: Long, item: FromItem, fromSource: DiskFromSource): List<List<Value>> =
         if (statement.joins.isEmpty() && fromSource is DiskTableSource) {
             candidateRows(fromSource.table, txn, statement.where, (item as TableSource).alias).map { it.second.values }
@@ -2906,17 +2282,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             fromSource.scan(txn)
         }
 
-    /**
-     * Nested-loop join: for every row already combined from earlier sources, scans the whole of
-     * [rightRows] evaluating [JoinClause.on] against each pairing. A LEFT/FULL JOIN row left
-     * unmatched still contributes one row, padded with NULLs for [rightSource]'s columns; a RIGHT/
-     * FULL JOIN additionally emits every [rightRows] entry that never matched any [left] row, padded
-     * with NULLs for everything [rightSource.offset] counts as coming before it. Deliberately no
-     * hash-join optimization for an equality condition (unlike [kestrel.engine.SelectRunner]'s
-     * `hashJoinKeys`) - a documented scope cut: this JOIN exists to be correct first, in a solo
-     * session without peer review, and every disk-backed table already pays a full heap scan for
-     * any predicate an index cannot serve, so nested loop is not a new order-of-magnitude cost here.
-     */
     private fun applyJoin(
         join: JoinClause,
         left: List<List<Value>>,
@@ -2953,14 +2318,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
 
     private fun lateralSelectOf(item: FromItem): QueryStatement? = (item as? SubquerySource)?.takeIf { it.lateral }?.select
 
-    /**
-     * Unlike every other join, a LATERAL derived table has no fixed row set: it is re-evaluated
-     * once per row already accumulated on the left, correlated to that row via [lateralOuterResolver]
-     * exactly like a correlated subquery in WHERE/SELECT (same [SubqueryRunner]/[Evaluator] plumbing,
-     * just invoked from FROM instead) - mirrors [kestrel.engine.SelectRunner.executeLateralJoin] 1:1.
-     * Hash-joining is meaningless here (there is no static right-hand row set to build buckets from),
-     * so this is always a nested loop, matching how real engines execute LATERAL.
-     */
     private fun executeLateralJoin(
         join: JoinClause,
         left: List<List<Value>>,
@@ -2990,12 +2347,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return result
     }
 
-    /**
-     * Resolves a column against [sourcesSoFar] - everything to the left of a LATERAL subquery in the
-     * FROM clause - and nothing else: a name that does not resolve there means the expression names a
-     * source not joined yet (or the LATERAL item itself), which SQL forbids, reported with a clear
-     * LATERAL-specific message rather than the generic "no such column".
-     */
     private fun lateralOuterResolver(sourcesSoFar: List<JoinSource>, leftRow: List<Value>): ColumnResolver = object : ColumnResolver {
         override fun resolve(expression: ColumnExpression): Value =
             resolveIndexOrNull(sourcesSoFar, expression)?.let { leftRow[it] }
@@ -3026,7 +2377,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         resolveIndexOrNull(sources, expression)
             ?: throw DiskExecutorException("no such column: ${expression.name}")
 
-    /** [expression]'s declared `COLLATE` from whichever [sources] entry it resolves against - mirrors [resolveIndexOrNull]'s own matching, `null` on no match or an ambiguous one. */
     private fun declaredCollationOrNull(sources: List<JoinSource>, expression: ColumnExpression): Collation? {
         val qualifier = expression.qualifier
         val matches = mutableListOf<Collation>()
@@ -3038,14 +2388,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return matches.singleOrNull()
     }
 
-    /**
-     * Resolves [expression]'s columns against [sources] first, falling back to [outer] (the
-     * enclosing statement's row, when this call is itself part of a correlated subquery) exactly
-     * once a name cannot be found locally - mirroring [kestrel.engine.SelectRunner]'s own
-     * `rowResolver`. The resulting [Evaluator] carries [subqueries] so any [ScalarSubqueryExpression]/
-     * [ExistsExpression]/[InSubqueryExpression] nested inside [expression] can itself run, correlated
-     * back to this very row through that same resolver.
-     */
     private fun evaluateCombinedRow(
         sources: List<JoinSource>,
         outer: ColumnResolver?,
@@ -3093,13 +2435,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return keyed.sortedWith(compareBy(comparator) { it.second }).map { it.first }
     }
 
-    /**
-     * When [windowExpressions] is non-empty, [row] may carry extra trailing values appended to
-     * [combined][runSelect] (one per entry, right after the real columns) - rewrites any
-     * [WindowExpression] node in [expression] into a [LiteralExpression] reading straight from
-     * that trailing slot before [evaluateCombinedRow] ever sees it, mirroring
-     * [kestrel.engine.SelectRunner]'s own `evaluateRow`/`substituteWindowValues`.
-     */
     private fun evaluateWindowAware(
         sources: List<JoinSource>,
         outer: ColumnResolver?,
@@ -3150,9 +2485,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         baseColumnCount: Int
     ): Pair<List<String>, List<List<Value>>> =
         when (projection) {
-            // rows may carry trailing window-function values appended in runSelect (only reachable
-            // here if ORDER BY names one directly, since SELECT * cannot spell an OVER clause
-            // itself) - trimmed back off so the row width matches the schema's own columns.
             StarProjection -> sources.flatMap { it.schema.columnNames } to rows.map { it.subList(0, baseColumnCount) }
             is ExpressionProjection -> {
                 val columns = projection.items.mapIndexed { index, item -> columnLabel(item, index) }
@@ -3173,15 +2505,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             else -> "column${index + 1}"
         }
 
-    /**
-     * Deliberately duplicated from [kestrel.engine.SelectRunner]'s own `containsAggregate`/
-     * `requireGrouped` (same reasoning as [coerceForColumn]): this executor must stay free-standing
-     * from the in-memory engine's own validation, so a change to one can never silently affect the
-     * other. `else -> false` covers every [Expression] variant this executor gives no
-     * aggregation-aware meaning to (a literal, a window function - rejected whenever it is actually
-     * evaluated, by [Evaluator] itself - or a subquery, whose own aggregates belong to that nested
-     * [SelectStatement]'s independent [runSelect] call, never to this one).
-     */
     private fun containsAggregate(projection: Projection): Boolean = when (projection) {
         StarProjection -> false
         is ExpressionProjection -> projection.items.any { containsAggregate(it.expression) }
@@ -3206,7 +2529,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         else -> false
     }
 
-    /** See [kestrel.engine.SelectRunner]'s `Plan.validateDistinctOn` for why both checks exist. */
     private fun validateDistinctOn(statement: SelectStatement, orderKeys: List<OrderKey>, aggregated: Boolean) {
         if (aggregated) {
             throw DiskExecutorException("DISTINCT ON cannot be combined with GROUP BY or aggregate functions")
@@ -3275,7 +2597,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Window functions are only legal in the SELECT list and ORDER BY - never WHERE/GROUP BY/HAVING/ON. */
     private fun containsWindowFunction(expression: Expression): Boolean = when (expression) {
         is WindowExpression -> true
         is BinaryExpression -> containsWindowFunction(expression.left) || containsWindowFunction(expression.right)
@@ -3299,7 +2620,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         if (containsWindowFunction(expression)) throw DiskExecutorException("window functions are not allowed in $clause")
     }
 
-    /** Every distinct window-function call reachable from [expression] (nested inside arithmetic, CASE, ...). */
     private fun collectWindowExpressions(expression: Expression): List<WindowExpression> = when (expression) {
         is WindowExpression -> listOf(expression)
         is BinaryExpression -> collectWindowExpressions(expression.left) + collectWindowExpressions(expression.right)
@@ -3319,26 +2639,12 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         else -> emptyList()
     }
 
-    /**
-     * Every distinct window-function call in the SELECT list or (post alias-resolution) ORDER BY -
-     * the only two clauses where one is allowed, mirroring [kestrel.engine.SelectRunner]'s own
-     * `windowExpressions` property.
-     */
     private fun collectWindowExpressions(projection: Projection, orderKeys: List<OrderKey>): List<WindowExpression> {
         val projectionWindows = (projection as? ExpressionProjection)?.items?.flatMap { collectWindowExpressions(it.expression) } ?: emptyList()
         val orderWindows = orderKeys.flatMap { collectWindowExpressions(it.expression) }
         return (projectionWindows + orderWindows).distinct()
     }
 
-    /**
-     * Window functions are rejected outright alongside GROUP BY/aggregates ([aggregated]) -
-     * windowing over an already-grouped result is valid SQL but requires running
-     * [GroupAggregation] first and then a second pass over its output rows, which this executor
-     * does not implement (same scope cut as [kestrel.engine.SelectRunner]). RANK/DENSE_RANK need an
-     * explicit tie-break (unlike ROW_NUMBER, which falls back to partition arrival order when OVER
-     * has no ORDER BY) and nesting one window function inside another's argument/PARTITION BY/
-     * ORDER BY/frame offset is invalid SQL in the first place.
-     */
     private fun validateWindows(windowExpressions: List<WindowExpression>, aggregated: Boolean) {
         if (aggregated) {
             throw DiskExecutorException("window functions cannot be combined with GROUP BY or aggregate functions in the same query")
@@ -3453,12 +2759,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * With no ORDER BY in OVER, the whole partition is one frame (every row gets the same value).
-     * With an ORDER BY, the default SQL frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
-     * ROW`: a running aggregate where rows tied on the order key (a "peer group") share one value -
-     * mirroring [kestrel.engine.SelectRunner]'s own `assignAggregateWindowValues` exactly.
-     */
     private fun assignAggregateWindowValues(
         window: WindowExpression,
         ordered: List<Int>,
@@ -3480,11 +2780,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * The frame's base [frameRange], narrowed by its [FrameExclude] mode (default
-     * [FrameExclude.NoOthers], which leaves the range untouched) - mirrors
-     * [kestrel.engine.SelectRunner]'s own `frameMembers` exactly.
-     */
     private fun frameMembers(
         window: WindowExpression,
         position: Int,
@@ -3510,12 +2805,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Resolves an explicit `ROWS|RANGE BETWEEN ... AND ...` [WindowFrame] to a range of positions
-     * into [ordered] for the row at [position] - clamped to the partition's edges rather than
-     * erroring, exactly like the implicit default frame already does. Mirrors
-     * [kestrel.engine.SelectRunner]'s own `frameRange` exactly.
-     */
     private fun frameRange(
         window: WindowExpression,
         position: Int,
@@ -3575,11 +2864,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return amount.toInt()
     }
 
-    /**
-     * `GROUPS BETWEEN <bound> AND <bound>` counts whole peer groups rather than physical rows
-     * ([FrameUnit.Rows]) or distance in a value ([FrameUnit.Range]) - mirrors
-     * [kestrel.engine.SelectRunner]'s own `groupsFrameRange` exactly.
-     */
     private fun groupsFrameRange(
         frame: WindowFrame,
         orderBy: List<OrderKey>,
@@ -3610,11 +2894,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         FrameBoundType.Following -> currentGroup + resolveIntegerFrameOffset(bound, row, "GROUPS", evaluateRow)
     }
 
-    /**
-     * `CURRENT ROW` in a RANGE frame means the boundary of the current row's peer group (every row
-     * tied with it on the OVER's ORDER BY, or the whole partition with no ORDER BY) - mirrors
-     * [kestrel.engine.SelectRunner]'s own `peerBoundary` exactly.
-     */
     private fun peerBoundary(
         orderBy: List<OrderKey>,
         position: Int,
@@ -3635,12 +2914,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return boundary
     }
 
-    /**
-     * `<value> PRECEDING`/`<value> FOLLOWING` in a RANGE frame measure distance in the value of a
-     * single numeric or DATE ORDER BY column rather than a row count - binary search works because
-     * [ordered] is already sorted on this column. Mirrors [kestrel.engine.SelectRunner]'s own
-     * `rangeBoundary` exactly.
-     */
     private fun rangeBoundary(
         bound: FrameBound,
         orderBy: List<OrderKey>,
@@ -3721,11 +2994,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return offset
     }
 
-    /**
-     * Splits [ordered] into contiguous "peer group" ranges of rows tied on the order key - or one
-     * range spanning the whole partition when there is no ORDER BY. Mirrors
-     * [kestrel.engine.SelectRunner]'s own `peerGroupRanges` exactly.
-     */
     private fun peerGroupRanges(
         orderBy: List<OrderKey>,
         ordered: List<Int>,
@@ -3748,13 +3016,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
     private fun aggregateWindowValue(window: WindowExpression, rows: List<List<Value>>, evaluateRow: (Expression, List<Value>) -> Value): Value =
         AggregateFunctions.compute(window.name, window.argument, window.star, rows, evaluateRow)
 
-    /**
-     * LAG (direction -1) / LEAD (direction +1): reads [WindowExpression.argument] from the row
-     * [WindowExpression.offset] positions before/after the current one in [ordered] (default 1).
-     * Past either edge of the partition, falls back to [WindowExpression.defaultValue] (evaluated
-     * against the *current* row) or NULL. Mirrors [kestrel.engine.SelectRunner]'s own
-     * `assignOffsetWindowValues` exactly.
-     */
     private fun assignOffsetWindowValues(
         window: WindowExpression,
         ordered: List<Int>,
@@ -3782,11 +3043,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return amount.toInt()
     }
 
-    /**
-     * NTILE(n): splits the partition into `n` buckets as evenly as possible - when the partition
-     * size does not divide evenly, the first `size % n` buckets get one extra row. Mirrors
-     * [kestrel.engine.SelectRunner]'s own `assignNtileWindowValues` exactly.
-     */
     private fun assignNtileWindowValues(
         window: WindowExpression,
         ordered: List<Int>,
@@ -3810,14 +3066,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Candidate (rid, row) pairs for [where] over [table]: an indexed
-     * point/range/secondary lookup via [DiskIndexAccessPlanner] when the
-     * predicate allows it, a full [DiskTable.scan] otherwise. Callers must
-     * still evaluate the full [where] against whatever this returns - the
-     * chosen plan only narrows candidates, it never claims to satisfy every
-     * conjunct of the predicate (see [DiskAccessPlan]'s own documentation).
-     */
     private fun candidateRows(table: DiskTable, txn: Long, where: Expression?, alias: String?): List<Pair<RecordId, Row>> =
         when (val plan = accessPlanner.plan(table.schema, table.secondaryIndexes, where, alias)) {
             DiskAccessPlan.FullScan -> table.scan(txn)
@@ -3843,15 +3091,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * UPDATE on a temp table's plain [Table.rows] list - ported from the same whole-batch-then-swap
-     * shape as [executeUpdateInTxn]/[kestrel.engine.Executor.executeUpdateInner]: every row is
-     * planned into [newRows] first (evaluating SET/DEFAULT/GENERATED and validating NOT NULL) before
-     * [table.rows] is ever mutated, so a CHECK/UNIQUE/PRIMARY KEY failure on any one row leaves the
-     * table completely untouched rather than half-updated - the in-memory list equivalent of
-     * [DiskTable.update]'s own per-row validate-before-write ordering, just batched like the
-     * in-memory engine does instead of row-by-row like [DiskTable].
-     */
     private fun executeTemporaryUpdate(statement: UpdateStatement, table: Table): StatementResult {
         val schema = table.schema
         val assignments = buildAssignments(schema, statement)
@@ -3902,9 +3141,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             statement.where == null ||
                 isTrue(Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueries).evaluate(statement.where))
         }
-        // Built as a whole batch first (not applied inline) for the same reason as executeInsert:
-        // a self-referencing FK must see every row's final value for this statement, not just
-        // rows already committed to the table.
         val planned = matches.map { (rid, row) ->
             val evaluator = Evaluator(composeResolver(rowResolver(schema, row), triggerContext), subqueries, this)
             val values = row.values.toMutableList()
@@ -3920,18 +3156,11 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             Triple(rid, row, Row(values))
         }
         val newRows = planned.map { it.third }
-        // Fires before any constraint below is checked, same as executeInsert's BEFORE trigger - a
-        // BEFORE UPDATE trigger's body can reject the whole statement before this executor's own
-        // validation ever runs.
         fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Update, planned.map { it.second to it.third }, txn)
         for ((_, _, newRow) in planned) {
             DiskForeignKeyEnforcer.validateRow(catalog, txn, schema, newRow.values, uncommittedSiblings = newRows)
             enforceChecks(schema, newRow, subqueries)
         }
-        // Every enforced-unique key group (the PRIMARY KEY, single-column or composite, plus each
-        // UNIQUE constraint) is a valid FOREIGN KEY target, so each group needs its own
-        // cascade/RESTRICT pass on UPDATE - not just the PRIMARY KEY. Run before the parent's own
-        // rows are rewritten below, mirroring kestrel.engine.Executor.executeUpdate's own order.
         for (group in schema.enforcedUniqueKeyGroups()) {
             val columnIndices = group.map { schema.columnIndex(it)!! }
             val changedPairs = planned.map { (_, oldRow, newRow) ->
@@ -3972,7 +3201,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return DeleteResult(matches.size, returning)
     }
 
-    /** DELETE on a temp table's plain [Table.rows] list - ported from the same shape as [executeDeleteInTxn]/[kestrel.engine.Executor.executeDeleteInner], minus trigger firing/[DiskForeignKeyEnforcer] cascade (both rejected outright at `CREATE TEMP TABLE` time). */
     private fun executeTemporaryDelete(statement: DeleteStatement, table: Table): StatementResult {
         val schema = table.schema
         return withStatementTransaction { txn ->
@@ -4000,19 +3228,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /**
-     * Ported 1:1 from [kestrel.engine.Executor.executeMergeInner] - see that method's own doc for
-     * why [MergeStatement.onCondition] is matched against [originalTargetRows] (a snapshot of the
-     * target table taken once, before any mutation) rather than the live table, and for the "MERGE
-     * command cannot affect a target row a second time" guarantee. The one difference: "already
-     * affected" and "this pair's target row" are tracked by [RecordId] here rather than [Row]
-     * object identity (`===`) - a disk row is decoded fresh from its page on every read, so no two
-     * reads of "the same" row are ever the same object, but each row in [originalTargetRows] keeps
-     * the one [RecordId] it had at snapshot time for the rest of this statement (this MERGE is the
-     * only writer touching [table] during its own execution, and every [RecordId] this MERGE itself
-     * mutates is used at most once, guarded by [affectedRids] below, so it is never looked up again
-     * afterward under a since-changed identity).
-     */
     private fun executeMergeInner(statement: MergeStatement, table: DiskTable, schema: TableSchema, txn: Long): StatementResult {
         val targetLabel = statement.targetAlias ?: statement.targetTable
         val (sourceSchema, sourceRows) = resolveMergeSource(statement.source, txn)
@@ -4074,7 +3289,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return MergeResult(inserted, updated, deleted, returning)
     }
 
-    /** Ported 1:1 from [kestrel.engine.Executor.evaluateMergeReturning] - see that method's own doc. */
     private fun evaluateMergeReturning(
         schema: TableSchema,
         actionedRows: List<Pair<Row, String>>,
@@ -4139,7 +3353,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return updatedRow
     }
 
-    /** Returns [targetRow] itself - the pre-deletion image, matching [applyMergeDelete]'s in-memory counterpart. */
     private fun applyMergeDelete(schema: TableSchema, table: DiskTable, txn: Long, targetRid: RecordId, targetRow: Row): Row {
         fireRowTriggers(schema, TriggerTiming.Before, TriggerEvent.Delete, listOf(targetRow to null), txn)
         DiskForeignKeyEnforcer.cascadeDelete(catalog, txn, schema.name, listOf(targetRow))
@@ -4184,18 +3397,11 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         return row
     }
 
-    /** A snapshot (schema, rows) for a MERGE `USING` source - ported 1:1 from [kestrel.engine.SelectRunner.resolveMergeSource], just via [resolveFromItem] rather than a separate in-memory `resolveSource`. */
     private fun resolveMergeSource(item: FromItem, txn: Long): Pair<TableSchema, List<Row>> {
         val source = resolveFromItem(item, txn)
         return source.schema to source.scan(txn).map { Row(it) }
     }
 
-    /**
-     * Resolves a MERGE `ON`/`WHEN MATCHED` column reference against whichever of [targetRow]/
-     * [sourceRow] its qualifier names ([targetLabel]/[sourceLabel] - alias if given, bare name
-     * otherwise); an unqualified reference must exist on exactly one side. Ported 1:1 from
-     * [kestrel.engine.Executor.mergeResolver].
-     */
     private fun mergeResolver(
         targetSchema: TableSchema,
         targetLabel: String,
@@ -4242,7 +3448,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** A `WHEN NOT MATCHED` clause has no target row to read - a qualifier naming the target throws rather than silently resolving to nothing. Ported 1:1 from [kestrel.engine.Executor.notMatchedResolver]. */
     private fun notMatchedResolver(
         sourceSchema: TableSchema,
         sourceLabel: String,
@@ -4264,7 +3469,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         override fun declaredCollation(expression: ColumnExpression): Collation? = sourceSchema.column(expression.name)?.collation
     }
 
-    /** Upfront validation for every clause of a MERGE statement, run even when the source produces zero rows. Ported 1:1 from [kestrel.engine.Executor.checkMergeColumns]. */
     private fun checkMergeColumns(
         statement: MergeStatement,
         targetSchema: TableSchema,
@@ -4302,7 +3506,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         }
     }
 
-    /** Fifth near-parallel recursive [Expression] walker in this file (alongside [requireNoSubquery]/[checkColumns]/[checkReturningColumns]/[validateTriggerRowReferences]) - same deliberate non-abstraction as [kestrel.engine.Executor.checkMergeExpressionColumns], since this one needs two relations plus ambiguity detection none of the others do. */
     private fun checkMergeExpressionColumns(
         expression: Expression,
         targetSchema: TableSchema,
@@ -4345,7 +3548,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
             is InSubqueryExpression -> recurse(expression.operand)
             is CastExpression -> recurse(expression.operand)
             is CollateExpression -> recurse(expression.operand)
-            // Structurally harmless here too - see checkReturningColumns's own MERGE_ACTION() branch.
             is NextValueExpression, is CurrentValueExpression, is MergeActionExpression, is ParameterExpression -> Unit
         }
     }
@@ -4380,7 +3582,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         if (!inTarget && !inSource) throw DiskExecutorException("no such column: ${expression.name}")
     }
 
-    /** Commits [txnId] if [block] returns normally, aborts it (then rethrows) if [block] throws. */
     private inline fun <T> runInTransaction(txnId: Long, block: () -> T): T {
         val result = try {
             block()
@@ -4425,7 +3626,6 @@ class DiskExecutor(private val catalog: DiskCatalog) : SequenceAccess {
         private const val MAX_RECURSION_ITERATIONS = 10_000
         private const val MAX_TRIGGER_DEPTH = 100
 
-        /** Kinds whose result actually depends on which rows fall inside the frame. */
         private val FRAME_CAPABLE_KINDS = setOf(WindowFunctionKind.Aggregate, WindowFunctionKind.FirstValue, WindowFunctionKind.LastValue)
     }
 }

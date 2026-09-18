@@ -14,12 +14,6 @@ import kestrel.storage.Value
 
 class DiskTableException(message: String) : KestrelException(message)
 
-/**
- * A live secondary index attached to a [DiskTable]: the B+Tree plus which column(s) it is keyed
- * on - [columnNames]/[columnIndices] have more than one entry for a composite (multi-column)
- * index, in the order the index was declared. [unique] mirrors a `CREATE UNIQUE INDEX` - see
- * [DiskTable.rejectDuplicateUniqueSecondary].
- */
 class SecondaryIndexHandle(
     val name: String,
     val columnNames: List<String>,
@@ -28,35 +22,6 @@ class SecondaryIndexHandle(
     val unique: Boolean = false
 )
 
-/**
- * The disk-resident counterpart of [kestrel.storage.Table]: a schema-aware
- * row store backed by a [TransactionalHeap] for the row bodies, an optional
- * unique [TransactionalIndex] on the primary key, and any number of
- * non-unique secondary [TransactionalIndex]es - all driven by the same
- * [kestrel.storage.Value]/[TableSchema] types the in-memory SQL engine uses,
- * so this is the storage backend a future Catalog/Executor integration would
- * sit on top of, not a parallel data model needing translation.
- *
- * [kestrel.store.btree.BPlusTree] only ever stores one value per key, so a
- * non-unique secondary index cannot key its B+Tree entries by the indexed
- * value(s) alone: two rows with the same value(s) would silently overwrite
- * each other. Every secondary index instead keys on `encodeKey(values) ++ rid`
- * (one or more columns, via [kestrel.store.codec.KeyCodec.encodeKey] - the
- * same order-preserving multi-value encoding a composite PRIMARY KEY uses), a
- * composite that is unique per row (see [compositeKey]); an equality lookup
- * becomes a range scan bounded by that encoding's smallest and largest possible
- * suffix (see [equalRangeFor]). This is the standard way an index built on a
- * unique-key structure supports duplicates (e.g. how InnoDB appends the
- * primary key to secondary index entries).
- *
- * Every mutating operation may change a primary or secondary index's root
- * page (a B+Tree split or merge) purely in the caller process's memory - see
- * [kestrel.store.engine.TransactionalIndex]'s own documentation. [onRootsChanged]
- * is how a [DiskTable] tells its owning [DiskCatalog] to persist that new
- * root into the directory row for this table, in the same transaction as the
- * data write, so a fresh process reopening the catalog later sees the
- * correct, committed root rather than the one recorded at table-creation time.
- */
 class DiskTable internal constructor(
     schema: TableSchema,
     private val heap: TransactionalHeap,
@@ -64,26 +29,12 @@ class DiskTable internal constructor(
     private val secondaryIndexHandles: MutableList<SecondaryIndexHandle>,
     private val onRootsChanged: (txnId: Long) -> Unit
 ) {
-    /**
-     * Mutable so `ALTER TABLE` (see [replaceSchemaMetadata]/[renameColumnAndIndexes]/[rewriteRows])
-     * can swap in a new [TableSchema] after CREATE TABLE - private setter because every mutation
-     * needs to happen alongside bookkeeping (secondary index column realignment, directory
-     * persistence) that only this class and [DiskCatalog] (its sole caller for these methods,
-     * same module) know how to do correctly.
-     */
     var schema: TableSchema = schema
         private set
 
     val headerPageId: Long get() = heap.headerPageId
     val secondaryIndexes: List<SecondaryIndexHandle> get() = secondaryIndexHandles.toList()
 
-    /**
-     * Access counters, incremented by [scan]/[findByPrimaryKey]/[rangeByPrimaryKey]/
-     * [findBySecondary]. Exists so a caller (chiefly [DiskIndexAccessPlanner]-driven
-     * code and its tests) can confirm an index lookup actually happened instead of
-     * a full heap scan - correctness alone cannot distinguish the two, since both
-     * return the same rows.
-     */
     var scanCount: Int = 0; private set
     var pointLookupCount: Int = 0; private set
     var rangeScanCount: Int = 0; private set
@@ -99,33 +50,16 @@ class DiskTable internal constructor(
         handle.index.destroy(txnId)
     }
 
-    /**
-     * Frees this table's own storage - its heap and every attached index (primary and secondary) -
-     * back to the shared page free list. Called by `DROP TABLE` once the directory row itself is
-     * already gone, since nothing will ever reopen this [DiskTable] again.
-     */
     internal fun destroyStorage(txnId: Long) {
         for (handle in secondaryIndexHandles) handle.index.destroy(txnId)
         primaryIndex?.destroy(txnId)
         heap.destroy(txnId)
     }
 
-    /**
-     * Metadata-only schema swap used by `ALTER TABLE ... RENAME TO` (this table's own name/
-     * self-referencing FK) and, on an unrelated table, by `RENAME TO`/`RENAME COLUMN`/`DROP COLUMN`
-     * rewriting a FOREIGN KEY that points at the table being altered - none of these change this
-     * table's own column count or positions, so no row rewrite or index realignment is needed.
-     */
     internal fun replaceSchemaMetadata(newSchema: TableSchema) {
         schema = newSchema
     }
 
-    /**
-     * `ALTER TABLE ... RENAME COLUMN`: swaps in [newSchema] (column list already renamed by the
-     * caller) and renames [oldName] to [newName] wherever it appears in a secondary index's
-     * [SecondaryIndexHandle.columnNames] - the index's [SecondaryIndexHandle.columnIndices] stay
-     * exactly the same, since a pure rename never moves a column's position.
-     */
     internal fun renameColumnAndIndexes(newSchema: TableSchema, oldName: String, newName: String) {
         schema = newSchema
         for (i in secondaryIndexHandles.indices) {
@@ -136,20 +70,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /**
-     * `ALTER TABLE ... ADD/DROP COLUMN`: rewrites every row's stored bytes through [transform] and
-     * swaps in [newSchema] (already reflecting the added/removed column). Every surviving secondary
-     * index's [SecondaryIndexHandle.columnIndices] is recomputed fresh from [newSchema] right after
-     * the swap (mirrors [kestrel.catalog.Catalog.reindexOne] always recomputing positions from
-     * names rather than trusting a cached one) - required for DROP COLUMN, where every column after
-     * the dropped one shifts down by one position; a no-op for ADD COLUMN, which only ever appends
-     * at the end. Reuses the ordinary [update] for each row (not a hand-rolled unindex/reindex pair)
-     * so a row relocated to a new [RecordId] by a growing/shrinking body - see
-     * [kestrel.store.heap.HeapFile.update] - keeps every index entry correctly pointed at it,
-     * exactly like a normal SQL `UPDATE` already guarantees. The caller is responsible for having
-     * already dropped (via [dropSecondaryIndexByName]) any index that depends on a column being
-     * removed - a survivor's columns are always still present in [newSchema] by the time this runs.
-     */
     internal fun rewriteRows(txnId: Long, newSchema: TableSchema, transform: (Row) -> Row) {
         val existing = rawScan(txnId)
         schema = newSchema
@@ -210,18 +130,8 @@ class DiskTable internal constructor(
         return newRid
     }
 
-    /** Convenience for a single-column PRIMARY KEY; delegates to the general, composite-capable overload below. */
     fun findByPrimaryKey(txnId: Long, key: Value): Pair<RecordId, Row>? = findByPrimaryKey(txnId, listOf(key))
 
-    /**
-     * Point lookup by the table's PRIMARY KEY, whether inline-single-column or table-level
-     * composite - [keys] must be given in [TableSchema.primaryKeyColumns] order. [KeyCodec.encodeKey]
-     * concatenates each value's own order-preserving encoding, so a single-element list here
-     * produces byte-identical output to [KeyCodec.encode] on that same value, keeping this the
-     * one lookup path both PRIMARY KEY shapes share. [keys] is folded through
-     * [encodePrimaryKey] first, so a search literal on a `COLLATE NOCASE`/`RTRIM`-declared PRIMARY
-     * KEY column finds a case-/trailing-space-variant row the same way a plain `=` comparison does.
-     */
     fun findByPrimaryKey(txnId: Long, keys: List<Value>): Pair<RecordId, Row>? {
         pointLookupCount++
         val index = primaryIndex ?: throw DiskTableException("table ${schema.name} has no primary key index")
@@ -230,17 +140,6 @@ class DiskTable internal constructor(
         return rid to get(txnId, rid)
     }
 
-    /**
-     * [DiskIndexAccessPlanner] plans a range against either a single-column PRIMARY KEY ([prefix]
-     * empty, see [DiskAccessPlan.PrimaryKeyRange]'s own doc) or the LAST column of a table-level
-     * composite one, after an equality prefix on every column before it ([prefix] non-empty, see
-     * [DiskAccessPlan.CompositePrimaryKeyRange]'s own doc) - either way, [prefix] plus [lower]/
-     * [upper] always names every PRIMARY KEY column, so [encodePrimaryKey]'s own per-position
-     * collation folding ([kestrel.engine.collationFoldedUniquenessKey]) applies directly and always
-     * produces a COMPLETE, full-arity key: unlike [rangeBySecondary], no RID-suffix bracketing
-     * trick is needed here, since a PRIMARY KEY entry is a bare `encodeKey(values)` with nothing
-     * after it to disambiguate.
-     */
     fun rangeByPrimaryKey(
         txnId: Long,
         lower: Value? = null,
@@ -261,18 +160,9 @@ class DiskTable internal constructor(
         }
     }
 
-    /** Convenience for a single-column secondary index; delegates to the general, composite-capable overload below. */
     fun findBySecondary(txnId: Long, indexName: String, key: Value): List<Pair<RecordId, Row>> =
         findBySecondary(txnId, indexName, listOf(key))
 
-    /**
-     * Equality lookup on a secondary index, whether single-column or composite - [keys] must be
-     * given in [SecondaryIndexHandle.columnNames] order. A single-element list here produces a
-     * byte-identical prefix to the single-[Value] overload, keeping this the one lookup path both
-     * shapes share (mirrors [findByPrimaryKey]). [keys] is folded per-column through
-     * [equalRangeFor], so equality against a declared-collation column finds a case-/trailing-
-     * space-variant row instead of missing it.
-     */
     fun findBySecondary(txnId: Long, indexName: String, keys: List<Value>): List<Pair<RecordId, Row>> {
         secondaryLookupCount++
         val handle = secondaryIndexHandles.firstOrNull { it.name.equals(indexName, ignoreCase = true) }
@@ -284,28 +174,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /**
-     * [DiskIndexAccessPlanner] plans a range against a secondary index's column right after
-     * [prefix]'s equality run (see [kestrel.store.sql.DiskAccessPlan.SecondaryRange]'s own doc) -
-     * [prefix] is empty for a single-column index or a composite one ranged on its very first
-     * column. Unlike [rangeByPrimaryKey] (whose B+Tree entries are bare `encodeKey(values)`, no RID
-     * suffix, since a PRIMARY KEY is unique), a secondary index entry is `encodeKey(values) ++ rid`
-     * (see the class doc), so a bound naming just [lower]/[upper]'s own encoded bytes would sit
-     * strictly *before* every real entry sharing that value (any real key, being longer, sorts
-     * after its own prefix) - reusing [equalRangeFor]'s (all-zero-suffix, all-one-suffix) pair for
-     * `prefix + value` sidesteps this: the all-zero-suffix bound is a valid inclusive lower
-     * bound for "this value or greater" (it sits at or before every RID-suffixed entry of that
-     * exact value), and the all-one-suffix bound is a valid inclusive upper bound for "this value
-     * or less" (it sits at or after every RID-suffixed entry of that exact value) - swapped for the
-     * opposite (exclusive) side of each bound, so e.g. `> X` starts scanning right after the last
-     * possible entry of exactly `X`. When [prefix] is non-empty and one side has no explicit bound
-     * (e.g. `WHERE a = 5 AND b < 10`, no lower bound on `b`), that side falls back to
-     * [equalRangeFor]'s own bound for [prefix] alone, so the scan still stays within the `a = 5`
-     * group instead of running off into rows from a smaller/larger `a` - [prefix]'s own encoding is
-     * a byte-string prefix of every real entry sharing it (each value's encoding is self-delimited),
-     * so this bound is exact regardless of how many values [prefix] holds relative to the index's
-     * full column count.
-     */
     fun rangeBySecondary(
         txnId: Long,
         indexName: String,
@@ -337,17 +205,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /**
-     * When [handle] is [SecondaryIndexHandle.unique], a table with pre-existing duplicate values
-     * in that column must fail cleanly (like `CREATE UNIQUE INDEX` does in the in-memory engine)
-     * rather than silently building an index that lies about uniqueness - [seen] catches that
-     * before any B+Tree entry is written, folded through each column's declared `COLLATE` (see
-     * [collationFoldedUniquenessKey]) so e.g. two pre-existing rows `'Bob'`/`'bob'` under a
-     * `NOCASE`-declared column are caught here just like [rejectDuplicateUniqueConstraints]
-     * already catches them for a declarative `UNIQUE`. The B+Tree entry itself ([compositeKey])
-     * is ALSO folded per-column through the same declared collation, so a value inserted *after*
-     * this backfill is caught too, by [rejectDuplicateUniqueSecondary]'s own range scan.
-     */
     internal fun backfillSecondaryIndex(txnId: Long, handle: SecondaryIndexHandle) {
         val seen = if (handle.unique) HashSet<List<Value>>() else null
         for ((rid, row) in scan(txnId)) {
@@ -398,15 +255,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /**
-     * Rejects [row] if any [SecondaryIndexHandle.unique] index would end up with two rows sharing
-     * a non-null tuple of values across its column(s). Searches the index directly (like
-     * [rejectDuplicatePrimaryKey]) rather than through [findBySecondary], so this internal check
-     * never inflates [secondaryLookupCount]. [excludeRid] is the row being updated (so it does not
-     * collide with its own prior entry); `null` on insert. [equalRangeFor] folds [values] per
-     * column through its declared collation, so this range scan is collation-aware exactly like
-     * the B+Tree entries [compositeKey] wrote in the first place.
-     */
     private fun rejectDuplicateUniqueSecondary(txnId: Long, row: Row, excludeRid: RecordId?) {
         for (handle in secondaryIndexHandles) {
             if (!handle.unique) continue
@@ -420,17 +268,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /**
-     * [TableSchema.uniqueConstraints] have no backing index (unlike a `CREATE UNIQUE INDEX`), so
-     * they are checked with a full heap scan per write - the same approach [kestrel.engine.Executor]
-     * uses for the in-memory engine, and the only one that generalizes to a constraint spanning more
-     * than one column without inventing a composite-key index format. A row where any constrained
-     * column is NULL is exempt, per standard SQL (NULLs never collide with each other). Every
-     * comparison is folded through [collationFoldedUniquenessKey], so this scan - unlike
-     * [rejectDuplicateUniqueSecondary]'s B+Tree range scan - is fully collation-correct on every
-     * call, not just at index-creation time: there is no backing structure whose physical byte
-     * order would need to change to keep up.
-     */
     private fun rejectDuplicateUniqueConstraints(txnId: Long, row: Row, excludeRid: RecordId?) {
         if (schema.uniqueConstraints.isEmpty()) return
         val rows = rawScan(txnId)
@@ -449,7 +286,6 @@ class DiskTable internal constructor(
         }
     }
 
-    /** `null` when the table has no PRIMARY KEY at all; one value per [TableSchema.primaryKeyColumns] otherwise. */
     private fun primaryKeyValuesOf(row: Row): List<Value>? {
         val indices = schema.primaryKeyIndices
         if (indices.isEmpty()) return null
@@ -474,12 +310,6 @@ class DiskTable internal constructor(
         if (before != currentRoots()) onRootsChanged(txnId)
     }
 
-    /**
-     * A secondary index's B+Tree key is `encodeKey(values) ++ rid` (see the class doc) - [values]
-     * is folded per-position through [columnIndices]' own declared collation first (mirrors
-     * [encodePrimaryKey]), so a `NOCASE`/`RTRIM`-declared column's index physically groups
-     * case-/trailing-space-variant values together instead of ordering/comparing them by raw bytes.
-     */
     private fun compositeKey(columnIndices: List<Int>, values: List<Value>, rid: RecordId): ByteArray =
         ByteWriter().writeBytes(KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, columnIndices, values)))
             .writeFixedLong(rid.encode()).toByteArray()
@@ -491,21 +321,8 @@ class DiskTable internal constructor(
         return lower to upper
     }
 
-    /**
-     * [KeyCodec.encodeKey] on [values] (in [TableSchema.primaryKeyColumns] order) after folding
-     * each position through that column's own declared collation - shared by every PRIMARY KEY
-     * B+Tree operation ([indexRow]/[unindexRow]/[findByPrimaryKey]/[rejectDuplicatePrimaryKey]) so
-     * insertion and lookup always agree on what bytes a given value encodes to.
-     */
     private fun encodePrimaryKey(values: List<Value>): ByteArray =
         KeyCodec.encodeKey(collationFoldedUniquenessKey(schema, schema.primaryKeyIndices, values))
 
-    /**
-     * Smallest key ordered strictly after [bytes]. Correct for the fixed-width
-     * encodings (INTEGER, REAL, BOOLEAN): appending a byte cannot be
-     * overtaken by another same-type key, since two distinct fixed-width
-     * encodings always differ within their common, unextended length. TEXT
-     * range queries should prefer an inclusive lower bound instead.
-     */
     private fun strictlyAfter(bytes: ByteArray): ByteArray = bytes + byteArrayOf(0)
 }

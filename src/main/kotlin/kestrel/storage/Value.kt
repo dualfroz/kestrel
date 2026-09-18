@@ -29,7 +29,6 @@ enum class ColumnType {
     }
 }
 
-/** Renders a type with its DECIMAL(precision[, scale]) parameters, if any were declared. */
 fun ColumnType.displayWith(precision: Int?, scale: Int?): String = when {
     this != ColumnType.Decimal || precision == null -> displayName
     scale == null -> "$displayName($precision)"
@@ -55,12 +54,6 @@ sealed class Value {
         override val type get() = ColumnType.Boolean
     }
 
-    /**
-     * Arbitrary-precision fixed-point number. Equality and hashing compare by numeric
-     * value (via [BigDecimal.compareTo]) rather than by representation, so `1.5` and
-     * `1.50` are the same value for GROUP BY/DISTINCT/UNION dedup purposes, matching
-     * standard SQL DECIMAL semantics instead of Java's stricter [BigDecimal.equals].
-     */
     class DecimalValue(val value: BigDecimal) : Value() {
         override val type get() = ColumnType.Decimal
 

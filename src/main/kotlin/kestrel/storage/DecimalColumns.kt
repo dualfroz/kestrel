@@ -4,11 +4,6 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import kestrel.KestrelException
 
-/**
- * Shared DECIMAL(precision, scale) rules used both when a value is coerced into a
- * DECIMAL column (INSERT/UPDATE) and when it is produced by an explicit CAST. Kept as
- * a single place so both call sites agree on rounding mode and overflow behavior.
- */
 object DecimalColumns {
     const val DEFAULT_PRECISION = 18
     const val DEFAULT_SCALE = 2

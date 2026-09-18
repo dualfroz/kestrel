@@ -6,48 +6,6 @@ import kestrel.store.page.Page
 
 class RecoveryException(message: String) : KestrelException(message)
 
-/**
- * ARIES-lite recovery over a [WriteAheadLog] of whole-page physical images.
- *
- * Because every [LogRecord.Update] carries the exact after-image a page had
- * once that write completed, replaying every update from the last
- * checkpoint forward in LSN order reproduces the pre-crash contents exactly
- * - no page-LSN comparison is needed to make redo idempotent, unlike
- * classic ARIES with incremental (delta) logging. The tradeoff is a bigger
- * log: every logged write carries a full page image rather than a diff.
- *
- * Undo walks each unresolved transaction's [LogRecord.Update] chain
- * backward via `prevLsn`, restoring the before-image at each step. A crash
- * partway through undoing a transaction requires re-running undo for it
- * from the start on the next recovery pass ([recover]'s forward redo pass
- * reproduces whatever partial undo already happened before the crash, via
- * any [LogRecord.CompensationUpdate] records it wrote, and the backward undo
- * pass then continues from there) rather than resuming partway through a
- * still-in-flight undo.
- *
- * [rollbackTo] undoes only a *suffix* of a transaction's updates, back to a
- * savepoint LSN captured earlier in the same transaction, and writes a
- * [LogRecord.CompensationUpdate] for each [LogRecord.Update] it undoes. A
- * later full [rollback] (or a rollback to an earlier savepoint) that walks
- * back through a CLR does not undo it again - it follows [LogRecord.CompensationUpdate.undoNextLsn]
- * straight past the range it already compensated for. This is the classic
- * ARIES technique for making undo of undo safe without needing a full CLR
- * chain of its own.
- *
- * Redo only ever targets pages already allocated in [diskManager]; page
- * allocation itself is not logged in this scope, so the log can only
- * restore content, not resurrect a page directory lost mid-crash.
- *
- * Because [rollback] restores before-images with plain physical writes
- * rather than logging its own compensation records, a transaction that
- * finished with an [LogRecord.Abort] before this recovery pass ran already
- * has the correct (pre-write) bytes on disk. Blindly redoing every
- * [LogRecord.Update] forward in LSN order - as classic ARIES redo does,
- * since it always has CLRs to make that safe - would reapply that
- * transaction's after-images and resurrect data it rolled back. [recover]
- * therefore runs an analysis pass first to learn each transaction's final
- * disposition, then skips redoing updates belonging to one that aborted.
- */
 class RecoveryManager(private val wal: WriteAheadLog, private val diskManager: DiskManager) {
 
     class Result(val redoneUpdates: Int, val rolledBackTxns: List<Long>)
@@ -93,12 +51,6 @@ class RecoveryManager(private val wal: WriteAheadLog, private val diskManager: D
         return Result(redone, rolledBack)
     }
 
-    /**
-     * Rolls back a transaction by walking its update chain backward from
-     * [fromLsn] (defaulting to the tail this [wal] instance has tracked for
-     * a still-live transaction) and restoring each before-image. Also used
-     * by [recover] to undo transactions left active by a crash.
-     */
     fun rollback(txnId: Long, fromLsn: Long = wal.lastLsnOf(txnId)) {
         require(fromLsn != WriteAheadLog.NO_LSN) { "transaction $txnId has no recorded updates" }
         var lsn = fromLsn
@@ -116,18 +68,6 @@ class RecoveryManager(private val wal: WriteAheadLog, private val diskManager: D
         wal.markAborted(txnId)
     }
 
-    /**
-     * Undoes [txnId]'s updates back to [savepointLsn] - the LSN [WriteAheadLog.lastLsnOf] reported for
-     * [txnId] at the moment the savepoint was established - without resolving the transaction: it
-     * remains active, can accumulate further writes, and can later be committed, fully rolled back, or
-     * rolled back to another savepoint. Each undone [LogRecord.Update] gets a
-     * [LogRecord.CompensationUpdate] so this is safe to call again (e.g. a second rollback to the same
-     * savepoint after more writes) and safe to crash through (see the class doc).
-     *
-     * Walking backward from the transaction's current tail, a [LogRecord.CompensationUpdate] already on
-     * the chain (written by an earlier, deeper savepoint rollback) is skipped via [LogRecord.CompensationUpdate.undoNextLsn]
-     * rather than undone again - the range it compensates for is already at its pre-savepoint bytes.
-     */
     fun rollbackTo(txnId: Long, savepointLsn: Long) {
         var lsn = wal.lastLsnOf(txnId)
         while (lsn != savepointLsn) {

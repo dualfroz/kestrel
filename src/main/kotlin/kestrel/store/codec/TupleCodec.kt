@@ -5,12 +5,6 @@ import java.math.BigInteger
 import java.time.LocalDate
 import kestrel.storage.Value
 
-/**
- * Encodes a row (list of [Value]) as a self-describing byte payload: a leading
- * null bitmap followed by a type-tagged, variable-length payload for every
- * non-null column. Used to store row bodies on disk pages, independent of the
- * order-preserving key encoding in [KeyCodec].
- */
 object TupleCodec {
     private const val TAG_BOOLEAN = 1
     private const val TAG_INTEGER = 2

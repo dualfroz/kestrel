@@ -39,17 +39,6 @@ import kestrel.sql.ast.UnaryExpression
 import kestrel.sql.ast.WindowExpression
 import kestrel.sql.ast.WithQuery
 
-/**
- * Rewrites every [TableSource] named [oldName] to [newName] throughout a view's defining query -
- * FROM/JOIN targets, derived tables, CTE bodies, set-operation branches, and every subquery
- * expression (scalar/EXISTS/IN) nested inside WHERE/HAVING/projection/GROUP BY/ORDER BY. Used by
- * [Catalog] to keep views working after `ALTER TABLE ... RENAME TO`.
- *
- * A CTE whose own name equals [oldName] shadows the real table for the rest of that WITH clause
- * (same rule SQL itself uses to resolve the name): once such a CTE is seen, later CTEs and the
- * body are left untouched, because a bare reference to that name from there on means the CTE, not
- * the table being renamed - renaming it there would silently change what the query means.
- */
 internal object RelationRename {
     fun rename(query: QueryStatement, oldName: String, newName: String): QueryStatement = when (query) {
         is SelectStatement -> renameInSelect(query, oldName, newName)
@@ -91,13 +80,6 @@ internal object RelationRename {
             distinctOn = select.distinctOn.map { renameInExpression(it, oldName, newName) }
         )
 
-    /**
-     * `groupBy` itself only ever carries the union of a [GroupingSpec]'s expressions (see
-     * [SelectStatement.groupBy]'s doc), never the spec's own per-set structure - so renaming that
-     * union alone would leave a stale table name buried inside a subquery nested in
-     * [RollupSpec]/[CubeSpec]/[GroupingSetsSpec], the one place [GroupAggregation] actually reads for
-     * execution. Kept in exact lockstep with `groupBy`'s own rewrite above.
-     */
     private fun renameInGroupingSpec(spec: GroupingSpec, oldName: String, newName: String): GroupingSpec = when (spec) {
         is RollupSpec -> spec.copy(expressions = spec.expressions.map { renameInExpression(it, oldName, newName) })
         is CubeSpec -> spec.copy(expressions = spec.expressions.map { renameInExpression(it, oldName, newName) })

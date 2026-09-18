@@ -4,7 +4,6 @@ import kestrel.KestrelException
 
 class CodecException(message: String) : KestrelException(message)
 
-/** Growable little-endian-free byte sink. Multi-byte integers are written big-endian. */
 class ByteWriter(initialCapacity: Int = 32) {
     private var buffer = ByteArray(initialCapacity)
     private var size = 0
@@ -41,7 +40,6 @@ class ByteWriter(initialCapacity: Int = 32) {
 
     fun writeFixedDouble(value: Double): ByteWriter = writeFixedLong(java.lang.Double.doubleToLongBits(value))
 
-    /** Unsigned LEB128 varint. */
     fun writeVarInt(value: Long): ByteWriter {
         var remaining = value
         while (true) {
@@ -55,7 +53,6 @@ class ByteWriter(initialCapacity: Int = 32) {
         }
     }
 
-    /** Zigzag-encoded signed varint, safe for negative numbers. */
     fun writeZigZag(value: Long): ByteWriter = writeVarInt((value shl 1) xor (value shr 63))
 
     fun writeLengthPrefixed(bytes: ByteArray): ByteWriter {

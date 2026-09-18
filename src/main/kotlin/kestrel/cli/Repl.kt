@@ -63,12 +63,6 @@ import kestrel.sql.parser.Parser
 import kestrel.store.sql.DiskCatalog
 import kestrel.store.sql.DiskExecutor
 
-/**
- * `diskCatalog` swaps the storage backend for every statement from the in-memory [Catalog]/
- * [Executor] to the real disk-backed [DiskCatalog]/[DiskExecutor] pair (pager/WAL/B+Tree) - the two
- * engines are mutually exclusive, never blended in one session, and [persistence] (the in-memory
- * engine's own text-based WAL replay) makes no sense once statements are already durable on disk.
- */
 class Repl(
     private val output: Appendable = System.out,
     private val errorOutput: Appendable = System.err,
@@ -147,18 +141,6 @@ class Repl(
         }
     }
 
-    /**
-     * A trigger body's `BEGIN ... END` wraps statements that each end in their own `;`, so the
-     * naive "buffer ends in a semicolon" check above would fire mid-body, on the first inner
-     * statement, well before the trigger definition is actually complete - unlike every other
-     * statement this REPL buffers line by line, a trigger body is the only one with `;` nested
-     * inside it. Distinguishing a trigger-body `BEGIN` from a bare `BEGIN`/`BEGIN TRANSACTION`
-     * (which never takes a matching `END`) only needs one fact: a fresh top-level statement's
-     * first token is always either the very start of the buffer or right after a `;` - a
-     * trigger-body `BEGIN` is never in that position, since `FOR EACH ROW` (or a `WHEN` clause)
-     * always precedes it. `CASE ... END` nests on the same stack since it needs the exact same
-     * "don't fire on an inner `;`" protection for a `CASE` that spans multiple typed lines.
-     */
     private fun endsInsideOpenBlock(tokens: List<Token>): Boolean {
         var depth = 0
         for (index in tokens.indices) {
@@ -191,25 +173,11 @@ class Repl(
         }
         for (statement in statements) {
             try {
-                // EXECUTE is resolved to its concrete, parameter-free statement HERE, once, rather
-                // than inside Executor.execute's own dispatch - so recordForPersistence below sees
-                // (and durably logs) the same substituted INSERT/UPDATE/DELETE/SELECT that actually
-                // ran, not the literal `EXECUTE name(...)` text. That literal text is meaningless to
-                // replay anyway: a freshly reopened session has no PREPARE-d statement named `name`
-                // (see PrepareStatement's own doc - prepared statements are session-scoped, never
-                // persisted). Resolving exactly once also matters for correctness, not just tidiness:
-                // an EXECUTE argument could itself be a volatile expression, so resolving twice
-                // (once to run it, once again to decide what to persist) would evaluate it twice.
                 val effective = if (diskExecutor == null && statement is ExecuteStatement) {
                     executor.resolveExecute(statement)
                 } else {
                     statement
                 }
-                // Computed BEFORE execute() runs, not after - DROP TABLE/RENAME TABLE/DROP INDEX
-                // mutate (or remove) the very catalog entry this asks about, so checking afterward
-                // could never again tell a table that WAS temporary apart from one that never
-                // existed at all. CREATE TABLE is the one case checked from the statement itself
-                // rather than the catalog, since the table it names does not exist yet either way.
                 val temporaryTargets = if (diskExecutor == null) temporaryTableTargets(effective) else emptySet()
                 val result = if (diskExecutor != null) diskExecutor.execute(statement) else executor.execute(effective)
                 printResult(result)
@@ -220,15 +188,6 @@ class Repl(
         }
     }
 
-    /**
-     * Every table name [statement] itself creates/drops/alters/indexes/reads-and-writes-as-its-own-
-     * target that is currently a TEMP table (see [kestrel.catalog.TableSchema.temporary]) -
-     * deliberately NOT a general "every table this statement's body could possibly touch" scan
-     * (an INSERT's SELECT source, a MERGE's USING source, a view/trigger's query body): those are
-     * read-only references that either replay fine (the source table still exists after reload) or
-     * fail loudly with "no such table" if it does not, which is an acceptable, honest failure mode -
-     * see [kestrel.persistence.SqlWriter.dump]'s own note on the same tradeoff for CREATE VIEW.
-     */
     private fun temporaryTableTargets(statement: Statement): Set<String> = when (statement) {
         is CreateTableStatement -> if (statement.temporary) setOf(statement.tableName) else emptySet()
         is DropTableStatement -> temporaryOf(statement.tableName)
@@ -277,13 +236,6 @@ class Repl(
                 pendingCommit?.let { buffer -> while (buffer.size > mark) buffer.removeAt(buffer.size - 1) }
                 while (savepointMarks.size > index + 1) savepointMarks.removeAt(savepointMarks.size - 1)
             }
-            // A TRUNCATE naming both TEMP and regular tables in one statement is the only
-            // persistable statement that can target more than one table (every other case above
-            // fully skips or fully persists) - the regular ones still need their truncation durably
-            // logged even though the TEMP ones must not appear in the text at all, since after
-            // reload a TEMP table's own CREATE never replayed and "TRUNCATE TABLE that_name" would
-            // otherwise fail with "no such table" for a name that was only ever supposed to vanish
-            // quietly.
             is TruncateTableStatement -> {
                 val persistedNames = statement.tableNames.filterNot { it in temporaryTargets }
                 if (persistedNames.isNotEmpty()) {
@@ -389,7 +341,6 @@ class Repl(
         return disk.tableNames.flatMap { disk.table(it).secondaryIndexes.map { index -> index.name } }
     }
 
-    /** Every `CREATE [UNIQUE] INDEX ...;` line for [tableName], one engine or the other - never both. */
     private fun indexLines(tableName: String): List<String> {
         val disk = diskCatalog
         if (disk != null) {
@@ -407,7 +358,6 @@ class Repl(
             }
     }
 
-    /** Every `CREATE TRIGGER ...` block for [tableName], one engine or the other - never both. */
     private fun triggerLines(tableName: String): List<String> {
         val definitions = diskCatalog?.triggerDefinitions() ?: catalog.triggerDefinitions()
         return definitions

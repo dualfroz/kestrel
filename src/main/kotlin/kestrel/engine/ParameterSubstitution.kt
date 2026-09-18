@@ -55,20 +55,8 @@ import kestrel.sql.ast.WindowExpression
 import kestrel.sql.ast.WithQuery
 import kestrel.storage.Value
 
-/**
- * Resolves `$1`, `$2`, ... [ParameterExpression] placeholders inside a [PreparableStatement] -
- * the only place they are ever actually turned into real values. Walks exactly the shape
- * [kestrel.catalog.RelationRename]/[kestrel.catalog.DependencyAnalysis] already walk for a view's
- * defining query (FROM/JOIN targets, derived tables, CTE bodies, set-operation branches, every
- * subquery nested in WHERE/HAVING/projection/GROUP BY/ORDER BY/window frames), plus the parts only
- * a top-level DML statement has that a view's body never does: INSERT's VALUES rows and ON CONFLICT
- * clause, UPDATE's SET assignments, and MERGE's USING source/ON condition/WHEN clauses - since a
- * prepared statement can be any [PreparableStatement] kind, not just a SELECT.
- * [kestrel.engine.Executor.resolveExecute] is the only caller.
- */
 internal object ParameterSubstitution {
 
-    /** Highest 1-based parameter index anywhere in [statement] - 0 if it has none. EXECUTE must supply exactly this many arguments. */
     fun parameterCount(statement: PreparableStatement): Int = when (statement) {
         is QueryStatement -> maxIndexInQuery(statement)
         is InsertStatement -> maxOf(
@@ -258,8 +246,6 @@ internal object ParameterSubstitution {
 
     private fun boundValueAt(index: Int, boundValues: List<Value>): Value =
         boundValues.getOrNull(index - 1) ?: throw KestrelException("no value supplied for parameter \$$index")
-
-    // --- parameterCount's twin walk: same shape as substitute above, but only tracks the max index seen. ---
 
     private fun maxIndexInAssignments(assignments: List<Assignment>): Int =
         assignments.maxOfOrNull { it.value?.let(::maxIndexInExpression) ?: 0 } ?: 0

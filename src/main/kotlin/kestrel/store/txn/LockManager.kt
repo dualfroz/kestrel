@@ -4,22 +4,6 @@ import kestrel.KestrelException
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-/**
- * A resource-level shared/exclusive lock table for strict two-phase locking:
- * transactions acquire locks as they go and are expected to release
- * everything at once, via [releaseAll], on commit or abort.
- *
- * Blocked requests are detected for deadlock *before* they wait: acquiring a
- * lock builds the tentative wait-for edges from the requester to the
- * resource's current holders and walks the existing wait-for graph (formed
- * by every other transaction currently blocked) to see whether any of those
- * holders already, transitively, waits on the requester. This avoids ever
- * parking a thread that could not possibly be woken. What it does not do is
- * enforce waiter ordering, so a steady stream of compatible shared requests
- * can starve a waiting exclusive request - a real risk this scope accepts in
- * exchange for a single shared [java.util.concurrent.locks.Condition]
- * instead of a priority queue.
- */
 class LockManager {
     enum class LockMode { SHARED, EXCLUSIVE }
 
@@ -51,7 +35,6 @@ class LockManager {
         }
     }
 
-    /** Releases every lock [txnId] holds. Called once, on commit or abort, under strict 2PL. */
     fun releaseAll(txnId: Long) {
         guard.withLock {
             val held = locksHeldByTxn.remove(txnId) ?: return
@@ -62,7 +45,6 @@ class LockManager {
         }
     }
 
-    /** Snapshot of current holders, e.g. for a `pg_locks`-style inspection view. */
     fun holders(resourceId: Long): Map<Long, LockMode> = guard.withLock {
         resources[resourceId]?.holders?.toMap() ?: emptyMap()
     }
@@ -106,7 +88,6 @@ class LockManager {
         return mode == LockMode.SHARED && others.values.all { it == LockMode.SHARED }
     }
 
-    /** True if any txn in [from] transitively waits, via the existing wait-for graph, on [target]. */
     private fun hasCycle(target: Long, from: List<Long>): Boolean {
         val visited = HashSet<Long>()
         val stack = ArrayDeque(from)

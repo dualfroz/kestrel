@@ -41,18 +41,6 @@ import kestrel.storage.typeName
 fun interface ColumnResolver {
     fun resolve(expression: ColumnExpression): Value
 
-    /**
-     * The [Collation] [expression] was declared with in its `CREATE TABLE ... COLLATE name` (its
-     * [kestrel.catalog.Column.collation]), or `null` when this resolver has no such column to
-     * report one for - a computed/derived row (a set operation's output, a LATERAL subquery's own
-     * result), an ambiguous reference across more than one source, or simply a resolver that never
-     * bothered to override this default. [Evaluator.collationOf] only ever calls this for a bare
-     * [ColumnExpression] with no [kestrel.sql.ast.CollateExpression] of its own - an explicit
-     * `COLLATE` in the query always wins over whatever this returns. A default method (not the SAM
-     * member) so every existing lambda-shaped `ColumnResolver { expression -> ... }` construction
-     * keeps compiling unchanged and simply reports "no declared collation" - only the resolvers
-     * built directly over a [kestrel.catalog.TableSchema] bother to override it.
-     */
     fun declaredCollation(expression: ColumnExpression): Collation? = null
 }
 
@@ -60,19 +48,6 @@ fun interface SubqueryRunner {
     fun run(select: SelectStatement, outer: ColumnResolver?): SelectResult
 }
 
-/**
- * Bridges NEXTVAL/CURRVAL evaluation to whichever [kestrel.catalog.Catalog] and per-session state
- * actually own sequence counters - kept as its own interface (not a `fun interface` like
- * [ColumnResolver]/[SubqueryRunner]) because it needs two independent operations, not one.
- * [kestrel.engine.Executor] is the only implementation; every other [Evaluator] construction site
- * (SELECT projections, WHERE clauses read-side, CHECK constraints, trigger `WHEN` clauses) omits it,
- * so [evaluateNextValue]/[evaluateCurrentValue] throw there exactly like a missing [SubqueryRunner]
- * already does for a subquery - deliberately: a volatile, side-effecting call being evaluated an
- * engine-implementation-defined number of times (once for filtering, again for projecting the same
- * row, ...) is exactly the ambiguity real databases warn about, so this engine only ever allows it
- * where a row's assignment is evaluated exactly once by construction (see
- * [kestrel.engine.Executor.executeInsertInner]/`executeUpdateInner`).
- */
 interface SequenceAccess {
     fun nextValue(sequenceName: String): Long
     fun currentValue(sequenceName: String): Long
@@ -82,7 +57,6 @@ class Evaluator(
     private val resolver: ColumnResolver? = null,
     private val subqueries: SubqueryRunner? = null,
     private val sequences: SequenceAccess? = null,
-    /** Bound only by [kestrel.engine.Executor.evaluateMergeReturning]'s per-row [Evaluator] - see [MergeActionExpression]'s own doc for why every other call site leaves this null and lets MERGE_ACTION() throw. */
     private val mergeAction: String? = null
 ) {
     constructor(schema: TableSchema?, row: Row?, subqueries: SubqueryRunner? = null, sequences: SequenceAccess? = null) : this(
@@ -460,12 +434,6 @@ class Evaluator(
         return Value.BooleanValue(result)
     }
 
-    /**
-     * [collation] only ever changes the outcome for two [Value.TextValue]s - every other pairing
-     * ignores it, matching SQLite (COLLATE is meaningless outside of text comparison). Defaults to
-     * [Collation.Binary] (this engine's behavior before COLLATE existed) at every call site that
-     * has no [CollateExpression] to resolve one from.
-     */
     private fun compareOperands(left: Value, right: Value, collation: Collation = Collation.Binary): Int = when {
         left is Value.IntegerValue && right is Value.IntegerValue -> left.value.compareTo(right.value)
         left is Value.DecimalValue || right is Value.DecimalValue -> {
@@ -480,36 +448,13 @@ class Evaluator(
         else -> throw KestrelException("cannot compare ${left.typeName} with ${right.typeName}")
     }
 
-    /** The [Collation] an explicit `COLLATE` on [expression] itself names, or `null` when it is not a [CollateExpression] at all. */
     private fun explicitCollationOf(expression: Expression): Collation? = (expression as? CollateExpression)?.collation
 
-    /**
-     * [expression]'s own declared `COLLATE` (see [kestrel.catalog.Column.collation]) when it is a
-     * bare [ColumnExpression] whose [resolver] reports one - `null` for anything else, including a
-     * column that never declared one at all ([ColumnResolver.declaredCollation] reporting
-     * [Collation.Binary], its class default, is treated the exact same as reporting nothing: a
-     * column that never opted into a non-default sequence should not out-rank an operand on the
-     * *other* side of a comparison that did, purely by virtue of appearing on the left - see
-     * [pairCollation]).
-     */
     private fun columnDeclaredCollationOf(expression: Expression): Collation? =
         (expression as? ColumnExpression)?.let { resolver?.declaredCollation(it) }?.takeIf { it != Collation.Binary }
 
-    /**
-     * The [Collation] [expression] compares with on its own, combining both of [pairCollation]'s
-     * tiers into one - used where there is only a single operand to consult
-     * ([evaluateIn]/[evaluateInSubquery]'s list/subquery operand), which can still tell "no COLLATE
-     * here at all" apart from "explicitly COLLATE BINARY" (both [explicitCollationOf] and
-     * [columnDeclaredCollationOf] return `null` only for the former).
-     */
     private fun collationOf(expression: Expression): Collation? = explicitCollationOf(expression) ?: columnDeclaredCollationOf(expression)
 
-    /**
-     * Delegates to the shared [kestrel.engine.pairCollation] (SQLite's two-tier binary-comparison
-     * rule) bound to this evaluator's own [resolver] - see that function's doc for the precedence
-     * rule itself and why it must stay two separate passes rather than one combined
-     * [collationOf]-per-side check.
-     */
     private fun pairCollation(left: Expression, right: Expression): Collation =
         kestrel.engine.pairCollation(left, right) { resolver?.declaredCollation(it) }
 
