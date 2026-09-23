@@ -143,12 +143,10 @@ class DirectoryEntryCodecTest {
     fun decodingAnUnknownColumnTypeFails() {
         val entry = TableDirectoryEntry("t", listOf(Column("c", ColumnType.Integer, false, false)), 0L, null, emptyList())
         val bytes = DirectoryEntryCodec.encode(entry).copyOf()
-        // Corrupt the type-keyword length byte to force an unrecognised keyword.
         var offset = 0
-        // skip table name: length-prefix varint then bytes
         val nameLength = bytes[offset].toInt() and 0x7F
         offset += 1 + nameLength
-        offset += 1 // column count varint (small)
+        offset += 1
         val colNameLength = bytes[offset].toInt() and 0x7F
         offset += 1 + colNameLength
         val typeLength = bytes[offset].toInt() and 0x7F
@@ -161,7 +159,6 @@ class DirectoryEntryCodecTest {
             block()
             throw AssertionError("expected decode to fail")
         } catch (e: kestrel.store.codec.CodecException) {
-            // expected
         }
     }
 }

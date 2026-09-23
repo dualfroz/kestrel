@@ -14,14 +14,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `INSERT ... ON CONFLICT (...) DO NOTHING|DO UPDATE` through [DiskExecutor] against a real
- * [DiskCatalog] backed by temp files - see [DiskExecutorTest] for the general end-to-end pattern
- * this reuses. Scenarios are ported 1:1 from [kestrel.UpsertTest] (the in-memory engine's
- * equivalent) wherever they translate; [conflictResolutionSurvivesAReopen] replaces that suite's
- * dump/replay test (this executor has no [kestrel.persistence.SqlWriter] equivalent - durability
- * here means surviving a real close/reopen of the backing files) and is new to this file.
- */
 class DiskExecutorOnConflictTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -263,13 +255,6 @@ class DiskExecutorOnConflictTest {
         assertEquals(1, db.select("SELECT * FROM accounts").rows.size)
     }
 
-    /**
-     * Durability proof unique to the disk-backed executor: a resolved conflict (one row inserted
-     * fresh, one row updated in place) must be readable after a real close/reopen of the backing
-     * files, not just correct in the live process's buffer pool - mirrors the reopen tests already
-     * established for SEQUENCE ([DiskExecutorSequenceTest.sequencePositionSurvivesAReopen]) and
-     * SAVEPOINT ([DiskExecutorSavepointTest.dataWrittenAfterASavepointRollbackSurvivesAReopenAfterCommit]).
-     */
     @Test
     fun conflictResolutionSurvivesAReopen() {
         val db = newDatabase()

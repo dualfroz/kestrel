@@ -30,7 +30,6 @@ class BufferPoolTest {
         page.data[0] = 99
         pool.unpinPage(page.id, true)
 
-        // Force eviction of the only frame by fetching a second page.
         val other = pool.newPage()
         pool.unpinPage(other.id, false)
 
@@ -47,10 +46,10 @@ class BufferPoolTest {
         pool.flushAll()
 
         val fetched = pool.fetchPage(page.id)
-        fetched.data[5] = 55 // mutate without marking dirty
+        fetched.data[5] = 55
         pool.unpinPage(page.id, markDirty = false)
 
-        pool.newPage() // evicts the clean page without writeback
+        pool.newPage()
         val reloaded = manager.readPage(page.id)
         assertEquals(0, reloaded.data[5])
     }
@@ -58,7 +57,7 @@ class BufferPoolTest {
     @Test
     fun pinnedPagesAreNeverEvicted() {
         val pool = BufferPool(newManager(), capacity = 1)
-        val pinned = pool.newPage() // pinCount == 1, never unpinned
+        val pinned = pool.newPage()
         assertFailsWith<BufferPoolExhaustedException> { pool.newPage() }
         pool.unpinPage(pinned.id, false)
     }
@@ -70,14 +69,11 @@ class BufferPoolTest {
         val b = pool.newPage(); pool.unpinPage(b.id, true)
         val c = pool.newPage(); pool.unpinPage(c.id, true)
 
-        // One full clock sweep: evicts `a` (first frame revisited) and clears b/c's reference bits.
         val d = pool.newPage(); pool.unpinPage(d.id, true)
 
-        // Refresh `c`'s reference bit by touching it again; `b` is left stale.
         val cTouch = pool.fetchPage(c.id)
         pool.unpinPage(c.id, false)
 
-        // Next eviction must take the stale page (`b`), sparing the freshly touched `c`.
         val e = pool.newPage(); pool.unpinPage(e.id, true)
 
         assertTrue(pool.fetchPage(c.id) === cTouch, "c should still be cached, not re-read from disk")
@@ -124,7 +120,7 @@ class BufferPoolTest {
         val pool = BufferPool(manager, capacity = 4)
         val page = pool.newPage()
         pool.unpinPage(page.id, true)
-        pool.flushAll() // establishes a known, all-zero baseline on disk
+        pool.flushAll()
 
         val fetched = pool.fetchPage(page.id)
         fetched.data[0] = 42

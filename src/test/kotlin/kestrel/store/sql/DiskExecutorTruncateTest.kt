@@ -13,13 +13,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `TRUNCATE TABLE` through [DiskExecutor] against a real [DiskCatalog] backed by temp files - see
- * [DiskExecutorTest] for the general end-to-end pattern this reuses, and [kestrel.TruncateTest] for
- * the in-memory engine's equivalent scenarios, ported 1:1 wherever they translate.
- * [restartIdentityIsNotUndoneByARollbackUnlikeTheRowTruncationItself] has no in-memory equivalent -
- * see [DiskExecutor.executeTruncate]'s own doc for the deliberate asymmetry it demonstrates.
- */
 class DiskExecutorTruncateTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -177,14 +170,6 @@ class DiskExecutorTruncateTest {
         assertEquals(listOf(listOf(int(1)), listOf(int(2))), db.select("SELECT id FROM t ORDER BY id").rows)
     }
 
-    /**
-     * Unlike the in-memory engine (where ALTER SEQUENCE mutates a catalog map entry covered by the
-     * whole-catalog snapshot ROLLBACK restores), [DiskCatalog.alterSequence] always opens and commits
-     * its own storage-engine transaction, independent of the caller's [txn] - the same
-     * already-established non-transactional behavior [DiskCatalog.nextValue] has. So a ROLLBACK here
-     * undoes the row truncation but NOT the sequence restart: the very next NEXTVAL keeps counting
-     * from 1 (post-restart), not from 3 (where it would have been had TRUNCATE never run at all).
-     */
     @Test
     fun restartIdentityIsNotUndoneByARollbackUnlikeTheRowTruncationItself() {
         val db = newDatabase()

@@ -16,11 +16,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * Multi-column PRIMARY KEY (`PRIMARY KEY (a, b, ...)`) and multi-column FOREIGN KEY
- * (`FOREIGN KEY (a, b) REFERENCES parent(x, y)`), the last documented "not yet supported" gap
- * left in TableSchema/ForeignKeyEnforcer after single-column UNIQUE landed.
- */
 class CompositeKeyTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -35,8 +30,6 @@ class CompositeKeyTest {
     private fun select(sql: String): SelectResult = exec(sql) as SelectResult
 
     private fun int(value: Long) = Value.IntegerValue(value)
-
-    // ---- parsing ----
 
     @Test
     fun parsesTableLevelCompositePrimaryKey() {
@@ -65,8 +58,6 @@ class CompositeKeyTest {
             parseOne("CREATE TABLE t (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES parent (x))")
         }
     }
-
-    // ---- CREATE TABLE validation ----
 
     @Test
     fun declaringBothInlineAndTableLevelPrimaryKeyIsRejected() {
@@ -110,8 +101,6 @@ class CompositeKeyTest {
         run("CREATE TABLE child (x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES parent (b, a))")
     }
 
-    // ---- composite PRIMARY KEY uniqueness ----
-
     @Test
     fun compositePrimaryKeyRejectsAnExactDuplicateCombination() {
         run("CREATE TABLE line_items (order_id INTEGER, sku TEXT, qty INTEGER, PRIMARY KEY (order_id, sku))")
@@ -134,8 +123,6 @@ class CompositeKeyTest {
         assertFailsWith<KestrelException> { run("UPDATE line_items SET sku = 'A' WHERE sku = 'B'") }
     }
 
-    // ---- composite FOREIGN KEY: existence checks ----
-
     private fun seedOrdersAndLineItems() {
         run("CREATE TABLE orders (region TEXT, order_no INTEGER, PRIMARY KEY (region, order_no))")
         run(
@@ -150,7 +137,6 @@ class CompositeKeyTest {
     @Test
     fun compositeForeignKeyRejectsAPartialMatch() {
         seedOrdersAndLineItems()
-        // ('eu', 1) and ('us', 1) both exist individually but not as the pair ('us', 2).
         assertFailsWith<KestrelException> {
             run("INSERT INTO line_items VALUES ('us', 2, 'SKU1', 3)")
         }
@@ -225,8 +211,6 @@ class CompositeKeyTest {
         assertEquals(1, select("SELECT * FROM line_items").rows.size)
     }
 
-    // ---- composite FOREIGN KEY referencing a composite UNIQUE (not the PRIMARY KEY) ----
-
     @Test
     fun compositeForeignKeyMayReferenceACompositeUniqueConstraintInsteadOfThePrimaryKey() {
         run(
@@ -244,8 +228,6 @@ class CompositeKeyTest {
         }
     }
 
-    // ---- self-referencing composite FOREIGN KEY ----
-
     @Test
     fun selfReferencingCompositeForeignKeySeedableInASingleMultiRowInsert() {
         run(
@@ -254,16 +236,12 @@ class CompositeKeyTest {
                 "PRIMARY KEY (tenant, node), " +
                 "FOREIGN KEY (parent_tenant, parent_node) REFERENCES edges (tenant, node))"
         )
-        // The root's parent columns are NULL (no parent); child references the root, all seeded
-        // together in one INSERT so the child must see its not-yet-committed sibling.
         run(
             "INSERT INTO edges VALUES " +
                 "('t1', 1, NULL, NULL), ('t1', 2, 't1', 1), ('t1', 3, 't1', 2)"
         )
         assertEquals(3, select("SELECT * FROM edges").rows.size)
     }
-
-    // ---- SqlWriter round-trip ----
 
     @Test
     fun createTableWithCompositePrimaryKeyRoundTripsThroughSqlWriter() {

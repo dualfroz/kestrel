@@ -27,13 +27,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * End-to-end tests that parse real SQL text through the same [Lexer]/[Parser]
- * the in-memory engine uses, then run it through [DiskExecutor] against a
- * real [DiskCatalog] backed by temp files - proving the disk storage engine
- * (page/heap/btree/wal/txn) can actually serve SQL, not just its own
- * unit tests.
- */
 class DiskExecutorTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -51,7 +44,6 @@ class DiskExecutorTest {
         fun run(sql: String): List<StatementResult> = parse(sql).map { executor.execute(it) }
         fun select(sql: String): SelectResult = run(sql).single() as SelectResult
 
-        /** Closes and reopens the catalog against the same files, simulating a fresh process. */
         fun reopen() {
             catalog.close()
             catalog = DiskCatalog.open(dataFile, walFile)
@@ -101,7 +93,6 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(int(1), text("ada"), int(0))), db.select("SELECT * FROM users").rows)
     }
 
-    /** Positive coverage lives in [DiskExecutorOnConflictTest] - this table only proves it is no longer a scope-cut. */
     @Test
     fun insertOnConflictDoNothingSkipsAConflictingRowInsteadOfThrowing() {
         val db = newDatabase()
@@ -112,7 +103,6 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM users").rows)
     }
 
-    /** Positive coverage lives in [DiskExecutorTriggerTest] - this table only proves it is no longer a scope-cut. */
     @Test
     fun createTriggerSucceedsAndFiresOnInsert() {
         val db = newDatabase()
@@ -123,7 +113,6 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(int(1))), db.select("SELECT * FROM audit").rows)
     }
 
-    /** Full SEQUENCE/NEXTVAL/CURRVAL coverage lives in [DiskExecutorSequenceTest]; this just proves the wiring. */
     @Test
     fun createSequenceSucceedsAndNextvalCanBackAColumnDefault() {
         val db = newDatabase()
@@ -259,8 +248,6 @@ class DiskExecutorTest {
     fun aFailedStatementInAMultiRowInsertLeavesNoPartialRowsBehind() {
         val db = newDatabase()
         db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-        // The second row duplicates the first row's primary key: DiskTable rejects it mid-batch,
-        // so the whole INSERT statement (including the already-applied first row) must abort.
         assertFailsWith<DiskTableException> {
             db.run("INSERT INTO users VALUES (1, 'ada'), (1, 'ada-again')")
         }
@@ -273,7 +260,6 @@ class DiskExecutorTest {
         db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         db.run("INSERT INTO users VALUES (1, 'ada'), (2, 'linus')")
         assertFailsWith<DiskTableException> { db.run("UPDATE users SET name = NULL") }
-        // Neither row's name was actually cleared, because the failure aborted the transaction.
         assertEquals(setOf(text("ada"), text("linus")), db.select("SELECT name FROM users").rows.map { it.single() }.toSet())
     }
 
@@ -306,12 +292,9 @@ class DiskExecutorTest {
         run("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         run("INSERT INTO customers VALUES (1, 'ada'), (2, 'linus'), (3, 'grace')")
         run("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, amount INTEGER NOT NULL)")
-        // grace (id 3) has no orders, so LEFT JOIN has something to pad and INNER JOIN has something to drop.
         run("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 200)")
     }
 
-    // Adds an order referencing a customer id that does not exist, so RIGHT/FULL JOIN has an
-    // unmatched *right* row to pad with NULLs on top of grace's unmatched left row from seedOrders.
     private fun Database.seedOrdersWithOrphan() {
         seedOrders()
         run("INSERT INTO orders VALUES (4, 99, 999)")
@@ -710,12 +693,6 @@ class DiskExecutorTest {
         )
     }
 
-    /**
-     * STRING_AGG's implementation lives entirely in the shared [kestrel.engine.GroupAggregation]/
-     * [kestrel.engine.AggregateFunctions] classes that this disk-backed executor already reuses for
-     * every other aggregate - this proves that reuse actually extends to STRING_AGG too, not just that
-     * the in-memory engine (AggregateTest) got it right.
-     */
     @Test
     fun stringAggGroupsAndOrdersPerGroupOnTheDiskBackedEngine() {
         val db = newDatabase()
@@ -730,12 +707,6 @@ class DiskExecutorTest {
         )
     }
 
-    /**
-     * `COUNT/SUM/AVG/MIN/MAX(DISTINCT ...)` dedup lives in the same shared [kestrel.engine.
-     * AggregateFunctions.compute] this executor already reuses for every other aggregate - this
-     * proves the DISTINCT dedup path itself, not just plain aggregation, actually runs on the
-     * disk-backed engine too.
-     */
     @Test
     fun countAndSumDistinctDedupOnTheDiskBackedEngine() {
         val db = newDatabase()
@@ -756,12 +727,6 @@ class DiskExecutorTest {
         assertEquals(listOf(listOf(text("eng"), int(2)), listOf(text("ops"), int(1))), result.rows)
     }
 
-    /**
-     * `FILTER (WHERE ...)` narrows the rows an aggregate call itself sees before
-     * [kestrel.engine.AggregateFunctions.compute] runs - lives in the same shared
-     * [kestrel.engine.GroupAggregation.computeAggregate] this executor already reuses for every other
-     * aggregate, so this proves the filtering itself, not just plain/DISTINCT aggregation, runs here too.
-     */
     @Test
     fun filterRestrictsWhichRowsEachAggregateSeesOnTheDiskBackedEngine() {
         val db = newDatabase()
@@ -1029,10 +994,6 @@ class DiskExecutorTest {
         db.run("ROLLBACK")
     }
 
-    // --- declarative UNIQUE constraints (inline `col TYPE UNIQUE` / table-level `UNIQUE (a, b, ...)`),
-    // enforced by a full heap scan per write rather than a backing index, mirroring
-    // kestrel.engine.Executor's own uniqueConstraints handling.
-
     @Test
     fun inlineUniqueColumnRejectsADuplicateValueOnInsert() {
         val db = newDatabase()
@@ -1056,7 +1017,6 @@ class DiskExecutorTest {
         db.run("CREATE TABLE registrations (event_id INTEGER, user_id INTEGER, UNIQUE (event_id, user_id))")
         db.run("INSERT INTO registrations VALUES (1, 100)")
         assertFailsWith<DiskTableException> { db.run("INSERT INTO registrations VALUES (1, 100)") }
-        // Sharing only one of the two columns is fine: the constraint is on the pair, not either column alone.
         db.run("INSERT INTO registrations VALUES (1, 200)")
         assertEquals(2, db.select("SELECT * FROM registrations").rows.size)
     }
@@ -1088,8 +1048,6 @@ class DiskExecutorTest {
         assertEquals(1, db.select("SELECT * FROM users").rows.size)
     }
 
-    // --- composite (multi-column) CREATE [UNIQUE] INDEX
-
     @Test
     fun createIndexBuildsANonUniqueCompositeSecondaryIndex() {
         val db = newDatabase()
@@ -1108,7 +1066,6 @@ class DiskExecutorTest {
         db.run("CREATE UNIQUE INDEX idx_reg ON registrations(event_id, user_id)")
         db.run("INSERT INTO registrations VALUES (1, 100)")
         assertFailsWith<DiskTableException> { db.run("INSERT INTO registrations VALUES (1, 100)") }
-        // Sharing only one of the two columns is fine: the index is on the pair, not either column alone.
         db.run("INSERT INTO registrations VALUES (1, 200)")
         assertEquals(2, db.select("SELECT * FROM registrations").rows.size)
     }
@@ -1153,9 +1110,6 @@ class DiskExecutorTest {
         assertEquals(listOf("event_id", "user_id"), handle.columnNames)
         assertTrue(handle.unique)
     }
-
-    // --- index pushdown: proven by DiskTable's access counters, not just by correct results,
-    // since a full scan and an index lookup return identical rows for these queries.
 
     @Test
     fun whereEqualityOnThePrimaryKeyUsesAPointLookupNotAFullScan() {
@@ -1207,7 +1161,7 @@ class DiskExecutorTest {
         db.seedUsers()
         db.run("CREATE INDEX idx_age ON users(age)")
         val table = db.catalog.table("users")
-        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val scansBeforeSelect = table.scanCount
         val result = db.select("SELECT name FROM users WHERE age = 54")
         assertEquals(listOf(listOf(text("linus"))), result.rows)
         assertEquals(1, table.secondaryLookupCount)
@@ -1221,7 +1175,7 @@ class DiskExecutorTest {
         db.run("INSERT INTO users VALUES (1, 36, 'ada'), (2, 36, 'grace')")
         db.run("CREATE INDEX idx_both ON users(age, name)")
         val table = db.catalog.table("users")
-        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val scansBeforeSelect = table.scanCount
         val result = db.select("SELECT id FROM users WHERE age = 36 AND name = 'grace'")
         assertEquals(listOf(listOf(int(2))), result.rows)
         assertEquals(1, table.secondaryLookupCount)
@@ -1248,7 +1202,7 @@ class DiskExecutorTest {
         db.seedUsers()
         db.run("CREATE INDEX idx_age ON users(age)")
         val table = db.catalog.table("users")
-        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val scansBeforeSelect = table.scanCount
         val result = db.select("SELECT name FROM users WHERE age > 40 AND age <= 85 ORDER BY age")
         assertEquals(listOf(listOf(text("linus")), listOf(text("grace"))), result.rows)
         assertEquals(1, table.rangeScanCount)
@@ -1263,7 +1217,7 @@ class DiskExecutorTest {
         db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (2, 1, 'kiwi'), (3, 1, 'mango')")
         db.run("CREATE INDEX idx_order_sku ON order_lines(order_id, sku)")
         val table = db.catalog.table("order_lines")
-        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val scansBeforeSelect = table.scanCount
         val result = db.select("SELECT sku FROM order_lines WHERE order_id > 1 ORDER BY order_id")
         assertEquals(listOf(listOf(text("kiwi")), listOf(text("mango"))), result.rows)
         assertEquals(1, table.rangeScanCount)
@@ -1277,7 +1231,7 @@ class DiskExecutorTest {
         db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (1, 2, 'mango'), (2, 1, 'kiwi')")
         db.run("CREATE INDEX idx_order_sku ON order_lines(order_id, sku)")
         val table = db.catalog.table("order_lines")
-        val scansBeforeSelect = table.scanCount // backfilling the new index already scanned once
+        val scansBeforeSelect = table.scanCount
         val result = db.select("SELECT line_no FROM order_lines WHERE order_id = 1 AND sku > 'apple'")
         assertEquals(listOf(listOf(int(2))), result.rows)
         assertEquals(1, table.rangeScanCount)
@@ -1287,9 +1241,6 @@ class DiskExecutorTest {
 
     @Test
     fun aRangeOnTheSecondColumnOfACompositeSecondaryIndexWithoutAnEqualityPrefixFallsBackToAFullScan() {
-        // Mirrors equalityOnOnlyOneColumnOfACompositeSecondaryIndexFallsBackToAFullScan - the index
-        // is sorted by order_id first, so a bare range on sku cannot narrow the scan without an
-        // equality prefix pinning order_id down first.
         val db = newDatabase()
         db.run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT)")
         db.run("INSERT INTO order_lines VALUES (1, 1, 'apple'), (1, 2, 'mango'), (2, 1, 'kiwi')")
@@ -1320,9 +1271,6 @@ class DiskExecutorTest {
         db.seedUsers()
         db.run("CREATE INDEX idx_age ON users(age)")
         val table = db.catalog.table("users")
-        // age = 999 matches nobody, but a point lookup on id must still run (and the extra
-        // conjunct is applied afterwards by the ordinary full-predicate filter), proving the
-        // planner picked the primary key rather than the secondary index for this predicate.
         val result = db.select("SELECT name FROM users WHERE id = 2 AND age = 999")
         assertEquals(emptyList<List<Value>>(), result.rows)
         assertEquals(1, table.pointLookupCount)
@@ -1352,9 +1300,6 @@ class DiskExecutorTest {
         assertEquals(0, table.scanCount)
         assertEquals(2, db.select("SELECT * FROM users").rows.size)
     }
-
-    // --- table-level composite PRIMARY KEY (a, b): PRIMARY KEY (a, b) instead of an inline
-    // `col TYPE PRIMARY KEY`, mirroring kestrel.engine.Executor's own handling of the same clause.
 
     private fun Database.seedOrderLines() {
         run("CREATE TABLE order_lines (order_id INTEGER, line_no INTEGER, sku TEXT, PRIMARY KEY (order_id, line_no))")
@@ -1922,19 +1867,10 @@ class DiskExecutorTest {
         val scansBefore = table.scanCount
         val result = db.select("WITH unused AS (SELECT id FROM users) SELECT name FROM users WHERE id = 1")
         assertEquals(listOf(listOf(text("ada"))), result.rows)
-        // Every CTE is materialized up front regardless of whether the body ends up using it (mirroring
-        // kestrel.engine.SelectRunner), so "unused" itself contributes exactly one full scan - the point is
-        // that the OUTER query's own WHERE id = 1 still gets its point lookup rather than also falling
-        // back to a scan just because a WITH clause is present.
         assertEquals(scansBefore + 1, table.scanCount)
         assertEquals(pointLookupsBefore + 1, table.pointLookupCount)
     }
 
-    /**
-     * eng (deptId 1): ada/linus tie at 400 (ada inserted first), grace at 300. sales (deptId 2):
-     * sam/kay tie at 200 (sam inserted first), meg at 100. Mirrors kestrel.WindowFunctionTest's seed()
-     * exactly so results can be cross-checked against the in-memory engine's own known-good values.
-     */
     private fun Database.seedWindowEmployees() {
         run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         run("CREATE TABLE employees (id INTEGER PRIMARY KEY, deptId INTEGER, name TEXT, salary INTEGER)")
@@ -2468,7 +2404,6 @@ class DiskExecutorTest {
         assertTrue(error.message!!.contains("nested"), error.message!!)
     }
 
-    /** amount is monotonic in id (10, 20, 20, 30, 50) so `ORDER BY id` and `ORDER BY amount` agree, with a tie at 20. */
     private fun Database.seedWindowSales() {
         run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
         run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
@@ -3025,7 +2960,6 @@ class DiskExecutorTest {
     fun checkPassesWhenExpressionIsUnknownBecauseOfNull() {
         val db = newDatabase()
         db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
-        // three-valued logic: NULL > 0 is UNKNOWN, not FALSE, so the row is accepted
         assertEquals(InsertResult(1), db.run("INSERT INTO t (id) VALUES (1)").single())
     }
 
@@ -3277,8 +3211,6 @@ class DiskExecutorTest {
             "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
                 "manager_id INTEGER REFERENCES employees(id))"
         )
-        // row 1 references row 2 (forward, not yet on disk) and row 3 references row 1 (backward) -
-        // order-independence within a single multi-row INSERT statement.
         assertEquals(
             InsertResult(3),
             db.run("INSERT INTO employees VALUES (1, 'a', 2), (2, 'b', NULL), (3, 'c', 1)").single()
@@ -3301,7 +3233,6 @@ class DiskExecutorTest {
         db.run("DROP TABLE departments CASCADE")
         assertEquals(listOf("employees"), db.catalog.tableNames)
         assertEquals(1, db.select("SELECT * FROM employees").rows.size)
-        // the constraint is gone, so a now-dangling value is accepted
         assertEquals(InsertResult(1), db.run("INSERT INTO employees VALUES (2, 'linus', 99)").single())
     }
 
@@ -3342,8 +3273,6 @@ class DiskExecutorTest {
         assertFailsWith<KestrelException> { db.run("DROP TABLE departments") }
         assertEquals(1, db.select("SELECT * FROM employees").rows.size)
     }
-
-    // ---- ALTER TABLE ADD COLUMN ----
 
     @Test
     fun addColumnAppendsNullToExistingRowsWhenNoDefaultIsGiven() {
@@ -3438,8 +3367,6 @@ class DiskExecutorTest {
         db.run("INSERT INTO t VALUES (2, 'linus', DEFAULT)")
         assertEquals(listOf(listOf(text("active"))), db.select("SELECT status FROM t WHERE id = 2").rows)
     }
-
-    // ---- ALTER TABLE DROP COLUMN ----
 
     @Test
     fun dropColumnRemovesColumnFromSchemaAndData() {
@@ -3550,12 +3477,6 @@ class DiskExecutorTest {
         assertTrue(error.message!!.contains("idx_age"))
     }
 
-    /**
-     * Beyond mirroring the in-memory engine's own coverage, this also proves the position
-     * realignment [DiskTable.rewriteRows] performs for every surviving secondary index: `dept`
-     * shifts from column position 2 to 1 once `age` (position 1) is dropped, and `idx_dept` must
-     * keep resolving against the new position rather than the stale one it was built with.
-     */
     @Test
     fun dropColumnCascadeRemovesTheIndexAndASurvivingLaterIndexStillResolvesAtItsShiftedPosition() {
         val db = newDatabase()
@@ -3582,8 +3503,6 @@ class DiskExecutorTest {
         assertEquals(listOf("id", "name"), db.select("SELECT * FROM t").columns)
         assertEquals(listOf(listOf(int(1), text("ada"))), db.select("SELECT * FROM t").rows)
     }
-
-    // ---- ALTER TABLE RENAME COLUMN ----
 
     @Test
     fun renameColumnRenamesSchemaAndPreservesData() {
@@ -3690,8 +3609,6 @@ class DiskExecutorTest {
         assertEquals(listOf("id", "biography"), db.select("SELECT * FROM t").columns)
         assertEquals(listOf(listOf(int(1), text("mathematician"))), db.select("SELECT * FROM t").rows)
     }
-
-    // ---- ALTER TABLE RENAME TO ----
 
     @Test
     fun renameTableRenamesAndPreservesData() {
@@ -3805,15 +3722,6 @@ class DiskExecutorTest {
         assertFailsWith<DiskCatalogException> { db.run("SELECT * FROM t") }
     }
 
-    /**
-     * The regression this guards against: [DiskCatalog.renameTable] used to capture the directory
-     * key a [DiskTable]'s `onRootsChanged` callback persists under *by value* at table-creation
-     * time. After a rename moved the row to a new map key, any *later* write that actually split a
-     * B+Tree (not the rename itself, which persists synchronously) would still try to persist under
-     * the stale, now-removed key and blow up with `NoSuchElementException`. 300 sequential inserts
-     * reliably force at least one primary-key index split (same row count [DiskCatalogTest] already
-     * relies on for the same reason).
-     */
     @Test
     fun renameTableFollowedByEnoughInsertsToSplitTheIndexPersistsCorrectlyAfterReopen() {
         val db = newDatabase()
@@ -3829,13 +3737,6 @@ class DiskExecutorTest {
         }
     }
 
-    /**
-     * `PREPARE`/`EXECUTE`/`DEALLOCATE` ported to the disk-backed executor - see [DiskExecutor]'s own
-     * class doc. These mirror [kestrel.PreparedStatementTest] (the in-memory engine's own suite for
-     * the same feature) case by case, plus two disk-specific ones proving via a real close/reopen of
-     * the backing files that the registry is genuinely session-scoped rather than durable - the same
-     * distinction [kestrel.PersistenceTest] draws for the in-memory engine's own text WAL.
-     */
     @Test
     fun prepareReturnsItsNameAndExecuteRunsAParameterizedSelect() {
         val db = newDatabase()
@@ -3911,8 +3812,6 @@ class DiskExecutorTest {
         )
         db.run("EXECUTE topUp(10)")
         assertEquals(listOf(listOf(int(510))), db.select("SELECT balance FROM accounts WHERE id = 1").rows)
-        // A second EXECUTE with a DIFFERENT argument proves substitution recomputes fresh every call
-        // rather than baking in whatever value the first call used.
         db.run("EXECUTE topUp(20)")
         assertEquals(listOf(listOf(int(520))), db.select("SELECT balance FROM accounts WHERE id = 1").rows)
     }
@@ -3979,8 +3878,6 @@ class DiskExecutorTest {
         db.run("BEGIN")
         db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
         db.run("ROLLBACK")
-        // Session-scoped, deliberately outside the storage-engine transaction that ROLLBACK undoes -
-        // see DiskExecutor's own doc on preparedStatements for why.
         assertEquals(listOf(listOf(text("ada"))), db.select("EXECUTE byId(1)").rows)
     }
 
@@ -3989,9 +3886,6 @@ class DiskExecutorTest {
         val db = newDatabase()
         db.seedUsers()
         db.run("PREPARE byId AS SELECT name FROM users WHERE id = \$1")
-        // The bare Evaluator() resolveExecute uses to evaluate EXECUTE arguments as constants is
-        // shared with the in-memory engine and throws the shared KestrelException directly, not a
-        // DiskExecutorException - unlike disk-executor-specific validation elsewhere in this class.
         assertFailsWith<KestrelException> { db.run("EXECUTE byId(id)") }
     }
 
@@ -4018,11 +3912,6 @@ class DiskExecutorTest {
         assertFailsWith<DiskExecutorException> { db.run("EXECUTE addUser(2, 'linus', 54)") }
     }
 
-    /**
-     * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` used to be rejected outright here - see
-     * [DiskExecutorTemporaryTableTest] for the full feature (now a real, live in-memory-only table
-     * on this executor) this pair of tests only confirms is reachable through both spellings.
-     */
     @Test
     fun createTempTableIsAcceptedByTheDiskBackedExecutor() {
         val db = newDatabase()

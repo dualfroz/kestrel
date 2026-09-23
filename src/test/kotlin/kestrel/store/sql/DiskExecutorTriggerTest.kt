@@ -13,16 +13,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `CREATE`/`DROP TRIGGER` `BEFORE`/`AFTER INSERT`/`UPDATE`/`DELETE` through [DiskExecutor] against a
- * real [DiskCatalog] backed by temp files - see [DiskExecutorTest] for the general end-to-end pattern
- * this reuses. Scenarios are ported 1:1 from [kestrel.TriggerTest] (the in-memory engine's equivalent)
- * wherever they translate, since firing/WHEN/validation semantics are identical (both engines share
- * [kestrel.engine.TriggerRowContext]); [triggerCascadeAtomicitySurvivesAReopen] and
- * [triggerFiringInsideAnExplicitTransactionParticipatesInItsCommit] are new to this file, proving what
- * is actually different on the disk-backed path: atomicity comes from an internal storage-engine
- * savepoint (see [DiskExecutor.withTriggerAtomicity]) rather than a whole-catalog snapshot/restore.
- */
 class DiskExecutorTriggerTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -66,7 +56,6 @@ class DiskExecutorTriggerTest {
         db.run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         db.run("CREATE TABLE guard (x INTEGER NOT NULL)")
         db.run("CREATE TRIGGER reject_all BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO guard VALUES (NULL); END")
-        // The row itself is perfectly valid for t's own PRIMARY KEY - only the trigger rejects it.
         assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (1)") }
         assertEquals(0, db.select("SELECT * FROM t").rows.size)
     }
@@ -342,7 +331,6 @@ class DiskExecutorTriggerTest {
         assertEquals(int(100), db.select("SELECT balance FROM accounts WHERE id = 1").rows[0][0])
     }
 
-    /** Disk-specific: the trigger cascade and the ON CONFLICT statement itself share one savepoint, so a BEFORE trigger's rejection survives a real close/reopen as if the whole statement never ran. */
     @Test
     fun onConflictBeforeUpdateTriggerRejectionSurvivesAReopen() {
         val db = newDatabase()
@@ -385,17 +373,10 @@ class DiskExecutorTriggerTest {
         db.run("CREATE TRIGGER log AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit VALUES (NEW.id); END")
         db.run("INSERT INTO t VALUES (5)")
         assertEquals(listOf(listOf(int(5))), db.select("SELECT * FROM audit").rows)
-        // OLD is simply not bound for an INSERT trigger, so an OLD.id reference in the body falls
-        // through exactly like any other unresolvable column in an INSERT's VALUES list would.
         db.run("CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit VALUES (OLD.id); END")
         assertFailsWith<KestrelException> { db.run("INSERT INTO t VALUES (6)") }
     }
 
-    /**
-     * Disk-specific: proves a fired trigger's writes and the firing statement's own writes share the
-     * user's explicit `BEGIN`, not a savepoint-scoped transaction of their own - a `ROLLBACK` after
-     * both undoes everything, same as [DiskExecutorOnConflictTest.onConflictInsideAnExplicitTransactionParticipatesInItsCommit].
-     */
     @Test
     fun triggerFiringInsideAnExplicitTransactionParticipatesInItsCommit() {
         val db = newDatabase()
@@ -409,13 +390,6 @@ class DiskExecutorTriggerTest {
         assertEquals(0, db.select("SELECT * FROM audit").rows.size)
     }
 
-    /**
-     * Durability proof unique to the disk-backed executor: a trigger cascade's rollback-on-failure
-     * (via the internal storage-engine savepoint [DiskExecutor.withTriggerAtomicity] takes, not a
-     * whole-catalog snapshot) must leave nothing behind even after a real close/reopen, and a
-     * trigger's own definition must itself survive to keep firing after reopen - mirrors the reopen
-     * tests already established for ON CONFLICT ([DiskExecutorOnConflictTest.conflictResolutionSurvivesAReopen]).
-     */
     @Test
     fun triggerCascadeAtomicitySurvivesAReopen() {
         val db = newDatabase()

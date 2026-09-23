@@ -10,14 +10,6 @@ import kotlin.test.assertContains
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * [Repl] wired to the real disk-backed [DiskCatalog]/[kestrel.store.sql.DiskExecutor] pair instead
- * of the in-memory [kestrel.catalog.Catalog]/[kestrel.engine.Executor] - the disk engine had been
- * fully built out (B+Tree/pager/WAL/2PL, DDL, DML, transactions, EXPLAIN) across many prior sessions
- * but was never reachable from the actual user-facing CLI, only from tests calling it directly. This
- * file is the end-to-end proof that a SQL session typed at the REPL really persists through the disk
- * engine, not just that the disk engine works in isolation.
- */
 class ReplDiskTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

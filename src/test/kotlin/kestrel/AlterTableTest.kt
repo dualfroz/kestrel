@@ -18,11 +18,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `ALTER TABLE ... ADD/DROP/RENAME COLUMN` and `DEFAULT` - the engine previously had no way to
- * change a table's shape after `CREATE TABLE` at all, and no way to fill a column omitted from an
- * INSERT column list with anything but NULL.
- */
 class AlterTableTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -40,8 +35,6 @@ class AlterTableTest {
     private fun text(value: String) = Value.TextValue(value)
     private fun real(value: Double) = Value.RealValue(value)
     private fun decimal(value: String) = Value.DecimalValue(BigDecimal(value))
-
-    // ---- ADD COLUMN ----
 
     @Test
     fun addColumnAppendsNullToExistingRowsWhenNoDefaultIsGiven() {
@@ -131,8 +124,6 @@ class AlterTableTest {
         assertFailsWith<ParseException> { run("ALTER TABLE t ADD COLUMN age INTEGER CHECK (age > 0)") }
     }
 
-    // ---- DROP COLUMN ----
-
     @Test
     fun dropColumnRemovesColumnFromSchemaAndData() {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, bio TEXT)")
@@ -171,7 +162,6 @@ class AlterTableTest {
         run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_code TEXT REFERENCES departments(code))")
         run("INSERT INTO departments VALUES (1, 'eng')")
         run("ALTER TABLE departments DROP COLUMN code CASCADE")
-        // The FK is gone, so an employee can now reference a nonexistent department code freely.
         run("INSERT INTO employees VALUES (1, 'ghost')")
         assertEquals(listOf(listOf(text("ghost"))), select("SELECT dept_code FROM employees").rows)
     }
@@ -238,8 +228,6 @@ class AlterTableTest {
         run("ALTER TABLE t DROP COLUMN age CASCADE")
         assertTrue(catalog.indexNames.isEmpty())
     }
-
-    // ---- RENAME COLUMN ----
 
     @Test
     fun renameColumnRenamesSchemaAndPreservesData() {
@@ -323,8 +311,6 @@ class AlterTableTest {
         assertTrue(plan.contains("Index Scan using idx_age"), plan)
         assertEquals(listOf(listOf(int(1))), select("SELECT id FROM t WHERE years = 30").rows)
     }
-
-    // ---- RENAME TABLE ----
 
     @Test
     fun renameTableRenamesAndPreservesData() {
@@ -440,8 +426,6 @@ class AlterTableTest {
         run("INSERT INTO t VALUES (1)")
         run("CREATE VIEW v AS WITH t AS (SELECT 99 AS id FROM t) SELECT * FROM t")
         run("ALTER TABLE t RENAME TO renamed")
-        // The CTE named "t" shadows the base table for the rest of that WITH clause, so the view
-        // must still yield the CTE's own row (99), not read from the (now renamed) base table.
         assertEquals(listOf(listOf(int(99))), select("SELECT * FROM v").rows)
         assertEquals(listOf(listOf(int(1))), select("SELECT * FROM renamed").rows)
     }
@@ -453,8 +437,6 @@ class AlterTableTest {
         run("ALTER TABLE t RENAME TO t")
         assertEquals(listOf(listOf(int(1))), select("SELECT * FROM t").rows)
     }
-
-    // ---- DEFAULT (CREATE TABLE + INSERT) ----
 
     @Test
     fun insertUsesColumnDefaultWhenColumnOmittedFromColumnList() {
@@ -512,8 +494,6 @@ class AlterTableTest {
             run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER DEFAULT 'not a number')")
         }
     }
-
-    // ---- DEFAULT (UPDATE) ----
 
     @Test
     fun updateSetToDefaultResetsTheColumnToItsDeclaredDefault() {
@@ -573,8 +553,6 @@ class AlterTableTest {
         assertEquals(listOf(listOf(text("pending"))), select("SELECT status FROM t").rows)
     }
 
-    // ---- DEFAULT (INSERT VALUES) ----
-
     @Test
     fun insertValuesWithLiteralDefaultUsesTheColumnsDeclaredDefault() {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'pending')")
@@ -633,8 +611,6 @@ class AlterTableTest {
         assertEquals(listOf(listOf(text("pending"))), select("SELECT status FROM t").rows)
     }
 
-    // ---- ADD CONSTRAINT / DROP CONSTRAINT ----
-
     @Test
     fun addConstraintCheckSucceedsWhenEveryExistingRowSatisfiesIt() {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
@@ -651,7 +627,6 @@ class AlterTableTest {
         run("INSERT INTO t VALUES (1, 30), (2, -5)")
         val error = assertFailsWith<KestrelException> { run("ALTER TABLE t ADD CONSTRAINT age_positive CHECK (age > 0)") }
         assertTrue(error.message!!.contains("age_positive"), error.message!!)
-        // Rejected, so never installed: a fresh negative row must still be free to insert.
         run("INSERT INTO t VALUES (3, -1)")
         assertEquals(2, select("SELECT id FROM t WHERE age < 0").rows.size)
     }
@@ -760,9 +735,6 @@ class AlterTableTest {
 
     @Test
     fun addConstraintForeignKeyRejectsAColumnCountMismatch() {
-        // Caught by the parser itself (parseInlineForeignKey, shared with CREATE TABLE's own
-        // table-level FOREIGN KEY clause) before Executor.executeAddForeignKeyConstraint's own
-        // redundant arity check would even run - same as CREATE TABLE's identical redundancy.
         run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)")
         run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER)")
         val error = assertFailsWith<KestrelException> {
@@ -911,8 +883,6 @@ class AlterTableTest {
         val error = assertFailsWith<KestrelException> { run("INSERT INTO employees VALUES (1, 'nonexistent')") }
         assertTrue(error.message!!.contains("FOREIGN KEY constraint failed"), error.message!!)
     }
-
-    // ---- ALTER COLUMN TYPE ----
 
     @Test
     fun changeColumnTypeWideningIntegerToRealCoercesExistingRowsWithNoExplicitUsing() {

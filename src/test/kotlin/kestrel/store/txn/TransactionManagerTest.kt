@@ -46,7 +46,7 @@ class TransactionManagerTest {
         assertContentEquals(after, fixture.diskManager.readPage(pageId).data)
 
         val otherTxn = fixture.manager.begin()
-        fixture.manager.acquireExclusive(otherTxn, pageId) // must not block: txn's locks were released on commit
+        fixture.manager.acquireExclusive(otherTxn, pageId)
     }
 
     @Test
@@ -67,7 +67,7 @@ class TransactionManagerTest {
         assertContentEquals(before, fixture.diskManager.readPage(pageId).data)
 
         val otherTxn = fixture.manager.begin()
-        fixture.manager.acquireExclusive(otherTxn, pageId) // must not block: aborted txn released its locks
+        fixture.manager.acquireExclusive(otherTxn, pageId)
     }
 
     @Test

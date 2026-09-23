@@ -11,13 +11,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
-/**
- * `SELECT DISTINCT`/`SELECT DISTINCT ON (...)` through [DiskExecutor] against a real [DiskCatalog]
- * backed by temp files - ports [kestrel.DistinctTest]'s in-memory scenarios 1:1, since `runSelect`
- * shares the same dedup pipeline shape as [kestrel.engine.SelectRunner]'s `Plan.projectRows`.
- * [distinctSurvivesClosingAndReopeningTheCatalog] has no in-memory equivalent - it exercises the one
- * thing only the disk-backed engine's persistence layer can demonstrate.
- */
 class DiskExecutorDistinctTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

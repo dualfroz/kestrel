@@ -12,13 +12,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `GROUP BY ROLLUP (...)` / `CUBE (...)` / `GROUPING SETS (...)` and the `GROUPING(...)` function -
- * a single query reporting subtotals (and a grand total) at several levels at once instead of a
- * separate `UNION ALL` of differently-grouped queries. See [kestrel.sql.ast.GroupingSpec] and
- * [kestrel.engine.GroupingSetExpansion] for how the sets are computed and
- * [kestrel.engine.GroupAggregation] for how a collapsed column reads as NULL outside an aggregate.
- */
 class GroupingSetsTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -142,8 +135,6 @@ class GroupingSetsTest {
     @Test
     fun aggregatesInsideTheSameQuerySeeRealPerRowValuesRegardlessOfCollapsedColumns() {
         seed()
-        // COUNT(*) on the grand-total row must count every row (4), not be tripped up by dept/region
-        // reading as NULL there - the nulling only ever applies outside an aggregate's own argument.
         val result = select(
             "SELECT dept, COUNT(*) AS n FROM sales GROUP BY ROLLUP (dept) ORDER BY GROUPING(dept), dept"
         )

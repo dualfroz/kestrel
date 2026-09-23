@@ -13,15 +13,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * A column's own declared `COLLATE` (see [kestrel.catalog.Column.collation]) against the disk
- * engine, mirroring a subset of [kestrel.ColumnCollationTest]'s in-memory scenarios to prove the
- * same [kestrel.engine.Evaluator]/[kestrel.engine.ColumnResolver.declaredCollation] machinery
- * [DiskExecutor] reuses behaves identically here, plus the one thing that only matters for this
- * engine: the declared collation is stored as a byte in [DirectoryEntryCodec]'s own binary schema
- * encoding (not this engine's text dump, which does not exist here), so it must survive a real
- * file close/reopen, not just staying alive in the same [DiskCatalog] instance.
- */
 class DiskExecutorColumnCollationTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -137,7 +128,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest]'s set-operation ORDER BY cases against the disk engine. */
     @Test
     fun declaredCollationAppliesToASetOperationsOrderByThroughAStarProjection() {
         val db = newDatabase()
@@ -174,7 +164,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf("Alice", "Bob", "Zoe", "bob"), result.rows.map { (it[1] as Value.TextValue).value })
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.groupByDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun groupByDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -186,7 +175,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.selectDistinctDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun selectDistinctDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -195,7 +183,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf("Alice", "Bob", "Zoe").map { listOf(Value.TextValue(it)) }, result.rows)
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.selectDistinctStarDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun selectDistinctStarDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -205,7 +192,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf("Alice", "Bob").map { listOf(Value.TextValue(it)) }, result.rows)
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.selectDistinctOnDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun selectDistinctOnDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -218,7 +204,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.countDistinctDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun countDistinctDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -226,7 +211,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(int(3), db.select("SELECT COUNT(DISTINCT name) FROM people").rows.single().single())
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.plainUnionDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun plainUnionDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -235,7 +219,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(Value.TextValue("Bob"))), result.rows)
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.intersectMatchesCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun intersectMatchesCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -244,7 +227,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(Value.TextValue("Bob"))), result.rows)
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.exceptExcludesCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun exceptExcludesCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -253,7 +235,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(Value.TextValue("Zoe"))), result.rows)
     }
 
-    /** Mirrors [kestrel.ColumnCollationTest.recursiveCteWithUnionDedupsCaseVariantsThroughTheColumnsDeclaredCollation]. */
     @Test
     fun recursiveCteWithUnionDedupsCaseVariantsThroughTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -271,11 +252,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(Value.TextValue("Bob")), listOf(Value.TextValue("Carol"))), result.rows)
     }
 
-    /**
-     * [DiskTable.rejectDuplicateUniqueConstraints] (declarative `UNIQUE`, heap-scanned on every
-     * write, no backing index) folded through [kestrel.engine.collationFoldedUniquenessKey] -
-     * mirrors [kestrel.ColumnCollationTest.uniqueConstraintHonorsTheColumnsDeclaredCollation].
-     */
     @Test
     fun declarativeUniqueConstraintHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -284,7 +260,6 @@ class DiskExecutorColumnCollationTest {
         assertFailsWith<DiskTableException> { db.run("INSERT INTO u1 VALUES (2, 'bob')") }
     }
 
-    /** Control negative: a `UNIQUE` column with no declared `COLLATE` behaves exactly as before this session. */
     @Test
     fun declarativeUniqueConstraintWithNoDeclaredCollationStaysBinary() {
         val db = newDatabase()
@@ -294,12 +269,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(2, db.select("SELECT id FROM u3").rows.size)
     }
 
-    /**
-     * [DiskTable.backfillSecondaryIndex]'s pre-existing-duplicate check, also folded through
-     * [kestrel.engine.collationFoldedUniquenessKey] - two rows already differing only by case
-     * under a `NOCASE`-declared column must now fail `CREATE UNIQUE INDEX` cleanly instead of
-     * silently building an index that lies about uniqueness.
-     */
     @Test
     fun createUniqueIndexHonorsTheColumnsDeclaredCollationAgainstPreexistingRows() {
         val db = newDatabase()
@@ -323,16 +292,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * [DiskIndexAccessPlanner]'s equivalent of [kestrel.ColumnCollationTest.indexedEqualityHonorsTheColumnsDeclaredCollation]:
-     * [DiskTable.findBySecondary] used to encode both the inserted row's key AND the search
-     * literal straight to bytes via [kestrel.store.codec.KeyCodec], with no regard for the
-     * column's declared `COLLATE` - so once `CREATE INDEX` made the planner choose an index scan
-     * over the full scan the un-indexed [bareEqualityHonorsTheColumnsDeclaredCollationWithoutAnExplicitClause]
-     * exercises, the case-variant row silently dropped out of the result instead of raising an
-     * error, since [DiskExecutor] only re-checks WHERE against candidates the chosen access plan
-     * already returned.
-     */
     @Test
     fun indexedEqualityHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -346,7 +305,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(int(1)), listOf(int(2))), indexed)
     }
 
-    /** Mirrors [indexedEqualityHonorsTheColumnsDeclaredCollation] for a trailing-space collation instead of case. */
     @Test
     fun indexedEqualityHonorsAnRtrimDeclaredCollation() {
         val db = newDatabase()
@@ -358,13 +316,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(int(1)), listOf(int(2))), db.select("SELECT id FROM tags WHERE tag = 'a' ORDER BY id").rows)
     }
 
-    /**
-     * Mirrors [kestrel.ColumnCollationTest.compositeIndexEqualityHonorsPerColumnDeclaredCollationIndependently]:
-     * a composite secondary index's key is `encodeKey(first) ++ encodeKey(last) ++ rid` - each
-     * column position must fold through its OWN declared collation independently (`first` is
-     * NOCASE, `last` stays BINARY) rather than, say, folding the whole composite key uniformly or
-     * not at all.
-     */
     @Test
     fun compositeIndexEqualityHonorsPerColumnDeclaredCollationIndependently() {
         val db = newDatabase()
@@ -379,12 +330,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * Safety net mirroring [kestrel.ColumnCollationTest.explicitCollateOverrideOnAnIndexedColumnFallsBackToASeqScanInsteadOfMisusingTheIndex]:
-     * [DiskIndexAccessPlanner.asColumnPredicate] only recognizes a bare [kestrel.sql.ast.ColumnExpression],
-     * so an explicit `COLLATE`-wrapped operand is excluded from pushdown entirely instead of being
-     * (wrongly) served by an index whose physical bytes are folded for the column's OWN collation.
-     */
     @Test
     fun explicitCollateOverrideOnAnIndexedColumnFallsBackToASeqScanInsteadOfMisusingTheIndex() {
         val db = newDatabase()
@@ -395,7 +340,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(emptyList(), db.select("SELECT id FROM people WHERE name COLLATE BINARY = 'BOB'").rows)
     }
 
-    /** Control negative: an index over a column with no declared `COLLATE` behaves exactly as before this session. */
     @Test
     fun indexedEqualityWithNoDeclaredCollationStaysBinary() {
         val db = newDatabase()
@@ -407,12 +351,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(int(1))), db.select("SELECT id FROM plain3 WHERE name = 'Bob'").rows)
     }
 
-    /**
-     * [DiskTable.findByPrimaryKey]'s point-lookup counterpart of [indexedEqualityHonorsTheColumnsDeclaredCollation]:
-     * a single-column, inline `PRIMARY KEY` is backed by its own B+Tree exactly like a secondary
-     * index, so `WHERE name = 'BOB'` against a `NOCASE`-declared `PRIMARY KEY` column must be
-     * planned as [DiskAccessPlan.PrimaryKeyPoint] and still find the case-variant row.
-     */
     @Test
     fun primaryKeyPointLookupHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -423,14 +361,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(int(10))), db.select("SELECT hits FROM pk1 WHERE name = 'BOB'").rows)
     }
 
-    /**
-     * [encodePrimaryKey]'s composite counterpart of [primaryKeyPointLookupHonorsTheColumnsDeclaredCollation]:
-     * a table-level composite `PRIMARY KEY (region, code)` folds each position through ITS OWN
-     * declared collation independently ([DiskAccessPlan.CompositePrimaryKeyPoint] mirrors
-     * [compositeIndexEqualityHonorsPerColumnDeclaredCollationIndependently] but for the PK's own
-     * B+Tree rather than a secondary index) - `region` is NOCASE (matches both rows) but `code`
-     * stays plain BINARY (only an exact-case match counts), so only row 1 survives both conjuncts.
-     */
     @Test
     fun compositePrimaryKeyPointLookupHonorsPerColumnDeclaredCollationIndependently() {
         val db = newDatabase()
@@ -441,14 +371,6 @@ class DiskExecutorColumnCollationTest {
         assertEquals(listOf(listOf(int(1))), db.select("SELECT hits FROM zones WHERE region = 'eu' AND code = 'west'").rows)
     }
 
-    /**
-     * [DiskTable.rangeByPrimaryKey]'s composite counterpart of [rangeQueryOnAPrimaryKeyHonorsTheColumnsDeclaredCollation]:
-     * a table-level composite `PRIMARY KEY (order_id, sku)` ranged on its LAST column (`sku`, the
-     * only shape [DiskAccessPlan.CompositePrimaryKeyRange] plans - see its own doc) after an
-     * equality prefix on `order_id` (plain BINARY, irrelevant here) still folds the bound through
-     * `sku`'s own declared `NOCASE` collation, same as the single-column case - `'Mango'` only
-     * survives `sku > 'lemon'` once both sides are canonicalized to `'MANGO' > 'LEMON'`.
-     */
     @Test
     fun rangeQueryOnTheLastColumnOfACompositePrimaryKeyAfterAnEqualityPrefixHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -462,19 +384,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * [DiskTable.rangeByPrimaryKey]'s counterpart of [primaryKeyPointLookupHonorsTheColumnsDeclaredCollation]
-     * for a range predicate instead of equality: [kestrel.engine.collationFoldedUniquenessKey] folds
-     * both the query's bound and every stored key through the same declared collation before the
-     * B+Tree ever compares bytes, so the ordering the index range-scans over agrees with what
-     * `Evaluator`'s own collation-aware `>`/`<` would decide row-by-row. The literal bound
-     * (`'ALICE'`, all-caps) is deliberately a different case than the stored `'Alice'` row it must
-     * exclude, proving the bound itself is folded too, not just the stored keys. `NoCase.canonicalize`
-     * uppercases, so the bound is deliberately given in lowercase (`'alice'`, not `'ALICE'`) - an
-     * unfolded lowercase bound would compare as bytewise *greater* than every uppercase-folded
-     * stored key (lowercase ASCII sorts after uppercase), wrongly excluding every row instead of
-     * just `'Alice'` itself.
-     */
     @Test
     fun rangeQueryOnAPrimaryKeyHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -488,18 +397,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * [DiskTable.rangeBySecondary]'s counterpart of [indexedEqualityHonorsTheColumnsDeclaredCollation]
-     * for a range predicate: a secondary index entry carries a RID suffix a primary key entry does
-     * not, so the fold has to reuse [kestrel.engine.collationFoldedUniquenessKey]'s
-     * (all-zero-suffix, all-one-suffix) bracketing trick rather than [DiskTable.rangeByPrimaryKey]'s
-     * bare bound - see [DiskTable.rangeBySecondary]'s own doc for why a bare bound would be wrong
-     * here. `>=` (inclusive) deliberately lands exactly on the folded value of an existing row
-     * (`'bob'` folds the same as the query's `'BOB'`) to prove the inclusive boundary itself is
-     * collation-aware, not just strictly-inside values. The bound is deliberately lowercase
-     * (`'bob'`), same reasoning as [rangeQueryOnAPrimaryKeyHonorsTheColumnsDeclaredCollation]: an
-     * unfolded lowercase bound would sort bytewise after every uppercase-folded stored key.
-     */
     @Test
     fun rangeQueryOnASecondaryIndexHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -514,16 +411,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * [DiskTable.rangeBySecondary]'s prefix+range counterpart of [rangeQueryOnASecondaryIndexHonorsTheColumnsDeclaredCollation]
-     * and [compositeIndexEqualityHonorsPerColumnDeclaredCollationIndependently]: an equality-prefix
-     * (`order_id`, plain BINARY, irrelevant here) plus a range on the composite index's second column
-     * (`sku`, NOCASE) must fold BOTH the stored `sku` values AND the query's own bound through
-     * `sku`'s declared collation before the B+Tree ever compares bytes - `'Mango'` only survives
-     * `sku > 'lemon'` once both sides are canonicalized to `'MANGO' > 'LEMON'`; an unfolded lowercase
-     * bound would sort bytewise after every uppercase-folded stored value (lowercase ASCII sorts
-     * after uppercase), wrongly excluding every row instead of just `'Apple'`/`'kiwi'`.
-     */
     @Test
     fun rangeQueryOnASecondaryIndexAfterAnEqualityPrefixHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()
@@ -538,14 +425,6 @@ class DiskExecutorColumnCollationTest {
         )
     }
 
-    /**
-     * Now that [DiskTable]'s secondary-index B+Tree keys are folded through the column's declared
-     * `COLLATE`, ONGOING enforcement of an already-created `CREATE UNIQUE INDEX` catches a
-     * case-variant duplicate too - this test used to assert the opposite (see git history) as a
-     * documented scope-cut; [kestrel.engine.collationFoldedUniquenessKey]'s own doc comment
-     * previously named this exact gap as "the harder, still-open half" of the disk engine's
-     * COLLATE support.
-     */
     @Test
     fun uniqueIndexEnforcementAfterCreationHonorsTheColumnsDeclaredCollation() {
         val db = newDatabase()

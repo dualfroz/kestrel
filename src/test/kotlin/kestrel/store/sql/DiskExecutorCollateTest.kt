@@ -11,15 +11,6 @@ import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-/**
- * `expr COLLATE BINARY|NOCASE|RTRIM` against the disk engine, mirroring a subset of
- * [kestrel.CollateTest]'s in-memory scenarios (equality, RTRIM, ORDER BY, IN) to prove the shared
- * [kestrel.engine.Evaluator]/[kestrel.engine.compareOrderKeyValues] code [kestrel.store.sql.
- * DiskExecutor] reuses directly behaves identically here, plus one disk-only scenario: a
- * COLLATE-bearing WHERE clause typed straight into the disk engine (never routed through
- * [kestrel.persistence.SqlWriter] - the disk engine has no text WAL to round-trip through) keeps
- * comparing the same way after a real file close/reopen.
- */
 class DiskExecutorCollateTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

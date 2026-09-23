@@ -596,8 +596,6 @@ class ParserTest {
         assertEquals("filter", expression.name)
     }
 
-    // LEFT/RIGHT are otherwise reserved (LEFT/RIGHT JOIN), so LEFT(str, n)/RIGHT(str, n) as scalar
-    // functions each need their own disambiguation in the parser.
     @Test
     fun leftParsesAsAScalarFunctionCallDespiteAlsoBeingTheLeftJoinKeyword() {
         val expression = firstProjection("SELECT LEFT(name, 3) FROM t")
@@ -1099,14 +1097,6 @@ class ParserTest {
         assertEquals(Collation.Binary, statement.columns[2].collation)
     }
 
-    /**
-     * COLLATE before DEFAULT is unambiguous: the column-definition loop consumes it as its own
-     * clause before ever calling [Parser.parseExpression] for DEFAULT's value. The other order
-     * (`DEFAULT 'x' COLLATE NOCASE`) is deliberately not covered here - `parseExpression` itself
-     * accepts a trailing `COLLATE` (see `parseCollate`), so it greedily becomes part of the DEFAULT
-     * expression instead (`DEFAULT ('x' COLLATE NOCASE)`), not a separate column-level clause; not a
-     * bug, just the same expression-grammar greediness this column-level COLLATE reuses.
-     */
     @Test
     fun columnLevelCollateBeforeDefaultAttachesToTheColumnNotTheDefaultExpression() {
         val statement = parseOne("CREATE TABLE t (name TEXT COLLATE NOCASE DEFAULT 'x')") as CreateTableStatement

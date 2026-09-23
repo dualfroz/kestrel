@@ -14,13 +14,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `GENERATED ALWAYS AS (expr) STORED` through [DiskExecutor] against a real [DiskCatalog] backed by
- * temp files - scenarios ported 1:1 from [kestrel.GeneratedColumnTest] (the in-memory engine's
- * equivalent) wherever they translate, plus [generatedColumnSurvivesAReopen] proving
- * [DirectoryEntryCodec] round-trips [kestrel.catalog.Column.generated] the same way it already did
- * [kestrel.catalog.Column.default].
- */
 class DiskExecutorGeneratedColumnTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -167,14 +160,9 @@ class DiskExecutorGeneratedColumnTest {
         db.run("INSERT INTO t (a) VALUES (5)")
         db.reopen()
         assertEquals(listOf(listOf(int(5), int(10))), db.select("SELECT a, b FROM t").rows)
-        // The GENERATED expression itself (not just data already computed before the reopen) must
-        // have round-tripped through DirectoryEntryCodec - proven by inserting a NEW row after the
-        // reopen and getting a freshly computed value, not a stale/missing one.
         db.run("INSERT INTO t (a) VALUES (7)")
         assertEquals(listOf(listOf(int(14))), db.select("SELECT b FROM t WHERE a = 7").rows)
     }
-
-    // ---- ALTER TABLE ADD COLUMN GENERATED ALWAYS AS ----
 
     @Test
     fun alterTableAddColumnGeneratedBackfillsEachExistingRowFromItsOwnOtherColumns() {

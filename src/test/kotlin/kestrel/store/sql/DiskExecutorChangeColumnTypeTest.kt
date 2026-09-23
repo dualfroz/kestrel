@@ -15,15 +15,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `ALTER TABLE t ALTER COLUMN col TYPE ...` on [DiskExecutor] - mirrors
- * [kestrel.AlterTableTest]'s in-memory `ChangeColumnType` cases. Built on [DiskTable.rewriteRows]
- * exactly like `ADD COLUMN` (see [DiskCatalog.changeColumnType]'s own doc): every row's stored
- * bytes are rewritten in place under a single WAL transaction, so a NOT NULL/CHECK failure
- * discovered partway through a multi-row rewrite aborts the whole transaction rather than leaving
- * some rows converted and others not - the disk-specific angle [kestrel.AlterTableTest] cannot
- * exercise at all, since the in-memory engine has no WAL to roll back.
- */
 class DiskExecutorChangeColumnTypeTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -42,7 +33,6 @@ class DiskExecutorChangeColumnTypeTest {
         fun exec(sql: String): StatementResult = run(sql).single()
         fun select(sql: String): SelectResult = exec(sql) as SelectResult
 
-        /** Closes and reopens the catalog against the same files, simulating a fresh process. */
         fun reopen() {
             catalog.close()
             catalog = DiskCatalog.open(dataFile, walFile)
@@ -172,14 +162,6 @@ class DiskExecutorChangeColumnTypeTest {
         assertEquals(listOf(listOf(text("100")), listOf(text(""))), db.select("SELECT code FROM t ORDER BY id ASC").rows)
     }
 
-    /**
-     * The disk-specific proof [kestrel.AlterTableTest] cannot give: row 1's converted value (20)
-     * would already have been written to its heap page by [DiskTable.rewriteRows] before row 2's
-     * CHECK violation is discovered and thrown - if the surrounding transaction were not aborted,
-     * row 1 would be left silently converted while row 2 was not. Asserting BOTH rows still hold
-     * their ORIGINAL, unconverted values after the failure is the proof that [DiskCatalog.changeColumnType]'s
-     * `catch { engine.abort(txn) }` really unwinds a partial per-row rewrite already applied to disk.
-     */
     @Test
     fun changeColumnTypeRevalidatesACheckConstraintAgainstTheNewValuesAndLeavesTheTableUnchangedOnFailure() {
         val db = newDatabase()
@@ -221,7 +203,6 @@ class DiskExecutorChangeColumnTypeTest {
         assertEquals(listOf(listOf(real(5.0))), db.select("SELECT amount FROM t").rows)
     }
 
-    /** The type change - and the converted data - must survive a full process close/reopen, not just live in the still-open transaction's page cache. */
     @Test
     fun changeColumnTypeSurvivesReopen() {
         val db = newDatabase()

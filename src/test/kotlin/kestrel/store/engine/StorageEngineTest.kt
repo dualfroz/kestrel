@@ -24,8 +24,6 @@ class StorageEngineTest {
         val txn = engine1.beginTransaction()
         val rid = heap.insert(txn, "durable across a crash".toByteArray())
         engine1.commit(txn)
-        // No engine1.close() / flush(): the committed page may still be sitting only in
-        // the buffer pool, never written to dataFile. Only the WAL commit record is durable.
 
         val engine2 = StorageEngine.open(dataFile, walFile)
         val reopenedHeap = engine2.openHeap(heap.headerPageId)

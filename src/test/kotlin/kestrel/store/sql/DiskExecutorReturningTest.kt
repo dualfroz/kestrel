@@ -16,13 +16,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 
-/**
- * `RETURNING` on INSERT/UPDATE/DELETE through [DiskExecutor] against a real [DiskCatalog] backed by
- * temp files - see [DiskExecutorTest] for the general end-to-end pattern this reuses. Scenarios are
- * ported 1:1 from [kestrel.ReturningTest] (the in-memory engine's equivalent) wherever they
- * translate; [returningSurvivesAReopen] has no in-memory equivalent since [DiskExecutor] has no
- * [kestrel.persistence.SqlWriter] counterpart - durability here means surviving a real close/reopen.
- */
 class DiskExecutorReturningTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

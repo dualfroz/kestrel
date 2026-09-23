@@ -281,9 +281,6 @@ class DiskTableTest {
         catalog.commit(reader)
     }
 
-    // --- UNIQUE secondary index (CREATE UNIQUE INDEX): backed by the same B+Tree secondary
-    // index shape as a non-unique one, but insert/update reject a value collision.
-
     @Test
     fun uniqueSecondaryIndexRejectsAnInsertSharingAnExistingNonNullValue() {
         val catalog = newCatalog()
@@ -351,9 +348,6 @@ class DiskTableTest {
         assertFailsWith<DiskTableException> { catalog.createIndex("users", "idx_name", "name", unique = true) }
         assertTrue(table.secondaryIndexes.isEmpty())
     }
-
-    // --- composite (multi-column) secondary index: same B+Tree shape as a single-column one,
-    // keyed by KeyCodec.encodeKey over every listed column rather than a single value's encoding.
 
     @Test
     fun compositeSecondaryIndexFindsRowsByEqualityOnEveryColumn() {
@@ -425,9 +419,6 @@ class DiskTableTest {
         assertFailsWith<DiskTableException> { catalog.createIndex("registrations", "idx_reg", listOf("event_id", "user_id"), unique = true) }
         assertTrue(table.secondaryIndexes.isEmpty())
     }
-
-    // --- declarative UNIQUE constraints (TableSchema.uniqueConstraints): no backing index,
-    // enforced by DiskTable with a full heap scan, so a single constraint can span multiple columns.
 
     private val registrationColumns = listOf(
         Column("event_id", ColumnType.Integer, notNull = false, primaryKey = false),

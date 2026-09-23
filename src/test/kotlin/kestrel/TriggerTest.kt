@@ -44,7 +44,6 @@ class TriggerTest {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         run("CREATE TABLE guard (x INTEGER NOT NULL)")
         run("CREATE TRIGGER reject_all BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO guard VALUES (NULL); END")
-        // The row itself is perfectly valid for t's own PRIMARY KEY - only the trigger rejects it.
         assertFailsWith<KestrelException> { run("INSERT INTO t VALUES (1)") }
         assertEquals(0, select("SELECT * FROM t").rows.size)
     }
@@ -329,8 +328,6 @@ class TriggerTest {
         run("CREATE TRIGGER log AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit VALUES (NEW.id); END")
         run("INSERT INTO t VALUES (5)")
         assertEquals(listOf(listOf(int(5))), select("SELECT * FROM audit").rows)
-        // OLD is simply not bound for an INSERT trigger, so an OLD.id reference in the body falls
-        // through exactly like any other unresolvable column in an INSERT's VALUES list would.
         run("CREATE TRIGGER bad AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit VALUES (OLD.id); END")
         assertFailsWith<KestrelException> { run("INSERT INTO t VALUES (6)") }
     }

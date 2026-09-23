@@ -23,17 +23,6 @@ class PersistenceTest {
         return output.toString()
     }
 
-    /**
-     * Delivers [text] like a normal [StringReader], but throws instead of ever signalling EOF -
-     * simulating a process that vanished (killed, crashed, power loss) right after its last
-     * statement ran, never reaching either `.exit` or a graceful end of input. [Repl.run] only
-     * checkpoints (see [Repl.finish]) on one of those two paths, so this is the one way to drive it
-     * through every statement in [text] while proving NOTHING beyond the incremental WAL write each
-     * statement already triggered on its own (via [kestrel.cli.Repl.recordForPersistence]) ever
-     * makes it to disk - exactly the scenario a TEMP table's persistence exclusion must hold up
-     * under, not just the far more common clean-`.exit`-then-checkpoint path every other test here
-     * exercises.
-     */
     private class CrashingReader(text: String) : Reader() {
         private val delegate = StringReader(text)
         override fun read(cbuf: CharArray, off: Int, len: Int): Int {
@@ -567,12 +556,6 @@ class PersistenceTest {
         assertContains(reopened, "red")
     }
 
-    /**
-     * `COUNT(DISTINCT ...)`'s `distinct` flag is a field on [kestrel.sql.ast.FunctionExpression] just
-     * like STRING_AGG's `separator`/`orderBy` above - this proves [kestrel.persistence.SqlWriter]
-     * actually dumps the `DISTINCT` keyword back out (not just the wrapped argument), so a view built
-     * on it does not silently turn into a plain, non-deduplicating `COUNT` after reopen.
-     */
     @Test
     fun countDistinctViewSurvivesReopenAfterCheckpoint() {
         val dir = tempDir()
@@ -594,12 +577,6 @@ class PersistenceTest {
         assertContains(reopened, "| 1 |")
     }
 
-    /**
-     * `FILTER (WHERE ...)`'s predicate is a field on [kestrel.sql.ast.FunctionExpression] just like
-     * STRING_AGG's `separator`/`orderBy` and COUNT's `distinct` above - this proves
-     * [kestrel.persistence.SqlWriter] actually dumps the `FILTER (WHERE ...)` clause back out, so a
-     * view built on it does not silently turn into an unfiltered aggregate after reopen.
-     */
     @Test
     fun filteredAggregateViewSurvivesReopenAfterCheckpoint() {
         val dir = tempDir()
@@ -621,13 +598,6 @@ class PersistenceTest {
         assertContains(reopened, "| 0 |")
     }
 
-    /**
-     * [kestrel.catalog.RelationRename] rewrites a renamed table's name everywhere it could appear in a
-     * dependent view's stored query, including inside a nested subquery - this proves that recursion
-     * now also reaches a subquery sitting inside an aggregate's `FILTER (WHERE ...)` predicate
-     * specifically (a [kestrel.sql.ast.FunctionExpression] field distinct from `argument`, easy to miss
-     * when only `argument` gets rewritten), not just a subquery in WHERE/projection.
-     */
     @Test
     fun renameTablePropagatesIntoAViewsAggregateFilterSubquery() {
         val dir = tempDir()
@@ -647,13 +617,6 @@ class PersistenceTest {
         assertContains(reopened, "| 1 |")
     }
 
-    /**
-     * [kestrel.catalog.RelationRename] rewrites a renamed table's name everywhere it could appear in a
-     * dependent view's stored query, including inside a nested subquery - this proves that recursion
-     * now also reaches a subquery sitting inside STRING_AGG's `separator` argument specifically (a
-     * [kestrel.sql.ast.FunctionExpression] field distinct from `argument`, easy to miss when only
-     * `argument` gets rewritten), not just a subquery in WHERE/projection.
-     */
     @Test
     fun renameTablePropagatesIntoAViewsStringAggSeparatorSubquery() {
         val dir = tempDir()
@@ -727,13 +690,6 @@ class PersistenceTest {
         assertTrue(!reopened.contains("100"), "amount=100 lost the DISTINCT ON tie-break and must not survive")
     }
 
-    /**
-     * Mirrors [renameTablePropagatesIntoAViewsStringAggSeparatorSubquery] for the newly added
-     * [kestrel.sql.ast.SelectStatement.distinctOn] field - [kestrel.catalog.RelationRename] must walk
-     * into it exactly like it already does for `groupBy`/`having`, or a subquery hiding inside
-     * `DISTINCT ON (...)` would silently keep pointing at a table name that no longer exists after
-     * reopen (the rewritten AST, not the original text, is what SqlWriter dumps on checkpoint).
-     */
     @Test
     fun renameTablePropagatesIntoAViewsDistinctOnSubquery() {
         val dir = tempDir()
@@ -755,12 +711,6 @@ class PersistenceTest {
         assertContains(reopened, "50")
     }
 
-    /**
-     * A trigger created before its table's data would refire on every reload (SqlWriter.dump
-     * intentionally writes CREATE TRIGGER only after every table's rows) - this proves reopening
-     * does NOT duplicate the audit row the trigger already produced during the first session,
-     * while a genuinely new INSERT after reopening still fires it normally.
-     */
     @Test
     fun triggerCreationIsDumpedAfterDataSoReloadDoesNotRefireForAlreadyPersistedRows() {
         val dir = tempDir()
@@ -783,11 +733,6 @@ class PersistenceTest {
         assertContains(afterSecondReopen, "2 rows")
     }
 
-    /**
-     * The dumped `CREATE SEQUENCE` must bake in the sequence's CURRENT position (via `START WITH`),
-     * not the one it was originally created with - otherwise a checkpoint reopen would reissue
-     * already-handed-out values, breaking the one guarantee a sequence exists to provide.
-     */
     @Test
     fun sequencePositionSurvivesReopenAfterCheckpointInsteadOfRestarting() {
         val dir = tempDir()
@@ -801,8 +746,6 @@ class PersistenceTest {
             """.trimIndent()
         )
         val reopened = runScript(dir, "INSERT INTO t VALUES (NEXTVAL('seq'));\nSELECT id FROM t WHERE id = 3;\n.exit\n")
-        // A restart-from-scratch bug would reissue 1 as the third value (1, 2, 1) instead of
-        // continuing to 3 - this query would then find zero rows instead of one.
         assertContains(reopened, "1 row")
     }
 
@@ -843,14 +786,6 @@ class PersistenceTest {
         assertContains(reopened, "no sequences")
     }
 
-    /**
-     * PREPARE/EXECUTE themselves are session-scoped and never written to the WAL (see
-     * PrepareStatement's own doc) - but an INSERT run THROUGH EXECUTE is real data and must survive
-     * a reopen exactly like one typed literally would. This is the whole reason
-     * [kestrel.cli.Repl.executeBuffer] persists EXECUTE's RESOLVED statement instead of its literal
-     * `EXECUTE name(...)` text: that literal text would be meaningless to replay against a fresh
-     * session that never re-ran the PREPARE.
-     */
     @Test
     fun executeOfAPreparedInsertPersistsTheResolvedRowAcrossReopen() {
         val dir = tempDir()
@@ -1015,10 +950,6 @@ class PersistenceTest {
             INSERT INTO scratch VALUES (222);
             """.trimIndent() + "\n"
         )
-        // No checkpoint ever ran, so this reopen replays raw incremental WAL entries only - if the
-        // TEMP table's CREATE/INSERT had leaked into that log, replaying "INSERT INTO scratch..."
-        // would either resurrect it or (if its CREATE alone were skipped but not its INSERT) throw
-        // "no such table" loudly enough to show up here.
         val reopened = runScript(dir, "SELECT id FROM regular;\nSELECT id FROM scratch;\n.exit\n")
         assertContains(reopened, "111")
         assertContains(reopened, "Error: no such table: scratch")
@@ -1038,11 +969,6 @@ class PersistenceTest {
             TRUNCATE TABLE regular, scratch;
             """.trimIndent() + "\n"
         )
-        // If the TEMP name were not stripped out of the persisted TRUNCATE text, replaying
-        // "TRUNCATE TABLE regular, scratch" against a reload where scratch was never recreated would
-        // throw before truncating ANYTHING (Catalog.truncateTables validates every name up front) -
-        // silently leaving regular's rows intact instead of empty, since replay errors are swallowed
-        // (see Repl.printResult's `if (replaying) return`).
         val reopened = runScript(dir, "SELECT id FROM regular;\n.exit\n")
         assertTrue(!reopened.contains("111") && !reopened.contains("222"), "regular's TRUNCATE must survive the crash-before-checkpoint replay")
     }

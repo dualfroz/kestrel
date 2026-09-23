@@ -14,14 +14,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED ...` through [DiskExecutor] against a real
- * [DiskCatalog] backed by temp files - see [DiskExecutorTest] for the general end-to-end pattern this
- * reuses, and [kestrel.MergeTest] for the in-memory engine's equivalent scenarios, ported 1:1 wherever
- * they translate (every one of them does; the disk-backed engine has no scope cut left for MERGE).
- * [mergeSurvivesClosingAndReopeningTheCatalog] has no in-memory equivalent - it exercises the one thing
- * only the disk-backed engine's persistence layer can demonstrate.
- */
 class DiskExecutorMergeTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

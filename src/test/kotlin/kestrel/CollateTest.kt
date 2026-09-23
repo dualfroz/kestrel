@@ -12,19 +12,6 @@ import kestrel.storage.Value
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-/**
- * `expr COLLATE BINARY|NOCASE|RTRIM` (SQL:1999), the explicit, expression-level form - see
- * [kestrel.ColumnCollationTest] for a column's own declared `COLLATE` (`CREATE TABLE ... col TYPE
- * COLLATE name`), which only ever changes what a *bare* column reference compares with and is
- * always overridden by an explicit annotation like the one covered here. Covers every comparison
- * site [kestrel.engine.Evaluator] threads a resolved [kestrel.storage.Collation] through (`=`/`<>`/
- * `<`/`<=`/`>`/`>=`, `IN`, `BETWEEN`, a searched-`CASE`'s operand match) plus every sort that shares
- * [kestrel.engine.compareOrderKeyValues] (top-level ORDER BY, a window's `OVER (... ORDER BY
- * ...)`), and a persistence round-trip through [SqlWriter]. [kestrel.store.sql.DiskExecutorCollateTest]
- * mirrors the comparison and ORDER BY cases against the disk engine, proving the shared
- * [kestrel.engine.Evaluator]/[kestrel.engine.compareOrderKeyValues] code is genuinely shared, not
- * reimplemented per engine.
- */
 class CollateTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)

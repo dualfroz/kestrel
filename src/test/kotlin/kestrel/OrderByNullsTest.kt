@@ -10,13 +10,6 @@ import kestrel.storage.Value
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-/**
- * `ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST]` on the in-memory engine, covering every
- * comparator that shares [kestrel.engine.compareOrderKeyValues]: plain top-level ORDER BY, a
- * GROUP BY's own ORDER BY (over already-aggregated rows), a window function's `OVER (... ORDER BY
- * ...)`, and STRING_AGG's internal ORDER BY. [kestrel.store.sql.DiskExecutorOrderByNullsTest] mirrors
- * the plain-ORDER-BY and window cases against the disk engine.
- */
 class OrderByNullsTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -29,7 +22,6 @@ class OrderByNullsTest {
     private fun int(value: Long) = Value.IntegerValue(value)
     private fun text(value: String) = Value.TextValue(value)
 
-    /** ids 2 and 4 are NULL; the rest ascend 10/20/30 out of id order so ASC/DESC actually reorder them. */
     private fun seedScored() {
         run("CREATE TABLE scored (id INTEGER PRIMARY KEY, score INTEGER)")
         run("INSERT INTO scored VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 20)")

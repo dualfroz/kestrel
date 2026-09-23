@@ -122,7 +122,6 @@ class TruncateTest {
 
     @Test
     fun truncateRestrictionAppliesEvenWhenTheForeignKeyDeclaresOnDeleteCascade() {
-        // TRUNCATE consults no per-row ON DELETE action at all - RESTRICT blocks regardless of it.
         run("CREATE TABLE departments (id INTEGER PRIMARY KEY)")
         run("CREATE TABLE employees (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES departments(id) ON DELETE CASCADE)")
         run("INSERT INTO departments VALUES (1)")
@@ -191,8 +190,6 @@ class TruncateTest {
         run("BEGIN")
         exec("TRUNCATE TABLE t RESTART IDENTITY")
         run("ROLLBACK")
-        // Both the rows (1, 2) AND the sequence's advanced position come back - if RESTART IDENTITY's
-        // reset had survived the ROLLBACK, this INSERT would collide with the just-restored id 1.
         run("INSERT INTO t (label) VALUES ('c')")
         assertEquals(listOf(int(1), int(2), int(3)), select("SELECT id FROM t").rows.map { it.single() })
     }

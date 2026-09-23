@@ -32,7 +32,6 @@ class TupleCodecTest {
         )
         val decoded = TupleCodec.decode(TupleCodec.encode(row))
         assertEquals(row, decoded)
-        // Exact scale round-trip (not just numeric equality): -19.990 must stay 3-decimal, not collapse to -19.99.
         assertEquals(3, (decoded[1] as Value.DecimalValue).value.scale())
     }
 
@@ -84,7 +83,6 @@ class TupleCodecTest {
     @Test
     fun encodingIsCompactForSmallIntegers() {
         val encoded = TupleCodec.encode(listOf(Value.IntegerValue(5)))
-        // 1 byte column count + 1 byte null bitmap + 1 byte tag + 1 byte zigzag payload
         assertEquals(4, encoded.size)
     }
 }

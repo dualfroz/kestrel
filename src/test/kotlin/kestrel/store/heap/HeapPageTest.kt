@@ -82,7 +82,6 @@ class HeapPageTest {
             slots.add(slot)
         }
         for (slot in slots.take(slots.size / 2)) HeapPage.delete(page, slot)
-        // Freed space is fragmented (tombstoned), not contiguous, until compact runs from within insert.
         assertTrue(HeapPage.insert(page, ByteArray(250)) != null)
     }
 

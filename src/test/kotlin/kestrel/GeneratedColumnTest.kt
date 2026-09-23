@@ -13,11 +13,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * `GENERATED ALWAYS AS (expr) STORED` on the in-memory engine - a column whose value is always
- * derived from the rest of its own row, never assigned directly, and recomputed on every
- * INSERT/UPDATE. See [kestrel.store.sql.DiskExecutorGeneratedColumnTest] for the disk engine.
- */
 class GeneratedColumnTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -30,8 +25,6 @@ class GeneratedColumnTest {
     private fun select(sql: String): SelectResult = exec(sql) as SelectResult
 
     private fun int(value: Long) = Value.IntegerValue(value)
-
-    // ---- computed on INSERT ----
 
     @Test
     fun generatedColumnIsComputedWhenOmittedFromInsert() {
@@ -71,8 +64,6 @@ class GeneratedColumnTest {
         assertEquals(listOf(listOf(int(21))), select("SELECT total FROM t").rows)
     }
 
-    // ---- computed on UPDATE ----
-
     @Test
     fun updatingADependencyColumnRecomputesTheGeneratedColumn() {
         run("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)")
@@ -97,8 +88,6 @@ class GeneratedColumnTest {
         assertEquals(listOf(listOf(int(18))), select("SELECT b FROM t").rows)
     }
 
-    // ---- ON CONFLICT DO UPDATE ----
-
     @Test
     fun onConflictDoUpdateRecomputesTheGeneratedColumn() {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)")
@@ -115,8 +104,6 @@ class GeneratedColumnTest {
             run("INSERT INTO t (id, a) VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET b = 1")
         }
     }
-
-    // ---- MERGE ----
 
     @Test
     fun mergeInsertComputesTheGeneratedColumn() {
@@ -140,8 +127,6 @@ class GeneratedColumnTest {
         assertEquals(listOf(listOf(int(18))), select("SELECT b FROM t").rows)
     }
 
-    // ---- ordering with CHECK / NOT NULL ----
-
     @Test
     fun checkConstraintSeesTheComputedGeneratedValueNotItsOldOne() {
         run("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED CHECK (b > 0))")
@@ -155,8 +140,6 @@ class GeneratedColumnTest {
         run("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a) STORED NOT NULL)")
         assertFailsWith<KestrelException> { run("INSERT INTO t (a) VALUES (NULL)") }
     }
-
-    // ---- validation at CREATE TABLE ----
 
     @Test
     fun rejectsGeneratedExpressionReferencingANonexistentColumn() {
@@ -200,8 +183,6 @@ class GeneratedColumnTest {
         assertTrue(error.message!!.contains("GENERATED"))
     }
 
-    // ---- RENAME COLUMN / DROP COLUMN interaction ----
-
     @Test
     fun renameColumnPropagatesIntoADependentGeneratedExpression() {
         run("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)")
@@ -226,8 +207,6 @@ class GeneratedColumnTest {
         assertEquals(listOf("c"), result.columns)
         assertEquals(listOf(listOf(text("x"))), result.rows)
     }
-
-    // ---- ALTER TABLE ADD COLUMN GENERATED ALWAYS AS ----
 
     @Test
     fun alterTableAddColumnGeneratedBackfillsEachExistingRowFromItsOwnOtherColumns() {
@@ -269,9 +248,6 @@ class GeneratedColumnTest {
     fun alterTableAddColumnGeneratedNotNullSkipsTheDefaultRequirementOnANonEmptyTable() {
         run("CREATE TABLE t (a INTEGER)")
         run("INSERT INTO t (a) VALUES (1), (2)")
-        // A plain NOT NULL column with no DEFAULT would be rejected here (see the DEFAULT-less
-        // ADD COLUMN rule tested elsewhere) - GENERATED has its own per-row value to backfill with
-        // instead, so it needs no DEFAULT at all even though the table already has rows.
         run("ALTER TABLE t ADD COLUMN b INTEGER NOT NULL GENERATED ALWAYS AS (a * 2) STORED")
         assertEquals(listOf(listOf(int(2)), listOf(int(4))), select("SELECT b FROM t ORDER BY a ASC").rows)
     }

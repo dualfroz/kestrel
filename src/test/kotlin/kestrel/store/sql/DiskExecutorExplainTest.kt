@@ -12,13 +12,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * Closes the "this executor has no `explain`" scope cut documented on [DiskExecutor.executeCreateView]:
- * proves EXPLAIN on the disk-backed executor both describes the right plan shape (Seq Scan/Primary Key
- * Scan/Index Scan/Nested Loop/GroupAggregate/Sort/Limit/CTE/UNION) AND - the part a plan-text assertion
- * alone cannot show - never touches a single row of real table data to produce it, verified against the
- * same [DiskTable] access counters [DiskExecutorTest] itself uses to prove index pushdown really happens.
- */
 class DiskExecutorExplainTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 

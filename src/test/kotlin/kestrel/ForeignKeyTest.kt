@@ -200,7 +200,6 @@ class ForeignKeyTest {
         exec("DROP TABLE departments CASCADE")
         assertEquals(listOf("employees"), catalog.tableNames)
         assertEquals(1, select("SELECT * FROM employees").rows.size)
-        // the constraint is gone, so a now-dangling value is accepted
         assertEquals(InsertResult(1), exec("INSERT INTO employees VALUES (2, 'linus', 99)"))
     }
 

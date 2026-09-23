@@ -92,7 +92,6 @@ class DiskManagerTest {
         manager.writePage(page)
         manager.close()
 
-        // Flip a byte inside the payload region of the physical slot for `id`, after the header slot and checksum.
         val slotSize = 4 + Page.PAGE_SIZE
         val offset = (id + 1) * slotSize + 4 + 10
         val raf = java.io.RandomAccessFile(file, "rw")

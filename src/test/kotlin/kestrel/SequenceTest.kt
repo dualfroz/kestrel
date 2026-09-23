@@ -155,8 +155,6 @@ class SequenceTest {
         run("INSERT INTO t VALUES (NEXTVAL('seq'))")
         run("ROLLBACK")
         run("INSERT INTO t VALUES (NEXTVAL('seq'))")
-        // The rolled-back row never landed, but NEXTVAL's advance to 1 survives - the surviving
-        // insert gets 2, not a reused 1.
         assertEquals(listOf(listOf(int(2))), select("SELECT id FROM t").rows)
     }
 
@@ -214,7 +212,6 @@ class SequenceTest {
         run("CREATE SEQUENCE seq")
         run("CREATE TABLE orders (id INTEGER DEFAULT NEXTVAL('seq'))")
         run("INSERT INTO orders (id) VALUES (DEFAULT)")
-        // If CREATE TABLE's own validation had already called NEXTVAL once, this would be 2.
         assertEquals(listOf(listOf(int(1))), select("SELECT id FROM orders").rows)
     }
 
@@ -297,7 +294,6 @@ class SequenceTest {
         run("CREATE SEQUENCE seq MINVALUE 1 MAXVALUE 3")
         run("ALTER SEQUENCE seq NO MAXVALUE")
         run("CREATE TABLE t (id INTEGER)")
-        // Was capped at 3 before the ALTER; NO MAXVALUE lifts it back to the ascending default.
         run("INSERT INTO t VALUES (NEXTVAL('seq')), (NEXTVAL('seq')), (NEXTVAL('seq')), (NEXTVAL('seq'))")
         assertEquals(4, select("SELECT id FROM t").rows.size)
     }

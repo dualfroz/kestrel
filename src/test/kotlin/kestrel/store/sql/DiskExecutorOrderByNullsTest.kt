@@ -11,11 +11,6 @@ import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-/**
- * `ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST]` against the disk engine, mirroring
- * [kestrel.OrderByNullsTest]'s in-memory scenarios to prove [kestrel.engine.compareOrderKeyValues]
- * is genuinely shared rather than reimplemented per engine with divergent NULL handling.
- */
 class DiskExecutorOrderByNullsTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -33,7 +28,6 @@ class DiskExecutorOrderByNullsTest {
 
     private fun newDatabase(): Database = Database(tempFile("kestrel-disk-nulls-data"), tempFile("kestrel-disk-nulls-wal"))
 
-    /** ids 2 and 4 are NULL; the rest ascend 10/20/30 out of id order so ASC/DESC actually reorder them. */
     private fun Database.seedScored() {
         run("CREATE TABLE scored (id INTEGER PRIMARY KEY, score INTEGER)")
         run("INSERT INTO scored VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 20)")

@@ -217,7 +217,6 @@ class EvaluatorTest {
             Value.DateValue(LocalDate.of(2024, 3, 5)),
             evalConstant(CallExpression("DATE_SUB", listOf(date, intLit(10))))
         )
-        // Crossing a month boundary exercises java.time's own carry logic rather than hand-rolled arithmetic.
         assertEquals(
             Value.DateValue(LocalDate.of(2024, 4, 2)),
             evalConstant(CallExpression("DATE_ADD", listOf(date, intLit(18))))
@@ -328,7 +327,6 @@ class EvaluatorTest {
             Value.DecimalValue(BigDecimal("1.99")),
             evalConstant(CallExpression("TRUNC", listOf(decimal, intLit(2))))
         )
-        // TRUNC never rounds up, exactly the case where it must differ from ROUND's HALF_UP default.
         assertEquals(Value.RealValue(1.0), evalConstant(CallExpression("TRUNC", listOf(realLit(1.9)))))
         assertEquals(Value.RealValue(2.0), evalConstant(CallExpression("ROUND", listOf(realLit(1.9)))))
     }

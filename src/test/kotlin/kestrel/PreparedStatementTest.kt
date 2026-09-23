@@ -17,11 +17,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * End-to-end tests for `PREPARE`/`EXECUTE`/`DEALLOCATE` on the in-memory engine: `$1`, `$2`, ...
- * positional parameters resolved by [kestrel.engine.ParameterSubstitution], driven through the same
- * [Lexer]/[Parser]/[Executor] pipeline real SQL text goes through, not the AST directly.
- */
 class PreparedStatementTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -104,8 +99,6 @@ class PreparedStatementTest {
         )
         run("EXECUTE topUp(10)")
         assertEquals(listOf(listOf(Value.IntegerValue(510))), select("SELECT balance FROM accounts WHERE id = 1").rows)
-        // Executed a second time with a DIFFERENT argument to prove substitution recomputes fresh
-        // every EXECUTE rather than baking in whatever value the first call used.
         run("EXECUTE topUp(20)")
         assertEquals(listOf(listOf(Value.IntegerValue(520))), select("SELECT balance FROM accounts WHERE id = 1").rows)
     }
@@ -132,8 +125,6 @@ class PreparedStatementTest {
         run("CREATE TABLE staging (id INTEGER PRIMARY KEY, name TEXT NOT NULL, balance INTEGER)")
         run("INSERT INTO accounts VALUES (1, 'ada', 100)")
         run("INSERT INTO staging VALUES (1, 'ada', 500)")
-        // Only a WHEN MATCHED clause - a source row the ON condition rejects has no NOT MATCHED
-        // clause to fall into, so it is a true no-op rather than an insert attempt.
         run(
             "PREPARE conditionalTopUp AS MERGE INTO accounts USING staging " +
                 "ON accounts.id = staging.id AND staging.balance > \$1 " +
@@ -204,8 +195,6 @@ class PreparedStatementTest {
         run("BEGIN")
         run("PREPARE byId AS SELECT name FROM accounts WHERE id = \$1")
         run("ROLLBACK")
-        // Session-scoped, deliberately outside the transactional catalog snapshot - see
-        // PrepareStatement's own doc for why.
         assertEquals(listOf(listOf(Value.TextValue("ada"))), select("EXECUTE byId(1)").rows)
     }
 
@@ -228,9 +217,6 @@ class PreparedStatementTest {
     @Test
     fun aParameterTypedDirectlyOutsidePrepareParsesButOnlyFailsAtEvaluationTime() {
         seedAccounts()
-        // $1 is structurally legal wherever any expression is (no PREPARE context exists at parse
-        // time to reject it) - GROUP BY validation lets it through exactly like a literal would, and
-        // it only fails once evaluation actually needs a real value for it.
         val exception = assertFailsWith<KestrelException> { run("SELECT \$1, COUNT(*) FROM accounts GROUP BY name") }
         assertTrue(exception.message!!.contains("parameter reference"), exception.message)
     }

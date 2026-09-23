@@ -82,8 +82,6 @@ class DistinctTest {
     fun distinctCombinesWithGroupBy() {
         run("CREATE TABLE t (a INTEGER, b INTEGER)")
         run("INSERT INTO t VALUES (1, 10), (1, 20), (2, 10)")
-        // GROUP BY a, b produces three distinct groups; DISTINCT on the projected `a` alone
-        // collapses the two groups sharing a=1 down to one output row.
         val result = select("SELECT DISTINCT a FROM t GROUP BY a, b ORDER BY a")
         assertEquals(listOf(listOf(int(1)), listOf(int(2))), result.rows)
     }

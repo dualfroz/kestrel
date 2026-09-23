@@ -40,7 +40,6 @@ class CheckConstraintTest {
     @Test
     fun checkPassesWhenExpressionIsUnknownBecauseOfNull() {
         run("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))")
-        // three-valued logic: NULL > 0 is UNKNOWN, not FALSE, so the row is accepted
         assertEquals(InsertResult(1), exec("INSERT INTO t VALUES (1, NULL)"))
     }
 

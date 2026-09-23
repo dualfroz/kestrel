@@ -13,7 +13,6 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Covers multi-column `CREATE [UNIQUE] INDEX idx ON t (a, b, ...)`: parsing, uniqueness enforcement over the whole tuple, and query-planner pushdown (full match, equality prefix, and range-after-prefix scans). */
 class CompositeIndexTest {
     private val catalog = Catalog()
     private val executor = Executor(catalog)
@@ -65,8 +64,6 @@ class CompositeIndexTest {
     fun compositeUniqueIndexRejectsDuplicateTupleButAllowsPartialReuse() {
         seedPairs()
         run("CREATE UNIQUE INDEX uidx ON pairs (a, b)")
-        // (1, 10) already exists as row 1; same 'a' with a different 'b', or same 'b' with a
-        // different 'a', must both be allowed - only the exact tuple collides.
         run("INSERT INTO pairs VALUES (7, 1, 99)")
         run("INSERT INTO pairs VALUES (8, 9, 10)")
         assertFailsWith<KestrelException> { run("INSERT INTO pairs VALUES (9, 1, 10)") }
@@ -166,7 +163,6 @@ class CompositeIndexTest {
         assertTrue(plan.any { it.contains("Index Scan using idxRegionAmount") }, "got $plan")
         val indexed = select("SELECT id FROM sales WHERE region = 'EU' AND amount > 100").rows
         assertEquals(scanned, indexed)
-        // Must exclude the US row with a bigger amount (300) and the EU row at exactly 100.
         assertEquals(listOf(3L, 4L), ids(select("SELECT id FROM sales WHERE region = 'EU' AND amount > 100")))
     }
 

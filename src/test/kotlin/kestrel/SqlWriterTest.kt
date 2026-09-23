@@ -348,8 +348,6 @@ class SqlWriterTest {
         run("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
         run("CREATE TABLE orders3 (id INTEGER PRIMARY KEY, customerId INTEGER)")
         run("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace')")
-        // customerId 99 matches no customer, and customer 'grace' (id 2) has no order - so a plain
-        // INNER JOIN would drop both, letting RIGHT/FULL prove they actually kept what INNER cannot.
         run("INSERT INTO orders3 VALUES (10, 1), (11, 99)")
 
         val rightStatement = parseOne("CREATE VIEW r AS SELECT customers.name, orders3.id FROM customers RIGHT JOIN orders3 ON customers.id = orders3.customerId")
@@ -639,8 +637,6 @@ class SqlWriterTest {
         val freshCatalog = Catalog()
         val freshExecutor = Executor(freshCatalog)
         Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
-        // A row inserted only AFTER replay proves the GENERATED expression itself round-tripped
-        // (not just the value 10 already sitting in the dump's INSERT statement).
         freshExecutor.execute(Parser(Lexer("INSERT INTO t (a) VALUES (7)").tokenize()).parseProgram().single())
 
         val result = freshExecutor.execute(
@@ -676,8 +672,6 @@ class SqlWriterTest {
         val freshCatalog = Catalog()
         val freshExecutor = Executor(freshCatalog)
         Parser(Lexer(dump).tokenize()).parseProgram().forEach { freshExecutor.execute(it) }
-        // A row inserted only AFTER replay proves the GENERATED expression itself round-tripped,
-        // not just the value backfilled into row a=5 before the dump was taken.
         freshExecutor.execute(Parser(Lexer("INSERT INTO t (a) VALUES (7)").tokenize()).parseProgram().single())
 
         val result = freshExecutor.execute(
@@ -1007,14 +1001,6 @@ class SqlWriterTest {
         assertEquals(listOf(listOf(Value.IntegerValue(1))), select("SELECT id FROM t").rows)
     }
 
-    /**
-     * `RETURNING` is a statement-level, query-time-only clause: its output was already consumed by
-     * whoever issued the statement (the REPL printed it, or a caller read the [StatementResult]), so
-     * replaying the write on reopen has no reason to recompute or re-print it - only the write itself
-     * needs to survive. [SqlWriter] therefore never round-trips it, matching that a persisted dump
-     * replayed on reopen is a silent process ([kestrel.cli.Repl]'s own `replaying` flag suppresses
-     * [kestrel.cli.Repl.printResult] during it) with nothing to print RETURNING's rows to anyway.
-     */
     @Test
     fun returningClauseIsDroppedFromThePersistedSql() {
         seed()
@@ -1031,7 +1017,6 @@ class SqlWriterTest {
         assertTrue(!SqlWriter.write(delete).contains("RETURNING"))
     }
 
-    /** Same reasoning as [returningClauseIsDroppedFromThePersistedSql], now for MERGE's own RETURNING. */
     @Test
     fun mergeReturningClauseIsDroppedFromThePersistedSqlButTheMutationStillReplays() {
         run("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
@@ -1064,12 +1049,6 @@ class SqlWriterTest {
         assertTrue(rendered.startsWith("CREATE TABLE t ("), rendered)
     }
 
-    /**
-     * The direct, single-function counterpart to [kestrel.PersistenceTest]'s full
-     * checkpoint-reopen tests: proves [SqlWriter.dump] itself never mentions a TEMP table (or its
-     * rows, or an index/trigger defined on it), rather than relying on the round trip through
-     * [kestrel.persistence.Persistence]/[kestrel.cli.Repl] to demonstrate the same thing indirectly.
-     */
     @Test
     fun dumpOmitsATemporaryTableItsRowsItsIndexAndItsTriggerEntirely() {
         run("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, tag TEXT)")

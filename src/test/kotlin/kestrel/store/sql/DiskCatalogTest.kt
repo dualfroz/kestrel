@@ -71,7 +71,6 @@ class DiskCatalogTest {
         val txn = catalog1.beginTransaction()
         table1.insert(txn, Row(listOf(Value.IntegerValue(1), Value.TextValue("alice"))))
         catalog1.commit(txn)
-        // No catalog1.close(): the dirty pages may still only live in the buffer pool.
 
         val catalog2 = DiskCatalog.open(dataFile, walFile)
         val table2 = catalog2.table("users")

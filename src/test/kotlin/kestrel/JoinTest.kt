@@ -61,7 +61,6 @@ class JoinTest {
 
     private fun seedWithOrphanOrder() {
         seed()
-        // References a userId that does not exist, giving RIGHT/FULL JOIN an unmatched right row.
         run("INSERT INTO orders VALUES (13, 99, 999)")
     }
 
@@ -122,9 +121,6 @@ class JoinTest {
     fun rightJoinPadsWithFullWidthOfAllPrecedingTablesInAChain() {
         seed()
         run("CREATE TABLE items (orderId INTEGER, label TEXT)")
-        // orderId 99 matches no `orders` row, so it can only survive via the RIGHT JOIN's own
-        // unmatched-right padding - proving that padding spans BOTH preceding tables (users AND
-        // orders), not just orders (the immediate left side of this particular JOIN).
         run("INSERT INTO items VALUES (10, 'book'), (99, 'orphanItem')")
         val result = select(
             "SELECT u.name, o.total, i.label FROM users u " +

@@ -23,17 +23,6 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/**
- * `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE` on [DiskExecutor] - the disk-backed counterpart of
- * the in-memory engine's own feature (see [kestrel.ExecutorTest]'s temp-table cases, added by
- * session #63), closing the scope-cut that session left named: "TEMP TABLE na silniku dyskowym
- * pozostaje swiadomym scope-cut... tabela tymczasowa na silniku dyskowym zylaby WYLACZNIE w
- * pamieci, nigdy dotykajac pager/WAL wcale". A temp table here is a plain [kestrel.storage.Table]
- * living only in [DiskCatalog] (see its own KDoc), so it participates in WHERE/JOIN/subqueries/
- * ORDER BY exactly like a real table via [DiskExecutor.resolveFromSource]'s `CteRowSource` reuse,
- * but FOREIGN KEY, `CREATE INDEX`, `CREATE TRIGGER`, and `INSERT ... ON CONFLICT` on one are all
- * documented, explicit scope-cuts (see the rejection tests below) rather than a silent gap.
- */
 class DiskExecutorTemporaryTableTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -50,7 +39,6 @@ class DiskExecutorTemporaryTableTest {
         fun select(sql: String): SelectResult = run(sql).single() as SelectResult
         fun rowCount(sql: String): Int = select(sql).rows.size
 
-        /** Closes and reopens the catalog against the same files, simulating a fresh process. */
         fun reopen() {
             catalog.close()
             catalog = DiskCatalog.open(dataFile, walFile)
@@ -142,7 +130,6 @@ class DiskExecutorTemporaryTableTest {
         assertFailsWith<KestrelException> { db.run("INSERT INTO scratch (id, sku) VALUES (3, 'c')") }
         assertFailsWith<KestrelException> { db.run("INSERT INTO scratch VALUES (4, 'd', -1)") }
 
-        // Nothing from any failed multi-row batch partially landed.
         assertEquals(1, db.rowCount("SELECT * FROM scratch"))
     }
 

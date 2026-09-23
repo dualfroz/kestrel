@@ -84,7 +84,7 @@ class BPlusTreeTest {
 
     @Test
     fun splitsAcrossMultipleLevelsAndPersistsThroughBufferEviction() {
-        val pool = newPool(capacity = 8) // small pool forces heavy eviction/reload traffic
+        val pool = newPool(capacity = 8)
         val tree = BPlusTree.create(pool)
         val n = 3000
         for (i in 0 until n) tree.insert(key(i.toLong()), i.toLong() * 7)

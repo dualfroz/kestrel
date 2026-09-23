@@ -16,16 +16,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/**
- * Exercises `BEGIN`/`COMMIT`/`ROLLBACK` through [DiskExecutor], parsing real SQL text through the
- * same [Lexer]/[Parser] the in-memory engine uses - see [DiskExecutorTest] for that general pattern.
- * Unlike [kestrel.TransactionTest] (the in-memory engine's equivalent, backed by a whole-catalog
- * snapshot/restore that also undoes DDL), an explicit transaction here is the storage engine's own
- * WAL/2PL transaction shared across statements via [DiskExecutor.execute] until `COMMIT`/`ROLLBACK`
- * (see [DiskExecutor.executeBegin]) - so it can only wrap DML/SELECT, survives a process restart once
- * committed, and actually holds locks across the gap between two SQL statements, which
- * [locksAcquiredByAnOpenTransactionBlockAConcurrentWriterUntilItEnds] proves end to end.
- */
 class DiskTransactionTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -42,10 +32,8 @@ class DiskTransactionTest {
         fun run(sql: String): List<StatementResult> = Parser(Lexer(sql).tokenize()).parseProgram().map { executor.execute(it) }
         fun select(sql: String): SelectResult = run(sql).single() as SelectResult
 
-        /** A second executor sharing this database's still-open [catalog] - a second concurrent session. */
         fun secondExecutor(): DiskExecutor = DiskExecutor(catalog)
 
-        /** Closes and reopens the catalog against the same files, simulating a fresh process. */
         fun reopen() {
             catalog.close()
             catalog = DiskCatalog.open(dataFile, walFile)
@@ -156,7 +144,6 @@ class DiskTransactionTest {
         assertFailsWith<DiskExecutorException> { db.run("CREATE INDEX idx ON accounts (balance)") }
         assertFailsWith<DiskExecutorException> { db.run("ALTER TABLE accounts ADD COLUMN note TEXT") }
 
-        // The rejected DDL must not have corrupted or silently closed the still-open transaction.
         assertEquals(CommitResult, db.run("COMMIT").single())
         assertEquals(3, db.rowCount("SELECT * FROM accounts"))
     }
@@ -169,8 +156,6 @@ class DiskTransactionTest {
         db.run("INSERT INTO accounts VALUES (3, 300)")
         db.run("UPDATE accounts SET balance = 0 WHERE id = 1")
 
-        // Neither statement opened a BEGIN, so each must already be durable on its own - reopening
-        // the catalog (a fresh process against the same files) has to see both without a COMMIT.
         db.reopen()
         assertEquals(3, db.rowCount("SELECT * FROM accounts"))
         assertEquals(0L, db.balanceOf(1))
@@ -187,16 +172,6 @@ class DiskTransactionTest {
         assertTrue(!db.executor.inTransaction)
     }
 
-    /**
-     * The core new guarantee this session adds: two SQL statements inside one `BEGIN` share a single
-     * disk transaction, so the exclusive lock taken by the first `UPDATE` (see
-     * [kestrel.store.engine.TransactionalHeap], locked on the table's header page) is still held while
-     * a second, concurrent session's `UPDATE` on the very same table blocks on it - across the gap
-     * between statement 1 and statement 2, not just for the duration of a single statement. Before
-     * this session's change, `DiskExecutor` had no notion of a transaction spanning more than one
-     * statement, so this scenario could never even arise: every statement committed (and released its
-     * locks) the instant it finished.
-     */
     @Test
     fun locksAcquiredByAnOpenTransactionBlockAConcurrentWriterUntilItEnds() {
         val db = newDatabase()

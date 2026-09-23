@@ -140,7 +140,6 @@ class IndexTest {
         seed()
         run("INSERT INTO users VALUES (6, 'ada', 21)")
         assertFailsWith<KestrelException> { run("CREATE UNIQUE INDEX idxName ON users (name)") }
-        // A failed creation must not leave a half-built index registered under the name.
         run("CREATE INDEX idxName ON users (name)")
     }
 

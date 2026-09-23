@@ -91,13 +91,6 @@ class ReplTest {
         assertTrue(!output.contains("unseen"), "statements after .exit must not run")
     }
 
-    /**
-     * The REPL buffers input line by line and (before this was fixed) treated ANY line ending in
-     * `;` as "statement complete" - a trigger body's inner `INSERT ... ;` would have tripped that
-     * check and been parsed as an incomplete CREATE TRIGGER, well before the closing `END;` was
-     * even typed. Feeding the trigger definition across several `readLine()` calls (rather than as
-     * one line) is the point of this test.
-     */
     @Test
     fun multiLineCreateTriggerIsNotExecutedPrematurelyOnAnInnerSemicolon() {
         val script = """

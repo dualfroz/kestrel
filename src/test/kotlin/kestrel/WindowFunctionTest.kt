@@ -27,12 +27,6 @@ class WindowFunctionTest {
     private fun text(value: String) = Value.TextValue(value)
     private fun int(value: Long) = Value.IntegerValue(value)
 
-    /**
-     * eng (deptId 1): ada/linus tie at 400 (ada inserted first), grace at 300.
-     * sales (deptId 2): sam/kay tie at 200 (sam inserted first), meg at 100.
-     * Salaries also happen to be in strict descending order by id across the whole table, which
-     * keeps the no-PARTITION-BY tests below easy to eyeball.
-     */
     private fun seed() {
         run("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         run("CREATE TABLE employees (id INTEGER PRIMARY KEY, deptId INTEGER, name TEXT, salary INTEGER)")
@@ -552,7 +546,6 @@ class WindowFunctionTest {
         )
     }
 
-    /** amount is monotonic in id (10, 20, 20, 30, 50) so `ORDER BY id` and `ORDER BY amount` agree, with a tie at 20. */
     private fun seedSales() {
         run("CREATE TABLE sales (id INTEGER PRIMARY KEY, amount INTEGER)")
         run("INSERT INTO sales VALUES (1, 10), (2, 20), (3, 20), (4, 30), (5, 50)")
@@ -779,10 +772,6 @@ class WindowFunctionTest {
         assertEquals(listOf(120L, 110L, 110L, 100L, 80L), result.rows.map { (it[1] as Value.IntegerValue).value })
     }
 
-    // ---- GROUPS frame unit ----
-    // sales (ordered by amount): id1=10, {id2=20, id3=20} tied, id4=30, id5=50 -> 4 distinct peer
-    // groups. GROUPS counts THESE groups, unlike ROWS (physical rows) or RANGE (value distance).
-
     @Test
     fun groupsBetweenPrecedingAndFollowingCountsPeerGroupsNotPhysicalRows() {
         seedSales()
@@ -794,8 +783,6 @@ class WindowFunctionTest {
             "SELECT id, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s " +
                 "FROM sales ORDER BY id ASC"
         )
-        // id2/id3's tied peer group makes the GROUPS frame span more physical rows than ROWS for
-        // their neighbours (id1 and id4), even though both ask for "1 PRECEDING AND 1 FOLLOWING".
         assertEquals(listOf(50L, 80L, 80L, 120L, 80L), groups.rows.map { (it[1] as Value.IntegerValue).value })
         assertEquals(listOf(30L, 50L, 70L, 100L, 80L), rows.rows.map { (it[1] as Value.IntegerValue).value })
     }
@@ -842,9 +829,6 @@ class WindowFunctionTest {
             "SELECT id, COUNT(*) OVER (ORDER BY deptId, name GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c " +
                 "FROM employees ORDER BY deptId ASC, name ASC"
         )
-        // ada, grace, linus (dept 1) then kay, meg, sam (dept 2) - every row is its own peer group
-        // since no two rows share the same (deptId, name), so this is exactly the sliding-window-of-3
-        // pattern (2 at each edge, 3 in the middle).
         assertEquals(
             listOf(int(1), int(3), int(2), int(5), int(6), int(4)),
             result.rows.map { it[0] }

@@ -72,21 +72,19 @@ class LockManagerTest {
     @Test
     fun circularWaitIsDetectedAndRejectedWithoutBlocking() {
         val locks = LockManager()
-        locks.acquireExclusive(1L, 100L) // txn 1 holds resource A
-        locks.acquireExclusive(2L, 200L) // txn 2 holds resource B
+        locks.acquireExclusive(1L, 100L)
+        locks.acquireExclusive(2L, 200L)
 
         val blocked = java.util.concurrent.atomic.AtomicBoolean(false)
         val thread = Thread {
-            locks.acquireExclusive(1L, 200L) // txn 1 wants B, held by txn 2: blocks
+            locks.acquireExclusive(1L, 200L)
             blocked.set(true)
         }
         thread.start()
         waitUntil { locks.waiters(200L).contains(1L) }
 
-        // txn 2 now wants A, held by txn 1, which is already waiting on txn 2: a cycle.
         assertFailsWith<LockManager.DeadlockException> { locks.acquireExclusive(2L, 100L) }
 
-        // Unblock the background waiter so the test does not leak a thread.
         locks.release(2L, 200L)
         thread.join(2000)
         assertTrue(blocked.get())
@@ -96,7 +94,6 @@ class LockManagerTest {
     fun unrelatedWaitersDoNotFalselyTriggerDeadlock() {
         val locks = LockManager()
         locks.acquireExclusive(1L, 100L)
-        // txn 2 requests an unrelated resource txn 1 does not hold: no cycle, should not throw.
         locks.acquireExclusive(2L, 200L)
     }
 

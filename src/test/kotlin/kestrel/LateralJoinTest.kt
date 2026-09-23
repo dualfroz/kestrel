@@ -157,9 +157,6 @@ class LateralJoinTest {
     @Test
     fun lateralSubqueryWithStarProjectionResolvesColumnsStructurallyFromItsBaseTable() {
         seed()
-        // The lateral subquery itself uses `SELECT *`, so its output column names come from
-        // [kestrel.engine.SelectRunner.structuralColumnNames] walking the base table's schema in
-        // the catalog, not from an executed row - exercised here before any left row exists yet.
         val result = select(
             "SELECT d.name, top.name, top.salary FROM departments d " +
                 "JOIN LATERAL (SELECT * FROM employees e WHERE e.deptId = d.id " +

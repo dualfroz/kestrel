@@ -16,21 +16,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
-/**
- * Exercises `CREATE`/`DROP`/`ALTER SEQUENCE` and `NEXTVAL`/`CURRVAL` through [DiskExecutor] against a
- * real [DiskCatalog] backed by temp files - see [DiskExecutorTest] for that general end-to-end
- * pattern. Most scenarios here are ported 1:1 from [kestrel.SequenceTest] (the in-memory engine's
- * equivalent), since [DiskExecutor] reuses the exact same [kestrel.catalog.Sequence]/
- * [kestrel.catalog.SequenceDefinition] arithmetic - the three exceptions are the "ROLLBACK undoes
- * CREATE/DROP/ALTER SEQUENCE" tests, which do not translate: `CREATE`/`DROP`/`ALTER SEQUENCE` are DDL,
- * and DDL is rejected inside an explicit disk transaction entirely (see
- * [rollbackCannotWrapCreateSequenceEitherBecauseItIsRejectedInsideAnExplicitTransaction] and its two
- * siblings) rather than being undoable by it, unlike the in-memory engine's whole-catalog
- * snapshot/restore. [sequencePositionSurvivesAReopen] and
- * [alterSequenceRestartPositionSurvivesAReopen] instead cover what is actually new on the disk-backed
- * path: [DiskCatalog.nextValue]'s counter write bypasses the WAL entirely (see its own doc), so
- * nothing but this kind of end-to-end reopen test proves it is still durable.
- */
 class DiskExecutorSequenceTest {
     private fun tempFile(prefix: String): File = Files.createTempFile(prefix, ".db").toFile().also { it.deleteOnExit() }
 
@@ -47,7 +32,6 @@ class DiskExecutorSequenceTest {
         fun run(sql: String): List<StatementResult> = Parser(Lexer(sql).tokenize()).parseProgram().map { executor.execute(it) }
         fun select(sql: String): SelectResult = run(sql).single() as SelectResult
 
-        /** Closes and reopens the catalog against the same files, simulating a fresh process. */
         fun reopen() {
             catalog.close()
             catalog = DiskCatalog.open(dataFile, walFile)
@@ -219,8 +203,6 @@ class DiskExecutorSequenceTest {
         db.run("INSERT INTO t VALUES (NEXTVAL('seq'))")
         db.run("ROLLBACK")
         db.run("INSERT INTO t VALUES (NEXTVAL('seq'))")
-        // The rolled-back row never landed, but NEXTVAL's advance to 1 survives - the surviving
-        // insert gets 2, not a reused 1.
         assertEquals(listOf(listOf(int(2))), db.select("SELECT id FROM t").rows)
     }
 
@@ -271,7 +253,6 @@ class DiskExecutorSequenceTest {
         db.run("CREATE SEQUENCE seq")
         db.run("CREATE TABLE orders (id INTEGER DEFAULT NEXTVAL('seq'))")
         db.run("INSERT INTO orders (id) VALUES (DEFAULT)")
-        // If CREATE TABLE's own validation had already called NEXTVAL once, this would be 2.
         assertEquals(listOf(listOf(int(1))), db.select("SELECT id FROM orders").rows)
     }
 
@@ -313,8 +294,6 @@ class DiskExecutorSequenceTest {
         db.run("CREATE SEQUENCE seq")
         db.run("CREATE TABLE t (id INTEGER)")
         db.run("INSERT INTO t VALUES (1)")
-        // Thrown by the shared Evaluator (no SequenceAccess given for a WHERE clause), not this
-        // executor's own code - see kestrel.engine.Evaluator.evaluateNextValue.
         assertFailsWith<KestrelException> { db.run("UPDATE t SET id = 2 WHERE id = NEXTVAL('seq')") }
     }
 
@@ -349,16 +328,10 @@ class DiskExecutorSequenceTest {
         db.run("CREATE SEQUENCE seq MINVALUE 1 MAXVALUE 3")
         db.run("ALTER SEQUENCE seq NO MAXVALUE")
         db.run("CREATE TABLE t (id INTEGER)")
-        // Was capped at 3 before the ALTER; NO MAXVALUE lifts it back to the ascending default.
         db.run("INSERT INTO t VALUES (NEXTVAL('seq')), (NEXTVAL('seq')), (NEXTVAL('seq')), (NEXTVAL('seq'))")
         assertEquals(4, db.select("SELECT id FROM t").rows.size)
     }
 
-    /**
-     * The core new guarantee this session adds over the in-memory engine's own sequence tests:
-     * [DiskCatalog.nextValue] writes the advanced counter straight through [DiskManager][kestrel.store.page.DiskManager],
-     * bypassing the WAL entirely - a reopen must still see the advance, not just a live process.
-     */
     @Test
     fun sequencePositionSurvivesAReopen() {
         val db = newDatabase()
@@ -370,7 +343,6 @@ class DiskExecutorSequenceTest {
         assertEquals(listOf(listOf(int(1)), listOf(int(2)), listOf(int(3))), db.select("SELECT id FROM t ORDER BY id").rows)
     }
 
-    /** Same durability guarantee as [sequencePositionSurvivesAReopen], but for a RESTART WITH position. */
     @Test
     fun alterSequenceRestartPositionSurvivesAReopen() {
         val db = newDatabase()
