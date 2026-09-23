@@ -3,36 +3,15 @@ package kestrel.store.sql
 import kestrel.catalog.ForeignKeyAction
 import kestrel.catalog.TableSchema
 import kestrel.store.heap.RecordId
+import kestrel.storage.DecimalColumns
 import kestrel.storage.Row
 import kestrel.storage.Value
+import kestrel.storage.typeName
 
-/**
- * Disk-backed counterpart of [kestrel.engine.ForeignKeyEnforcer]: existence checks on INSERT/UPDATE
- * of the referencing (child) table, and ON DELETE/ON UPDATE actions on the referenced (parent)
- * table, operating on [DiskCatalog]/[DiskTable] within an active disk transaction instead of the
- * in-memory engine's `Table.rows` ArrayList. Deliberately duplicated rather than shared - same
- * reasoning as every other validation [DiskExecutor] duplicates (see
- * [DiskExecutor.validateUniqueDefinitions]).
- *
- * [validateRow]'s existence check is a full [DiskTable.scan] of the referenced table, exactly
- * mirroring the in-memory engine's own full scan of `Table.rows` - a documented performance
- * compromise (not correctness), same category as CTE materialization or the disk executor's UNIQUE
- * constraint scan: a real index-driven point lookup here would need to first prove the referenced
- * columns line up with the PRIMARY KEY or a secondary index before choosing a plan, which is scope
- * this pass does not take on.
- */
 internal object DiskForeignKeyEnforcer {
 
-    /**
-     * [uncommittedSiblings] covers a self-referencing FK (`referencedTable == schema.name`, e.g. an
-     * employee/manager hierarchy) inside a multi-row INSERT/UPDATE statement: those sibling rows are
-     * being validated as part of the very same statement and have not been written to [txn] yet, so
-     * without this a later row could not reference an earlier row from the same batch (or vice
-     * versa - order within the batch must not matter).
-     *
-     * Follows MATCH SIMPLE (the SQL default): if *any* column of the FK is NULL in this row, the
-     * whole constraint is skipped for that row - not just the null column.
-     */
+    private val keyPlanner = DiskIndexAccessPlanner()
+
     fun validateRow(
         catalog: DiskCatalog,
         txn: Long,
@@ -51,8 +30,11 @@ internal object DiskForeignKeyEnforcer {
                 )
             val refIndices = fk.referencedColumns.map { referenced.schema.columnIndex(it)!! }
             val siblings = if (fk.referencedTable.equals(schema.name, ignoreCase = true)) uncommittedSiblings else emptyList()
-            val exists = referenced.scan(txn).any { (_, row) -> refIndices.map { idx -> row.values[idx] } == key } ||
-                siblings.any { row -> refIndices.map { idx -> row.values[idx] } == key }
+            val parentKey = keyInColumnTypes(referenced.schema, refIndices, key)
+            val exists = parentKey != null && (
+                rowsWithKeys(referenced, txn, refIndices, setOf(parentKey)).isNotEmpty() ||
+                    siblings.any { row -> refIndices.map { idx -> row.values[idx] } == parentKey }
+                )
             if (!exists) {
                 throw DiskExecutorException(
                     "FOREIGN KEY constraint failed: ${schema.name}(${fk.columns.joinToString(", ")}) has no " +
@@ -72,12 +54,6 @@ internal object DiskForeignKeyEnforcer {
         applySteps(txn, planDelete(catalog, txn, parentTableName, deletedRows))
     }
 
-    /**
-     * [referencedColumns] is the full column group whose values changed together (a PRIMARY KEY or
-     * UNIQUE key group) and [changedPairs] holds the old/new key tuple for every row of the parent
-     * table, positionally aligned with [referencedColumns] - a matching FK may declare its own
-     * `referencedColumns` in a different order, so [planUpdate] re-projects each tuple by name.
-     */
     fun cascadeUpdate(
         catalog: DiskCatalog,
         txn: Long,
@@ -97,9 +73,11 @@ internal object DiskForeignKeyEnforcer {
             for (fk in child.schema.foreignKeys) {
                 if (!fk.referencedTable.equals(parentTableName, ignoreCase = true)) continue
                 val refIndices = fk.referencedColumns.map { parent.schema.columnIndex(it)!! }
-                val deletedKeys = deletedRows.map { row -> refIndices.map { row.values[it] } }.toHashSet()
                 val childColumnIndices = fk.columns.map { child.schema.columnIndex(it)!! }
-                val matches = child.scan(txn).filter { (_, row) -> childColumnIndices.map { row.values[it] } in deletedKeys }
+                val deletedKeys = deletedRows.mapNotNull { row ->
+                    keyInColumnTypes(child.schema, childColumnIndices, refIndices.map { row.values[it] })
+                }.toHashSet()
+                val matches = rowsWithKeys(child, txn, childColumnIndices, deletedKeys)
                 if (matches.isEmpty()) continue
                 when (fk.onDelete) {
                     ForeignKeyAction.Cascade ->
@@ -133,8 +111,6 @@ internal object DiskForeignKeyEnforcer {
             for (fk in child.schema.foreignKeys) {
                 if (!fk.referencedTable.equals(parentTableName, ignoreCase = true)) continue
                 if (fk.referencedColumns.size != referencedColumns.size) continue
-                // Re-project the tuple by name: this FK's referencedColumns may list the same key
-                // group in a different order than the one changedPairs was built from.
                 val positions = fk.referencedColumns.map { refCol ->
                     referencedColumns.indexOfFirst { it.equals(refCol, ignoreCase = true) }
                 }
@@ -144,11 +120,12 @@ internal object DiskForeignKeyEnforcer {
                     val oldKey = positions.map { oldTuple[it] }
                     val newKey = positions.map { newTuple[it] }
                     if (oldKey == newKey) continue
-                    val matches = child.scan(txn).filter { (_, row) -> childColumnIndices.map { row.values[it] } == oldKey }
+                    val childKey = keyInColumnTypes(child.schema, childColumnIndices, oldKey) ?: continue
+                    val matches = rowsWithKeys(child, txn, childColumnIndices, setOf(childKey))
                     if (matches.isEmpty()) continue
                     when (fk.onUpdate) {
                         ForeignKeyAction.Cascade ->
-                            steps.add(CascadeStep.SetTo(child, childColumnIndices, matches, newKey))
+                            steps.add(CascadeStep.SetTo(child, childColumnIndices, matches, cascadedKey(child.schema, childColumnIndices, newKey)))
                         ForeignKeyAction.SetNull -> {
                             requireNullable(child.schema, childColumnIndices, "ON UPDATE SET NULL")
                             steps.add(CascadeStep.SetToNull(child, childColumnIndices, matches))
@@ -181,6 +158,50 @@ internal object DiskForeignKeyEnforcer {
             }
         }
     }
+
+    private fun keyInColumnTypes(schema: TableSchema, columnIndices: List<Int>, key: List<Value>): List<Value>? =
+        columnIndices.mapIndexed { position, columnIndex ->
+            keyPlanner.equalityKey(schema.columns[columnIndex].type, key[position]) ?: return null
+        }
+
+    private fun rowsWithKeys(table: DiskTable, txn: Long, columnIndices: List<Int>, keys: Set<List<Value>>): List<Pair<RecordId, Row>> {
+        if (keys.isEmpty()) return emptyList()
+        val keyColumns = columnIndices.toSet()
+        val primaryKeyIndices = table.schema.primaryKeyIndices
+        val secondary = table.secondaryIndexes.firstOrNull { it.columnIndices.toSet() == keyColumns }
+        val candidates = when {
+            primaryKeyIndices.toSet() == keyColumns -> keys.mapNotNull { key ->
+                val keyByColumn = columnIndices.zip(key).toMap()
+                table.findByPrimaryKey(txn, primaryKeyIndices.map { keyByColumn.getValue(it) })
+            }
+            secondary != null -> keys.flatMap { key ->
+                val keyByColumn = columnIndices.zip(key).toMap()
+                table.findBySecondary(txn, secondary.name, secondary.columnIndices.map { keyByColumn.getValue(it) })
+            }
+            else -> table.scan(txn)
+        }
+        return candidates.filter { (_, row) -> columnIndices.map { row.values[it] } in keys }
+    }
+
+    private fun cascadedKey(schema: TableSchema, columnIndices: List<Int>, parentKey: List<Value>): List<Value> =
+        columnIndices.mapIndexed { position, columnIndex ->
+            val parentValue = parentKey[position]
+            if (parentValue is Value.NullValue) return@mapIndexed parentValue
+            val column = schema.columns[columnIndex]
+            val key = keyPlanner.equalityKey(column.type, parentValue)
+            val stored = if (key is Value.DecimalValue) {
+                Value.DecimalValue(DecimalColumns.normalize(key.value, column.precision, column.scale, "column ${column.name}"))
+            } else {
+                key
+            }
+            if (stored == null || stored != key) {
+                throw DiskExecutorException(
+                    "FOREIGN KEY constraint failed: cannot cascade ${parentValue.typeName} key into " +
+                        "${schema.name}.${column.name} of type ${column.type.displayName} without changing its value"
+                )
+            }
+            stored
+        }
 
     private fun requireNullable(schema: TableSchema, columnIndices: List<Int>, action: String) {
         for (columnIndex in columnIndices) {

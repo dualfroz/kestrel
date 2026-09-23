@@ -5,7 +5,7 @@ plugins {
     application
 }
 
-group = "space.vulp.kestrel"
+group = "com.dualfroz.kestrel"
 version = "0.1.0"
 
 repositories {

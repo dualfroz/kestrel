@@ -9,18 +9,9 @@ import java.io.RandomAccessFile
 
 class CorruptPageException(message: String) : KestrelException(message)
 
-/**
- * Owns a single heap file of fixed-size pages. Every physical slot is stored
- * as `[4-byte CRC32C][PAGE_SIZE payload]` so torn or corrupted writes are
- * detected on read. Slot 0 is reserved for a metadata header (page count and
- * the head of the free list); logical page ids are 0-based and map to
- * physical slot `id + 1`. Freed pages are threaded into a singly linked free
- * list stored inline in the freed page's own bytes, so allocation reuses
- * space instead of only ever growing the file.
- */
 class DiskManager(private val file: File) : AutoCloseable {
     companion object {
-        private const val MAGIC = 0x4B535452 // "KSTR"
+        private const val MAGIC = 0x4B535452
         private const val SLOT_SIZE = 4 + Page.PAGE_SIZE
         private const val HEADER_SLOT = 0L
         private const val NO_PAGE = -1L
